@@ -61,7 +61,7 @@ submit=[
 ]
 
 # %%
- app.layout=dbc.Container(
+app.layout=dbc.Container(
  [
      html.H1("PCS on Stock Returns"),
      #Ticker input
@@ -83,7 +83,7 @@ width=4),
   )
 
 # %%
-  @app.callback(
+@app.callback(
     [
         Output("bar-chart","figure"),
         Output("line-chart","figure"),
@@ -141,7 +141,7 @@ range (n_components)],
     return bar_chart, line_chart
 
 if __name__== "__main__":
-    app.run_server(debug=True)
+    app.run_server(debug=True),
     
     
     
@@ -151,7 +151,7 @@ if __name__== "__main__":
 
 
 # %%
-,
+
 
 # %%
 

@@ -141,28 +141,4 @@ range (n_components)],
     return bar_chart, line_chart
 
 if __name__== "__main__":
-    app.run_server(debug=True),
-    
-    
-    
-    
-
-# %%
-
-
-# %%
-
-
-# %%
-
-
-# %%
-
-
-# %%
-
-
-# %%
-
-
-
+    app.run_server(debug=True)

@@ -53,7 +53,7 @@ date_picker_field=[
     start_date=datetime.datetime.now()-
 datetime.timedelta(365*3),
     end_date=datetime.datetime.now(),
-    display_format="YYY-MM-DD"
+    display_format="YYYY-MM-DD"
     ),
 ]
 submit=[
@@ -63,7 +63,7 @@ submit=[
 # %%
 app.layout=dbc.Container(
  [
-     html.H1("PCS on Stock Returns"),
+     html.H1("PCA on Stock Returns"),
      #Ticker input
      dbc.Row([dbc.Col(ticker_field)]),
      dbc.Row([dbc.Col(components_field)]),
@@ -137,8 +137,8 @@ range (n_components)],
         xaxis=dict(title="Principal Component"),
         yaxis=dict(title="Cumulative Explained Variance"),
         ),
-    ),
-    return bar_chart; line_chart
+    )
+    return bar_chart, line_chart
 
 if __name__== "__main__":
     app.run_server(debug=True)

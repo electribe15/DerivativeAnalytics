@@ -137,8 +137,8 @@ range (n_components)],
         xaxis=dict(title="Principal Component"),
         yaxis=dict(title="Cumulative Explained Variance"),
         ),
-    )
-    return bar_chart, line_chart
+    ),
+    return bar_chart; line_chart
 
 if __name__== "__main__":
     app.run_server(debug=True)

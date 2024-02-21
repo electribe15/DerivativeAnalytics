@@ -1,0 +1,17 @@
+FastAPI
+Streamlit
+Pandas
+Hugging Face Transformers
+LangChain
+Neo4j
+Tesseract
+AWS Textract
+FinBERT
+ESG-BERT
+psycopg2
+python-dotenv
+numpy
+scikit-learn
+matplotlib
+seaborn
+pytest

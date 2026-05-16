@@ -453,205 +453,205 @@ def skew_chart(raw_df, spot, ticker):
 
 print('Chart builders ready.')
 
-# ── Dash Application ──────────────────────────────────────────────────
-import dash
-from dash import dcc, html, Input, Output, State, ctx
-import dash_bootstrap_components as dbc
-
-# Shared state will be initialized lazily after first fetch
-store = {
-    'raw':       None,
-    'by_strike': None,
-    'by_expiry': None,
-    'spot':      None,
-    'ticker':    DEFAULT_TICKER,
-}
-
-# Stat card helper
-
-def stat_card(label, value, color=ACCENT_GRN):
-    return html.Div([
-        html.P(label, style={'color': '#7a8399', 'fontSize': '11px',
-                              'margin': '0', 'letterSpacing': '1.5px',
-                              'textTransform': 'uppercase', 'fontFamily': 'Courier New'}),
-        html.H4(value, style={'color': color, 'margin': '4px 0 0',
-                               'fontFamily': 'Courier New', 'fontSize': '20px'})
-    ], style={
-        'background': '#13161e',
-        'border': f'1px solid {GRID_COL}',
-        'borderTop': f'3px solid {color}',
-        'borderRadius': '4px',
-        'padding': '14px 18px',
-        'flex': '1',
-        'minWidth': '160px',
-    })
-
-
-def build_stats(raw_df, by_strike_df, spot):
-    total_gex_val = raw_df['gex'].sum()
-    total_dex_val = raw_df['dex'].sum()
-    largest_strike = by_strike_df.loc[by_strike_df['net_gex'].abs().idxmax(), 'strike']
-    call_oi = int(raw_df[raw_df['flag'] == 'c']['openInterest'].sum())
-    put_oi = int(raw_df[raw_df['flag'] == 'p']['openInterest'].sum())
-    pcr = put_oi / call_oi if call_oi else 0
-    regime = '🟢 POSITIVE' if total_gex_val > 0 else '🔴 NEGATIVE'
-    regime_col = ACCENT_GRN if total_gex_val > 0 else ACCENT_RED
-    return [
-        stat_card('Spot Price', f'${spot:.2f}', ACCENT_YLW),
-        stat_card('Total GEX', f'${total_gex_val/1e9:.2f}B', ACCENT_GRN if total_gex_val > 0 else ACCENT_RED),
-        stat_card('Total DEX', f'${total_dex_val/1e6:.0f}M', ACCENT_BLU),
-        stat_card('GEX Regime', regime, regime_col),
-        stat_card('Peak GEX Strike', f'{largest_strike}', ACCENT_GRN),
-        stat_card('Put/Call OI Ratio', f'{pcr:.2f}', ACCENT_YLW),
-    ]
-
-# App
-app = dash.Dash(
-    __name__,
-    external_stylesheets=[dbc.themes.CYBORG],
-    title='DEX / GEX Dashboard'
- )
-
-HEADER = html.Div([
-    html.Div([
-        html.H2('⚡ DEX / GEX', style={'color': ACCENT_GRN, 'margin': '0',
-                                      'fontFamily': 'Courier New', 'fontSize': '28px',
-                                      'letterSpacing': '4px'}),
-        html.P('Options Exposure Dashboard', style={'color': '#7a8399', 'margin': '0',
-                                                    'fontFamily': 'Courier New',
-                                                    'fontSize': '12px', 'letterSpacing': '2px'}),
-    ]),
-    html.Div([
-        dcc.Input(id='ticker-input', value=DEFAULT_TICKER, type='text',
-                  placeholder='Ticker …',
-                  style={'background': '#1a1d27', 'border': f'1px solid {GRID_COL}',
-                         'color': TEXT_COL, 'padding': '8px 12px', 'borderRadius': '4px',
-                         'fontFamily': 'Courier New', 'fontSize': '14px',
-                         'width': '100px', 'textTransform': 'uppercase'}),
-        html.Div(
-            dcc.Slider(
-                id='window-slider',
-                min=5,
-                max=25,
-                step=5,
-                value=10,
-                marks={v: f'{v}%' for v in [5, 10, 15, 20, 25]},
-                tooltip={'always_visible': False},
-                className='mx-3',
-            ),
-            style={'width': '200px'}
-        ),
-        html.Button('↻ REFRESH', id='refresh-btn',
-                    style={'background': 'transparent', 'border': f'1px solid {ACCENT_GRN}',
-                           'color': ACCENT_GRN, 'padding': '8px 20px',
-                           'borderRadius': '4px', 'cursor': 'pointer',
-                           'fontFamily': 'Courier New', 'fontSize': '13px',
-                           'letterSpacing': '1px'}),
-    ], style={'display': 'flex', 'alignItems': 'center', 'gap': '12px'}),
-], style={
-    'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center',
-    'padding': '18px 28px', 'background': '#0d0f14',
-    'borderBottom': f'1px solid {GRID_COL}',
-})
-
-app.layout = html.Div([
-    HEADER,
-
-    html.Div(id='status-bar', style={'padding': '8px 28px', 'fontSize': '12px',
-                                     'color': '#7a8399', 'fontFamily': 'Courier New',
-                                     'borderBottom': f'1px solid {GRID_COL}'}),
-
-    html.Div(id='stat-cards',
-             style={'display': 'flex', 'gap': '12px', 'padding': '16px 28px',
-                    'flexWrap': 'wrap'}),
-
-    html.Div([
-        html.Div(dcc.Graph(id='gex-bar'), style={'flex': '1', 'minWidth': '400px'}),
-        html.Div(dcc.Graph(id='dex-bar'), style={'flex': '1', 'minWidth': '400px'}),
-    ], style={'display': 'flex', 'gap': '12px', 'padding': '0 28px 12px'}),
-
-    html.Div([
-        html.Div(dcc.Graph(id='gex-expiry'), style={'flex': '1', 'minWidth': '300px'}),
-        html.Div(dcc.Graph(id='oi-heatmap'), style={'flex': '1.3', 'minWidth': '380px'}),
-        html.Div(dcc.Graph(id='vol-smile'), style={'flex': '1', 'minWidth': '300px'}),
-    ], style={'display': 'flex', 'gap': '12px', 'padding': '0 28px 28px'}),
-
-    dcc.Loading(html.Div(id='_dummy'), type='circle', color=ACCENT_GRN),
-
-], style={'background': DARK_BG, 'minHeight': '100vh', 'fontFamily': 'Courier New'})
-
-
-# Callbacks
-@app.callback(
-    Output('stat-cards', 'children'),
-    Output('gex-bar', 'figure'),
-    Output('dex-bar', 'figure'),
-    Output('gex-expiry', 'figure'),
-    Output('oi-heatmap', 'figure'),
-    Output('vol-smile', 'figure'),
-    Output('status-bar', 'children'),
-    Output('_dummy', 'children'),
-    Input('refresh-btn', 'n_clicks'),
-    Input('window-slider', 'value'),
-    State('ticker-input', 'value'),
-    prevent_initial_call=False,
- )
-def update_dashboard(n_clicks, window_pct, ticker_val):
-    triggered = ctx.triggered_id
-    ticker = (ticker_val or DEFAULT_TICKER).strip().upper()
-    wpct = (window_pct or 10) / 100
-
-    if triggered == 'refresh-btn' or store['raw'] is None or ticker != store['ticker']:
-        try:
-            raw_df, spot = fetch_options_data(ticker)
-            store['raw'] = raw_df
-            store['by_strike'] = aggregate_by_strike(raw_df)
-            store['by_expiry'] = aggregate_by_expiry(raw_df)
-            store['spot'] = spot
-            store['ticker'] = ticker
-        except Exception as e:
-            status = f'⚠  Error fetching {ticker}: {e}'
-            empty = go.Figure().update_layout(**base_layout())
-            return [], empty, empty, empty, empty, empty, status, ''
-
-    raw_df = store['raw']
-    bs_df = store['by_strike']
-    be_df = store['by_expiry']
-    spot = store['spot']
-    ticker = store['ticker']
-    ts = datetime.now().strftime('%H:%M:%S')
-
-    stats = build_stats(raw_df, bs_df, spot)
-    fig_gex = gex_bar_chart(bs_df, spot, ticker, wpct)
-    fig_dex = dex_bar_chart(bs_df, spot, ticker, wpct)
-    fig_exp = gex_expiry_chart(be_df, ticker)
-    fig_oi = oi_heatmap(raw_df, spot, ticker, wpct)
-    fig_vol = vol_smile_chart(raw_df, spot, ticker)
-    status = f'Last updated: {ts}  |  {len(raw_df):,} contracts  |  {raw_df["expiry"].nunique()} expiries  |  Spot ${spot:.2f}'
-
-    return stats, fig_gex, fig_dex, fig_exp, fig_oi, fig_vol, status, ''
-
-
-def _pick_port(preferred: list[int]) -> int:
-    """Return the first available port from preferred, or an OS-assigned free port."""
-    for p in preferred:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(('127.0.0.1', p))
-            s.close()
-            return p
-        except OSError:
-            continue
-    # Fallback: ask OS for a free port
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(('127.0.0.1', 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
-
 
 if __name__ == '__main__':
+    # Delayed imports for Dash so that importing this module for Streamlit
+    # doesn't require Dash to be installed or initialize the Dash app.
+    import dash
+    from dash import dcc, html, Input, Output, State, ctx
+    import dash_bootstrap_components as dbc
+
+    # Shared state will be initialized lazily after first fetch
+    store = {
+        'raw':       None,
+        'by_strike': None,
+        'by_expiry': None,
+        'spot':      None,
+        'ticker':    DEFAULT_TICKER,
+    }
+
+    # Stat card helper
+    def stat_card(label, value, color=ACCENT_GRN):
+        return html.Div([
+            html.P(label, style={'color': '#7a8399', 'fontSize': '11px',
+                                  'margin': '0', 'letterSpacing': '1.5px',
+                                  'textTransform': 'uppercase', 'fontFamily': 'Courier New'}),
+            html.H4(value, style={'color': color, 'margin': '4px 0 0',
+                                   'fontFamily': 'Courier New', 'fontSize': '20px'})
+        ], style={
+            'background': '#13161e',
+            'border': f'1px solid {GRID_COL}',
+            'borderTop': f'3px solid {color}',
+            'borderRadius': '4px',
+            'padding': '14px 18px',
+            'flex': '1',
+            'minWidth': '160px',
+        })
+
+    def build_stats(raw_df, by_strike_df, spot):
+        total_gex_val = raw_df['gex'].sum()
+        total_dex_val = raw_df['dex'].sum()
+        largest_strike = by_strike_df.loc[by_strike_df['net_gex'].abs().idxmax(), 'strike']
+        call_oi = int(raw_df[raw_df['flag'] == 'c']['openInterest'].sum())
+        put_oi = int(raw_df[raw_df['flag'] == 'p']['openInterest'].sum())
+        pcr = put_oi / call_oi if call_oi else 0
+        regime = '🟢 POSITIVE' if total_gex_val > 0 else '🔴 NEGATIVE'
+        regime_col = ACCENT_GRN if total_gex_val > 0 else ACCENT_RED
+        return [
+            stat_card('Spot Price', f'${spot:.2f}', ACCENT_YLW),
+            stat_card('Total GEX', f'${total_gex_val/1e9:.2f}B', ACCENT_GRN if total_gex_val > 0 else ACCENT_RED),
+            stat_card('Total DEX', f'${total_dex_val/1e6:.0f}M', ACCENT_BLU),
+            stat_card('GEX Regime', regime, regime_col),
+            stat_card('Peak GEX Strike', f'{largest_strike}', ACCENT_GRN),
+            stat_card('Put/Call OI Ratio', f'{pcr:.2f}', ACCENT_YLW),
+        ]
+
+    # App
+    app = dash.Dash(
+        __name__,
+        external_stylesheets=[dbc.themes.CYBORG],
+        title='DEX / GEX Dashboard'
+     )
+
+    HEADER = html.Div([
+        html.Div([
+            html.H2('⚡ DEX / GEX', style={'color': ACCENT_GRN, 'margin': '0',
+                                          'fontFamily': 'Courier New', 'fontSize': '28px',
+                                          'letterSpacing': '4px'}),
+            html.P('Options Exposure Dashboard', style={'color': '#7a8399', 'margin': '0',
+                                                        'fontFamily': 'Courier New',
+                                                        'fontSize': '12px', 'letterSpacing': '2px'}),
+        ]),
+        html.Div([
+            dcc.Input(id='ticker-input', value=DEFAULT_TICKER, type='text',
+                      placeholder='Ticker …',
+                      style={'background': '#1a1d27', 'border': f'1px solid {GRID_COL}',
+                             'color': TEXT_COL, 'padding': '8px 12px', 'borderRadius': '4px',
+                             'fontFamily': 'Courier New', 'fontSize': '14px',
+                             'width': '100px', 'textTransform': 'uppercase'}),
+            html.Div(
+                dcc.Slider(
+                    id='window-slider',
+                    min=5,
+                    max=25,
+                    step=5,
+                    value=10,
+                    marks={v: f'{v}%' for v in [5, 10, 15, 20, 25]},
+                    tooltip={'always_visible': False},
+                    className='mx-3',
+                ),
+                style={'width': '200px'}
+            ),
+            html.Button('↻ REFRESH', id='refresh-btn',
+                        style={'background': 'transparent', 'border': f'1px solid {ACCENT_GRN}',
+                               'color': ACCENT_GRN, 'padding': '8px 20px',
+                               'borderRadius': '4px', 'cursor': 'pointer',
+                               'fontFamily': 'Courier New', 'fontSize': '13px',
+                               'letterSpacing': '1px'}),
+        ], style={'display': 'flex', 'alignItems': 'center', 'gap': '12px'}),
+    ], style={
+        'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center',
+        'padding': '18px 28px', 'background': '#0d0f14',
+        'borderBottom': f'1px solid {GRID_COL}',
+    })
+
+    app.layout = html.Div([
+        HEADER,
+
+        html.Div(id='status-bar', style={'padding': '8px 28px', 'fontSize': '12px',
+                                         'color': '#7a8399', 'fontFamily': 'Courier New',
+                                         'borderBottom': f'1px solid {GRID_COL}'}),
+
+        html.Div(id='stat-cards',
+                 style={'display': 'flex', 'gap': '12px', 'padding': '16px 28px',
+                        'flexWrap': 'wrap'}),
+
+        html.Div([
+            html.Div(dcc.Graph(id='gex-bar'), style={'flex': '1', 'minWidth': '400px'}),
+            html.Div(dcc.Graph(id='dex-bar'), style={'flex': '1', 'minWidth': '400px'}),
+        ], style={'display': 'flex', 'gap': '12px', 'padding': '0 28px 12px'}),
+
+        html.Div([
+            html.Div(dcc.Graph(id='gex-expiry'), style={'flex': '1', 'minWidth': '300px'}),
+            html.Div(dcc.Graph(id='oi-heatmap'), style={'flex': '1.3', 'minWidth': '380px'}),
+            html.Div(dcc.Graph(id='vol-smile'), style={'flex': '1', 'minWidth': '300px'}),
+        ], style={'display': 'flex', 'gap': '12px', 'padding': '0 28px 28px'}),
+
+        dcc.Loading(html.Div(id='_dummy'), type='circle', color=ACCENT_GRN),
+
+    ], style={'background': DARK_BG, 'minHeight': '100vh', 'fontFamily': 'Courier New'})
+
+
+    # Callbacks
+    @app.callback(
+        Output('stat-cards', 'children'),
+        Output('gex-bar', 'figure'),
+        Output('dex-bar', 'figure'),
+        Output('gex-expiry', 'figure'),
+        Output('oi-heatmap', 'figure'),
+        Output('vol-smile', 'figure'),
+        Output('status-bar', 'children'),
+        Output('_dummy', 'children'),
+        Input('refresh-btn', 'n_clicks'),
+        Input('window-slider', 'value'),
+        State('ticker-input', 'value'),
+        prevent_initial_call=False,
+     )
+    def update_dashboard(n_clicks, window_pct, ticker_val):
+        triggered = ctx.triggered_id
+        ticker = (ticker_val or DEFAULT_TICKER).strip().upper()
+        wpct = (window_pct or 10) / 100
+
+        if triggered == 'refresh-btn' or store['raw'] is None or ticker != store['ticker']:
+            try:
+                raw_df, spot = fetch_options_data(ticker)
+                store['raw'] = raw_df
+                store['by_strike'] = aggregate_by_strike(raw_df)
+                store['by_expiry'] = aggregate_by_expiry(raw_df)
+                store['spot'] = spot
+                store['ticker'] = ticker
+            except Exception as e:
+                status = f'⚠  Error fetching {ticker}: {e}'
+                empty = go.Figure().update_layout(**base_layout())
+                return [], empty, empty, empty, empty, empty, status, ''
+
+        raw_df = store['raw']
+        bs_df = store['by_strike']
+        be_df = store['by_expiry']
+        spot = store['spot']
+        ticker = store['ticker']
+        ts = datetime.now().strftime('%H:%M:%S')
+
+        stats = build_stats(raw_df, bs_df, spot)
+        fig_gex = gex_bar_chart(bs_df, spot, ticker, wpct)
+        fig_dex = dex_bar_chart(bs_df, spot, ticker, wpct)
+        fig_exp = gex_expiry_chart(be_df, ticker)
+        fig_oi = oi_heatmap(raw_df, spot, ticker, wpct)
+        fig_vol = vol_smile_chart(raw_df, spot, ticker)
+        status = f'Last updated: {ts}  |  {len(raw_df):,} contracts  |  {raw_df["expiry"].nunique()} expiries  |  Spot ${spot:.2f}'
+
+        return stats, fig_gex, fig_dex, fig_exp, fig_oi, fig_vol, status, ''
+
+
+    def _pick_port(preferred: list[int]) -> int:
+        """Return the first available port from preferred, or an OS-assigned free port."""
+        for p in preferred:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(('127.0.0.1', p))
+                s.close()
+                return p
+            except OSError:
+                continue
+        # Fallback: ask OS for a free port
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(('127.0.0.1', 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+
     preferred_ports = [PORT, 8051, 8052]
     selected_port = _pick_port(preferred_ports)
     print('Dash app built.')

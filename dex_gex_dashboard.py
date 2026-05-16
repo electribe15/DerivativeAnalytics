@@ -507,8 +507,18 @@ if __name__ == '__main__':
         ]
 
     # App
+    # Create an explicit Flask server with a defined instance_path to avoid
+    # Flask attempting to auto-discover package paths (which can fail in some
+    # container/mounted environments). Pass this server into Dash.
+    import flask
+    import os
+    instance_dir = os.path.join(os.getcwd(), 'dash_instance')
+    os.makedirs(instance_dir, exist_ok=True)
+    server = flask.Flask('dex_gex_dashboard', instance_path=instance_dir)
+
     app = dash.Dash(
         __name__,
+        server=server,
         external_stylesheets=[dbc.themes.CYBORG],
         title='DEX / GEX Dashboard'
      )

@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""
+Converted script from the notebook `.devcontainer/dex_gex_dashboard.ipynb`.
+This script preserves the notebook's imports, helpers, data fetching, chart builders
+and the Dash app. Run it from the repository root.
+
+Usage:
+  python .devcontainer/dex_gex_dashboard.py
+
+Note: running this will start the Dash app and bind to `PORT` as defined in the config.
+"""
+
+import warnings
+warnings.filterwarnings('ignore')
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+from scipy.optimize import brentq
+import yfinance as yf
+from datetime import datetime, date
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+
+# ── Dashboard config ──────────────────────────────────────────────────────────
+DEFAULT_TICKER   = 'SPY'   # Change to any ticker (SPY, QQQ, AAPL, TSLA …)
+RISK_FREE_RATE   = 0.053221  # Update to current Fed funds rate
+OI_THRESHOLD     = 100     # Minimum open interest to keep a strike
+MAX_EXPIRY_DAYS  = 90      # Only look at expiries within this window
+PORT             = 8050    # Browser port
+
+print(f'Config loaded. Default ticker: {DEFAULT_TICKER}')
+
+# ── Black-Scholes helpers ─────────────────────────────────────────────
+
+def bs_delta(S, K, T, r, sigma, flag):
+    """Black-Scholes delta. flag='c' for call, 'p' for put."""
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    if flag == 'c':
+        return norm.cdf(d1)
+    else:
+        return norm.cdf(d1) - 1
+
+
+def bs_gamma(S, K, T, r, sigma):
+    """Black-Scholes gamma (same for calls & puts)."""
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    return norm.pdf(d1) / (S * sigma * np.sqrt(T))
+
+
+def implied_vol(price, S, K, T, r, flag, tol=1e-6):
+    """Implied volatility via Brent's method. Returns NaN on failure."""
+    if T <= 0 or price <= 0:
+        return np.nan
+    intrinsic = max(0, S - K) if flag == 'c' else max(0, K - S)
+    if price < intrinsic:
+        return np.nan
+    try:
+        def objective(sigma):
+            d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+            d2 = d1 - sigma * np.sqrt(T)
+            if flag == 'c':
+                return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2) - price
+            else:
+                return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1) - price
+        return brentq(objective, 1e-6, 10.0, xtol=tol)
+    except Exception:
+        return np.nan
+
+print('Black-Scholes functions ready.')
+
+# ── Data fetching & processing ────────────────────────────────────────
+
+def fetch_options_data(ticker: str, max_days: int = MAX_EXPIRY_DAYS,
+                        oi_thresh: int = OI_THRESHOLD, r: float = RISK_FREE_RATE):
+    """
+    Fetches options chain from Yahoo Finance and computes:
+    - Implied Volatility
+    - Delta per contract
+    - Gamma per contract
+    - DEX = delta * OI * 100
+    - GEX = gamma * OI * 100 * spot  (dealer convention: calls +, puts -)
+    """
+    print(f'Fetching data for {ticker} …')
+    tk   = yf.Ticker(ticker)
+    info = tk.fast_info
+    S    = info.last_price
+    print(f'  Spot price: ${S:.2f}')
+
+    today      = date.today()
+    expiries   = tk.options           # tuple of expiry strings
+    rows       = []
+
+    for exp_str in expiries:
+        exp_date = datetime.strptime(exp_str, '%Y-%m-%d').date()
+        T_days   = (exp_date - today).days
+        if T_days < 1 or T_days > max_days:
+            continue
+        T_years = T_days / 365.0
+
+        chain = tk.option_chain(exp_str)
+
+        for flag, df in [('c', chain.calls), ('p', chain.puts)]:
+            df = df.copy()
+            df['flag']       = flag
+            df['expiry']     = exp_str
+            df['T_days']     = T_days
+            df['T_years']    = T_years
+            df['spot']       = S
+            df['mid']        = (df['bid'] + df['ask']) / 2
+            rows.append(df)
+
+    if not rows:
+        raise ValueError('No options data found within the expiry window.')
+
+    data = pd.concat(rows, ignore_index=True)
+
+    # Filter low OI
+    data = data[data['openInterest'] >= oi_thresh].copy()
+
+    # Compute IV
+    data['iv'] = data.apply(
+        lambda row: implied_vol(row['mid'], S, row['strike'], row['T_years'], r, row['flag']),
+        axis=1
+    )
+    data.dropna(subset=['iv'], inplace=True)
+    data = data[data['iv'] > 0].copy()
+
+    # Greeks
+    data['delta'] = data.apply(
+        lambda row: bs_delta(S, row['strike'], row['T_years'], r, row['iv'], row['flag']),
+        axis=1,
+    )
+    data['gamma'] = data.apply(
+        lambda row: bs_gamma(S, row['strike'], row['T_years'], r, row['iv']),
+        axis=1,
+    )
+
+    # DEX = net delta dollars per 1-point move  (delta * OI * 100)
+    data['dex'] = data['delta'] * data['openInterest'] * 100
+
+    # GEX = gamma * OI * 100 * spot  (dealer flip: puts negative)
+    sign = data['flag'].map({'c': 1, 'p': -1})
+    data['gex'] = sign * data['gamma'] * data['openInterest'] * 100 * S
+
+    print(f'  Loaded {len(data):,} option contracts across {data["expiry"].nunique()} expiries.')
+    return data, S
+
+
+def aggregate_by_strike(data: pd.DataFrame):
+    """Roll up DEX and GEX to per-strike totals."""
+    agg = data.groupby('strike').agg(
+        net_dex = ('dex', 'sum'),
+        net_gex = ('gex', 'sum'),
+        call_dex = ('dex', lambda x: x[data.loc[x.index, 'flag'] == 'c'].sum()),
+        put_dex  = ('dex', lambda x: x[data.loc[x.index, 'flag'] == 'p'].sum()),
+        call_gex = ('gex', lambda x: x[data.loc[x.index, 'flag'] == 'c'].sum()),
+        put_gex  = ('gex', lambda x: x[data.loc[x.index, 'flag'] == 'p'].sum()),
+        total_oi = ('openInterest', 'sum'),
+    ).reset_index()
+    return agg
+
+
+def aggregate_by_expiry(data: pd.DataFrame):
+    """Roll up DEX and GEX to per-expiry totals."""
+    return data.groupby(['expiry', 'T_days']).agg(
+        net_dex = ('dex', 'sum'),
+        net_gex = ('gex', 'sum'),
+        total_oi = ('openInterest', 'sum'),
+    ).reset_index().sort_values('T_days')
+
+print('Data functions ready.')
+
+# ── Load initial data (lazy: do not fetch until run) ─────────────────────────────────
+
+# Note: fetching at import time can be slow and requires network; keep commented by default.
+# raw_data, spot_price = fetch_options_data(DEFAULT_TICKER)
+# by_strike  = aggregate_by_strike(raw_data)
+# by_expiry  = aggregate_by_expiry(raw_data)
+
+# ── Chart builders ────────────────────────────────────────────────────
+
+DARK_BG    = '#0d0f14'
+CARD_BG    = '#13161e'
+ACCENT_GRN = '#00e5a0'
+ACCENT_RED = '#ff4d6d'
+ACCENT_BLU = '#4db8ff'
+ACCENT_YLW = '#ffd166'
+GRID_COL   = '#1e2130'
+TEXT_COL   = '#c9d1e0'
+
+
+def base_layout(title='', height=420):
+    return dict(
+        title=dict(text=title, font=dict(color=TEXT_COL, size=14, family='Courier New')),
+        paper_bgcolor=CARD_BG,
+        plot_bgcolor=CARD_BG,
+        font=dict(color=TEXT_COL, family='Courier New'),
+        height=height,
+        xaxis=dict(gridcolor=GRID_COL, zerolinecolor=GRID_COL),
+        yaxis=dict(gridcolor=GRID_COL, zerolinecolor=GRID_COL),
+        margin=dict(l=50, r=20, t=40, b=40),
+        legend=dict(bgcolor='rgba(0,0,0,0)', font=dict(size=11))
+    )
+
+
+def gex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10):
+    lo = spot * (1 - window_pct)
+    hi = spot * (1 + window_pct)
+    df = by_strike_df[(by_strike_df['strike'] >= lo) & (by_strike_df['strike'] <= hi)].copy()
+
+    colors = [ACCENT_GRN if v >= 0 else ACCENT_RED for v in df['net_gex']]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=df['strike'], y=df['net_gex'] / 1e6,
+        marker_color=colors,
+        name='Net GEX'
+    ))
+    fig.add_vline(x=spot, line_color=ACCENT_YLW, line_dash='dash',
+                  annotation_text=f' Spot ${spot:.1f}',
+                  annotation_font_color=ACCENT_YLW)
+    fig.update_layout(**base_layout(f'GEX by Strike — {ticker}'),
+                       yaxis_title='GEX ($M)',
+                       xaxis_title='Strike')
+    return fig
+
+
+def dex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10):
+    lo = spot * (1 - window_pct)
+    hi = spot * (1 + window_pct)
+    df = by_strike_df[(by_strike_df['strike'] >= lo) & (by_strike_df['strike'] <= hi)].copy()
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df['strike'], y=df['call_dex'] / 1e6,
+                          name='Call DEX', marker_color=ACCENT_GRN))
+    fig.add_trace(go.Bar(x=df['strike'], y=df['put_dex'] / 1e6,
+                          name='Put DEX', marker_color=ACCENT_RED))
+    fig.add_trace(go.Scatter(x=df['strike'], y=df['net_dex'] / 1e6,
+                              mode='lines+markers', name='Net DEX',
+                              line=dict(color=ACCENT_YLW, width=2)))
+    fig.add_vline(x=spot, line_color=ACCENT_BLU, line_dash='dash',
+                  annotation_text=f' Spot ${spot:.1f}',
+                  annotation_font_color=ACCENT_BLU)
+    fig.update_layout(**base_layout(f'DEX by Strike — {ticker}'),
+                       barmode='relative',
+                       yaxis_title='DEX ($M)',
+                       xaxis_title='Strike')
+    return fig
+
+
+def gex_expiry_chart(by_expiry_df, ticker):
+    fig = go.Figure()
+    colors = [ACCENT_GRN if v >= 0 else ACCENT_RED for v in by_expiry_df['net_gex']]
+    fig.add_trace(go.Bar(
+        x=by_expiry_df['expiry'], y=by_expiry_df['net_gex'] / 1e6,
+        marker_color=colors, name='Net GEX'
+    ))
+    fig.update_layout(**base_layout(f'GEX by Expiry — {ticker}'),
+                       yaxis_title='GEX ($M)', xaxis_title='Expiry')
+    return fig
+
+
+def oi_heatmap(raw_df, spot, ticker, window_pct=0.12):
+    lo = spot * (1 - window_pct)
+    hi = spot * (1 + window_pct)
+    df = raw_df[(raw_df['strike'] >= lo) & (raw_df['strike'] <= hi)].copy()
+
+    pivot = df.pivot_table(index='expiry', columns='strike',
+                            values='openInterest', aggfunc='sum', fill_value=0)
+    fig = go.Figure(go.Heatmap(
+        z=pivot.values / 1000,
+        x=[str(c) for c in pivot.columns],
+        y=pivot.index.tolist(),
+        colorscale='Viridis',
+        colorbar=dict(title='OI (K)', tickfont=dict(color=TEXT_COL)),
+        hoverongaps=False
+    ))
+    fig.update_layout(**base_layout(f'Open Interest Heatmap — {ticker}', height=380),
+                       xaxis_title='Strike', yaxis_title='Expiry')
+    return fig
+
+
+def vol_smile_chart(raw_df, spot, ticker):
+    """IV smile for nearest 3 expiries."""
+    expiries = sorted(raw_df['expiry'].unique())[:4]
+    colors   = [ACCENT_GRN, ACCENT_BLU, ACCENT_YLW, ACCENT_RED]
+    fig = go.Figure()
+    for exp, col in zip(expiries, colors):
+        sub = raw_df[(raw_df['expiry'] == exp) & (raw_df['flag'] == 'c')].sort_values('strike')
+        fig.add_trace(go.Scatter(
+            x=sub['strike'], y=sub['iv'] * 100,
+            mode='lines', name=exp, line=dict(color=col, width=2)
+        ))
+    fig.add_vline(x=spot, line_color=ACCENT_YLW, line_dash='dot')
+    fig.update_layout(**base_layout(f'IV Smile (Calls) — {ticker}'),
+                       yaxis_title='Implied Vol (%)', xaxis_title='Strike')
+    return fig
+
+print('Chart builders ready.')
+
+# ── Dash Application ──────────────────────────────────────────────────
+import dash
+from dash import dcc, html, Input, Output, State, ctx
+import dash_bootstrap_components as dbc
+
+# Shared state will be initialized lazily after first fetch
+store = {
+    'raw':       None,
+    'by_strike': None,
+    'by_expiry': None,
+    'spot':      None,
+    'ticker':    DEFAULT_TICKER,
+}
+
+# Stat card helper
+
+def stat_card(label, value, color=ACCENT_GRN):
+    return html.Div([
+        html.P(label, style={'color': '#7a8399', 'fontSize': '11px',
+                              'margin': '0', 'letterSpacing': '1.5px',
+                              'textTransform': 'uppercase', 'fontFamily': 'Courier New'}),
+        html.H4(value, style={'color': color, 'margin': '4px 0 0',
+                               'fontFamily': 'Courier New', 'fontSize': '20px'})
+    ], style={
+        'background': '#13161e',
+        'border': f'1px solid {GRID_COL}',
+        'borderTop': f'3px solid {color}',
+        'borderRadius': '4px',
+        'padding': '14px 18px',
+        'flex': '1',
+        'minWidth': '160px',
+    })
+
+
+def build_stats(raw_df, by_strike_df, spot):
+    total_gex_val = raw_df['gex'].sum()
+    total_dex_val = raw_df['dex'].sum()
+    largest_strike = by_strike_df.loc[by_strike_df['net_gex'].abs().idxmax(), 'strike']
+    call_oi = int(raw_df[raw_df['flag'] == 'c']['openInterest'].sum())
+    put_oi = int(raw_df[raw_df['flag'] == 'p']['openInterest'].sum())
+    pcr = put_oi / call_oi if call_oi else 0
+    regime = '🟢 POSITIVE' if total_gex_val > 0 else '🔴 NEGATIVE'
+    regime_col = ACCENT_GRN if total_gex_val > 0 else ACCENT_RED
+    return [
+        stat_card('Spot Price', f'${spot:.2f}', ACCENT_YLW),
+        stat_card('Total GEX', f'${total_gex_val/1e9:.2f}B', ACCENT_GRN if total_gex_val > 0 else ACCENT_RED),
+        stat_card('Total DEX', f'${total_dex_val/1e6:.0f}M', ACCENT_BLU),
+        stat_card('GEX Regime', regime, regime_col),
+        stat_card('Peak GEX Strike', f'{largest_strike}', ACCENT_GRN),
+        stat_card('Put/Call OI Ratio', f'{pcr:.2f}', ACCENT_YLW),
+    ]
+
+# App
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.CYBORG],
+    title='DEX / GEX Dashboard'
+ )
+
+HEADER = html.Div([
+    html.Div([
+        html.H2('⚡ DEX / GEX', style={'color': ACCENT_GRN, 'margin': '0',
+                                      'fontFamily': 'Courier New', 'fontSize': '28px',
+                                      'letterSpacing': '4px'}),
+        html.P('Options Exposure Dashboard', style={'color': '#7a8399', 'margin': '0',
+                                                    'fontFamily': 'Courier New',
+                                                    'fontSize': '12px', 'letterSpacing': '2px'}),
+    ]),
+    html.Div([
+        dcc.Input(id='ticker-input', value=DEFAULT_TICKER, type='text',
+                  placeholder='Ticker …',
+                  style={'background': '#1a1d27', 'border': f'1px solid {GRID_COL}',
+                         'color': TEXT_COL, 'padding': '8px 12px', 'borderRadius': '4px',
+                         'fontFamily': 'Courier New', 'fontSize': '14px',
+                         'width': '100px', 'textTransform': 'uppercase'}),
+        html.Div(
+            dcc.Slider(
+                id='window-slider',
+                min=5,
+                max=25,
+                step=5,
+                value=10,
+                marks={v: f'{v}%' for v in [5, 10, 15, 20, 25]},
+                tooltip={'always_visible': False},
+                className='mx-3',
+            ),
+            style={'width': '200px'}
+        ),
+        html.Button('↻ REFRESH', id='refresh-btn',
+                    style={'background': 'transparent', 'border': f'1px solid {ACCENT_GRN}',
+                           'color': ACCENT_GRN, 'padding': '8px 20px',
+                           'borderRadius': '4px', 'cursor': 'pointer',
+                           'fontFamily': 'Courier New', 'fontSize': '13px',
+                           'letterSpacing': '1px'}),
+    ], style={'display': 'flex', 'alignItems': 'center', 'gap': '12px'}),
+], style={
+    'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center',
+    'padding': '18px 28px', 'background': '#0d0f14',
+    'borderBottom': f'1px solid {GRID_COL}',
+})
+
+app.layout = html.Div([
+    HEADER,
+
+    html.Div(id='status-bar', style={'padding': '8px 28px', 'fontSize': '12px',
+                                     'color': '#7a8399', 'fontFamily': 'Courier New',
+                                     'borderBottom': f'1px solid {GRID_COL}'}),
+
+    html.Div(id='stat-cards',
+             style={'display': 'flex', 'gap': '12px', 'padding': '16px 28px',
+                    'flexWrap': 'wrap'}),
+
+    html.Div([
+        html.Div(dcc.Graph(id='gex-bar'), style={'flex': '1', 'minWidth': '400px'}),
+        html.Div(dcc.Graph(id='dex-bar'), style={'flex': '1', 'minWidth': '400px'}),
+    ], style={'display': 'flex', 'gap': '12px', 'padding': '0 28px 12px'}),
+
+    html.Div([
+        html.Div(dcc.Graph(id='gex-expiry'), style={'flex': '1', 'minWidth': '300px'}),
+        html.Div(dcc.Graph(id='oi-heatmap'), style={'flex': '1.3', 'minWidth': '380px'}),
+        html.Div(dcc.Graph(id='vol-smile'), style={'flex': '1', 'minWidth': '300px'}),
+    ], style={'display': 'flex', 'gap': '12px', 'padding': '0 28px 28px'}),
+
+    dcc.Loading(html.Div(id='_dummy'), type='circle', color=ACCENT_GRN),
+
+], style={'background': DARK_BG, 'minHeight': '100vh', 'fontFamily': 'Courier New'})
+
+
+# Callbacks
+@app.callback(
+    Output('stat-cards', 'children'),
+    Output('gex-bar', 'figure'),
+    Output('dex-bar', 'figure'),
+    Output('gex-expiry', 'figure'),
+    Output('oi-heatmap', 'figure'),
+    Output('vol-smile', 'figure'),
+    Output('status-bar', 'children'),
+    Output('_dummy', 'children'),
+    Input('refresh-btn', 'n_clicks'),
+    Input('window-slider', 'value'),
+    State('ticker-input', 'value'),
+    prevent_initial_call=False,
+ )
+def update_dashboard(n_clicks, window_pct, ticker_val):
+    triggered = ctx.triggered_id
+    ticker = (ticker_val or DEFAULT_TICKER).strip().upper()
+    wpct = (window_pct or 10) / 100
+
+    if triggered == 'refresh-btn' or store['raw'] is None or ticker != store['ticker']:
+        try:
+            raw_df, spot = fetch_options_data(ticker)
+            store['raw'] = raw_df
+            store['by_strike'] = aggregate_by_strike(raw_df)
+            store['by_expiry'] = aggregate_by_expiry(raw_df)
+            store['spot'] = spot
+            store['ticker'] = ticker
+        except Exception as e:
+            status = f'⚠  Error fetching {ticker}: {e}'
+            empty = go.Figure().update_layout(**base_layout())
+            return [], empty, empty, empty, empty, empty, status, ''
+
+    raw_df = store['raw']
+    bs_df = store['by_strike']
+    be_df = store['by_expiry']
+    spot = store['spot']
+    ticker = store['ticker']
+    ts = datetime.now().strftime('%H:%M:%S')
+
+    stats = build_stats(raw_df, bs_df, spot)
+    fig_gex = gex_bar_chart(bs_df, spot, ticker, wpct)
+    fig_dex = dex_bar_chart(bs_df, spot, ticker, wpct)
+    fig_exp = gex_expiry_chart(be_df, ticker)
+    fig_oi = oi_heatmap(raw_df, spot, ticker, wpct)
+    fig_vol = vol_smile_chart(raw_df, spot, ticker)
+    status = f'Last updated: {ts}  |  {len(raw_df):,} contracts  |  {raw_df["expiry"].nunique()} expiries  |  Spot ${spot:.2f}'
+
+    return stats, fig_gex, fig_dex, fig_exp, fig_oi, fig_vol, status, ''
+
+
+if __name__ == '__main__':
+    print('Dash app built.')
+    print(f'\n🚀  Starting dashboard on  http://127.0.0.1:{PORT}')
+    print('   Press  Ctrl+C  in this terminal to stop.\n')
+    app.run(debug=False, port=PORT)

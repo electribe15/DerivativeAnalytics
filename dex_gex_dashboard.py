@@ -18,6 +18,7 @@ import pandas as pd
 from scipy.stats import norm
 from scipy.optimize import brentq
 import yfinance as yf
+import socket
 from datetime import datetime, date
 import plotly.graph_objects as go
 import plotly.express as px
@@ -28,7 +29,7 @@ DEFAULT_TICKER   = 'SPY'   # Change to any ticker (SPY, QQQ, AAPL, TSLA …)
 RISK_FREE_RATE   = 0.053221  # Update to current Fed funds rate
 OI_THRESHOLD     = 100     # Minimum open interest to keep a strike
 MAX_EXPIRY_DAYS  = 90      # Only look at expiries within this window
-PORT             = 8050    # Browser port
+PORT             = 8051    # Browser port (safe default)
 
 print(f'Config loaded. Default ticker: {DEFAULT_TICKER}')
 
@@ -287,20 +288,168 @@ def oi_heatmap(raw_df, spot, ticker, window_pct=0.12):
 
 
 def vol_smile_chart(raw_df, spot, ticker):
-    """IV smile for nearest 3 expiries."""
-    expiries = sorted(raw_df['expiry'].unique())[:4]
-    colors   = [ACCENT_GRN, ACCENT_BLU, ACCENT_YLW, ACCENT_RED]
-    fig = go.Figure()
-    for exp, col in zip(expiries, colors):
-        sub = raw_df[(raw_df['expiry'] == exp) & (raw_df['flag'] == 'c')].sort_values('strike')
-        fig.add_trace(go.Scatter(
-            x=sub['strike'], y=sub['iv'] * 100,
-            mode='lines', name=exp, line=dict(color=col, width=2)
-        ))
+    """IV smile or surface for calls.
+
+    - If there are 4 or fewer expiries, show individual IV smiles (lines).
+    - If there are more expiries, interpolate each expiry's call IVs onto a
+      common strike grid and render a continuous heatmap (expiry vs strike).
+    """
+    expiries = sorted(raw_df['expiry'].unique())
+    n_exp = len(expiries)
+
+    # Keep the compact multi-line view for a small number of expiries
+    if n_exp <= 4:
+        expiries = expiries[:4]
+        colors = [ACCENT_GRN, ACCENT_BLU, ACCENT_YLW, ACCENT_RED]
+        fig = go.Figure()
+        for exp, col in zip(expiries, colors):
+            sub = raw_df[(raw_df['expiry'] == exp) & (raw_df['flag'] == 'c')].sort_values('strike')
+            fig.add_trace(go.Scatter(
+                x=sub['strike'], y=sub['iv'] * 100,
+                mode='lines', name=exp, line=dict(color=col, width=2)
+            ))
+        fig.add_vline(x=spot, line_color=ACCENT_YLW, line_dash='dot')
+        fig.update_layout(**base_layout(f'IV Smile (Calls) — {ticker}'),
+                           yaxis_title='Implied Vol (%)', xaxis_title='Strike')
+        return fig
+
+    # For many expiries, build a continuous IV surface by interpolating onto
+    # a common strike grid so that the surface/heatmap is smooth and continuous.
+    calls = raw_df[raw_df['flag'] == 'c']
+    if calls.empty:
+        # fallback to empty figure
+        fig = go.Figure()
+        fig.update_layout(**base_layout(f'IV Surface (Calls) — {ticker}'))
+        return fig
+
+    # Determine strike grid (dense enough for a smooth surface)
+    min_strike = calls['strike'].min()
+    max_strike = calls['strike'].max()
+    if pd.isna(min_strike) or pd.isna(max_strike) or min_strike >= max_strike:
+        fig = go.Figure()
+        fig.update_layout(**base_layout(f'IV Surface (Calls) — {ticker}'))
+        return fig
+
+    strike_grid = np.linspace(min_strike, max_strike, 140)
+
+    # Order expiries by time to expiry (T_days) for a natural y-axis
+    exp_meta = raw_df[['expiry', 'T_days']].drop_duplicates().set_index('expiry')
+    expiries_sorted = exp_meta.loc[expiries].sort_values('T_days').index.tolist()
+
+    z_rows = []
+    y_labels = []
+    for exp in expiries_sorted:
+        sub = calls[calls['expiry'] == exp].sort_values('strike')
+        strikes = sub['strike'].values
+        ivs = sub['iv'].values
+        if len(strikes) < 2:
+            row = np.full(strike_grid.shape, np.nan)
+        else:
+            # Interpolate; values outside known strikes set to nan for clarity
+            row = np.interp(strike_grid, strikes, ivs, left=np.nan, right=np.nan)
+        z_rows.append(row * 100)  # convert to percent
+        y_labels.append(exp)
+
+    z = np.vstack(z_rows)
+
+    fig = go.Figure(go.Heatmap(
+        z=z,
+        x=np.round(strike_grid, 2),
+        y=y_labels,
+        colorscale='Viridis',
+        colorbar=dict(title='Implied Vol (%)', tickfont=dict(color=TEXT_COL)),
+        hovertemplate='Expiry: %{y}<br>Strike: %{x}<br>IV: %{z:.2f}%',
+        zmin=np.nanpercentile(z, 2) if np.isfinite(z).any() else None,
+        zmax=np.nanpercentile(z, 98) if np.isfinite(z).any() else None,
+        hoverongaps=False,
+    ))
+
+    fig.update_layout(**base_layout(f'IV Surface (Calls) — {ticker}', height=420),
+                       xaxis_title='Strike', yaxis_title='Expiry')
     fig.add_vline(x=spot, line_color=ACCENT_YLW, line_dash='dot')
-    fig.update_layout(**base_layout(f'IV Smile (Calls) — {ticker}'),
-                       yaxis_title='Implied Vol (%)', xaxis_title='Strike')
     return fig
+
+
+# --- Additional chart builders (from notebook)
+def iv_surface_chart(raw_df, spot, ticker, expiries_to_show=6, expiries_list=None):
+    # expiries_list: explicit list of expiry strings to use (overrides expiries_to_show)
+    if expiries_list is not None and len(expiries_list) > 0:
+        exps = list(expiries_list)
+    else:
+        exps = sorted(raw_df['expiry'].unique())[:expiries_to_show]
+
+    sub = raw_df[raw_df['expiry'].isin(exps) & (raw_df['flag']=='c')].copy()
+    pivot = sub.pivot_table(index='expiry', columns='strike', values='iv', aggfunc='mean')
+    if pivot.empty:
+        return go.Figure().update_layout(**base_layout(f'IV Surface — {ticker} (no data)'))
+
+    x = [float(c) for c in pivot.columns]
+    y = pivot.index.tolist()
+    z = (pivot.values * 100)  # percent
+
+    fig = go.Figure()
+    fig.add_trace(go.Surface(z=z, x=x, y=y, colorscale='Viridis', colorbar=dict(title='IV %')))
+    fig.update_layout(**base_layout(f'IV Surface — {ticker}', height=480),
+                      scene=dict(xaxis_title='Strike', yaxis_title='Expiry', zaxis_title='IV (%)',
+                                 xaxis=dict(gridcolor=GRID_COL), yaxis=dict(gridcolor=GRID_COL), zaxis=dict(gridcolor=GRID_COL)))
+    return fig
+
+
+def vega_heatmap(raw_df, spot, ticker, window_pct=0.12):
+    lo = spot * (1 - window_pct)
+    hi = spot * (1 + window_pct)
+    df = raw_df[(raw_df['strike'] >= lo) & (raw_df['strike'] <= hi)].copy()
+    pivot = df.pivot_table(index='expiry', columns='strike', values='vega_exposure', aggfunc='sum', fill_value=0)
+    z = pivot.values / 1e6  # show in $M
+    fig = go.Figure(go.Heatmap(
+        z=z,
+        x=[str(c) for c in pivot.columns],
+        y=pivot.index.tolist(),
+        colorscale='RdYlGn',
+        colorbar=dict(title='Vega Exposure ($M)', tickfont=dict(color=TEXT_COL)),
+        hoverongaps=False
+    ))
+    fig.update_layout(**base_layout(f'Vega Exposure Heatmap — {ticker}', height=420),
+                       xaxis_title='Strike', yaxis_title='Expiry')
+    return fig
+
+
+def term_structure_chart(raw_df, spot, ticker):
+    rows = []
+    for exp in sorted(raw_df['expiry'].unique()):
+        sub = raw_df[(raw_df['expiry']==exp)].copy()
+        # pick strike closest to spot (ATM)
+        atm = sub.loc[(sub['strike'] - spot).abs().idxmin()]
+        rows.append((exp, atm['iv']*100))
+    df = pd.DataFrame(rows, columns=['expiry','atm_iv'])
+    fig = go.Figure(go.Scatter(x=df['expiry'], y=df['atm_iv'], mode='lines+markers', line=dict(color=ACCENT_BLU)))
+    fig.update_layout(**base_layout(f'ATM Term Structure — {ticker}', height=360), yaxis_title='ATM IV (%)', xaxis_title='Expiry')
+    return fig
+
+
+def skew_chart(raw_df, spot, ticker):
+    # For each expiry, find approx 25-delta call and put vols
+    rows = []
+    for exp in sorted(raw_df['expiry'].unique()):
+        sub = raw_df[raw_df['expiry'] == exp].copy()
+        calls = sub[sub['flag']=='c']
+        puts  = sub[sub['flag']=='p']
+        if calls.empty or puts.empty:
+            continue
+        # call delta target 0.25
+        call_idx = (calls['delta'] - 0.25).abs().idxmin()
+        put_idx  = (puts['delta'] + 0.25).abs().idxmin()
+        call_iv = calls.loc[call_idx, 'iv'] * 100
+        put_iv  = puts.loc[put_idx, 'iv'] * 100
+        rows.append((exp, call_iv, put_iv, put_iv - call_iv))
+    df = pd.DataFrame(rows, columns=['expiry','call25_iv','put25_iv','skew25'])
+    fig = make_subplots(rows=1, cols=2, subplot_titles=('25Δ Call/Put Vols','25Δ Skew'))
+    fig.add_trace(go.Scatter(x=df['expiry'], y=df['call25_iv'], mode='lines+markers', name='25Δ Call', line=dict(color=ACCENT_GRN)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['expiry'], y=df['put25_iv'], mode='lines+markers', name='25Δ Put', line=dict(color=ACCENT_RED)), row=1, col=1)
+    fig.add_trace(go.Bar(x=df['expiry'], y=df['skew25'], name='25Δ Skew', marker_color=ACCENT_YLW), row=1, col=2)
+    fig.update_layout(**base_layout(f'Skew Metrics — {ticker}', height=360))
+    return fig
+
 
 print('Chart builders ready.')
 
@@ -483,8 +632,31 @@ def update_dashboard(n_clicks, window_pct, ticker_val):
     return stats, fig_gex, fig_dex, fig_exp, fig_oi, fig_vol, status, ''
 
 
+def _pick_port(preferred: list[int]) -> int:
+    """Return the first available port from preferred, or an OS-assigned free port."""
+    for p in preferred:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(('127.0.0.1', p))
+            s.close()
+            return p
+        except OSError:
+            continue
+    # Fallback: ask OS for a free port
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 if __name__ == '__main__':
+    preferred_ports = [PORT, 8051, 8052]
+    selected_port = _pick_port(preferred_ports)
     print('Dash app built.')
-    print(f'\n🚀  Starting dashboard on  http://127.0.0.1:{PORT}')
+    print(f"\n🚀  Starting dashboard on  http://127.0.0.1:{selected_port}")
+    if selected_port != PORT:
+        print(f"  Note: preferred port {PORT} was unavailable; using {selected_port} instead.")
     print('   Press  Ctrl+C  in this terminal to stop.\n')
-    app.run(debug=False, port=PORT)
+    app.run(debug=False, port=selected_port, host='127.0.0.1')

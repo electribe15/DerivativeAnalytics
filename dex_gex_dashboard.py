@@ -514,7 +514,12 @@ if __name__ == '__main__':
     import os
     instance_dir = os.path.join(os.getcwd(), 'dash_instance')
     os.makedirs(instance_dir, exist_ok=True)
-    server = flask.Flask('dex_gex_dashboard', instance_path=instance_dir)
+    # Use a known import name (here 'flask') so Flask can locate a loader
+    # in environments where the local module/package is not importable
+    # (mounted filesystems, containers, etc.). The import_name is used
+    # only to compute resource paths; choosing a stable installed package
+    # avoids pkgutil.get_loader returning None.
+    server = flask.Flask('flask', instance_path=instance_dir)
 
     app = dash.Dash(
         __name__,

@@ -20,9 +20,10 @@ from scipy.optimize import brentq
 import yfinance as yf
 import socket
 from datetime import datetime, date
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
+# Defer Plotly imports to inside plotting functions so this module can be
+# imported without requiring Plotly to be installed. Plotly is heavy and
+# only needed when rendering charts (Streamlit/ Dash). See individual
+# chart functions for local imports.
 
 # ── Dashboard config ──────────────────────────────────────────────────────────
 DEFAULT_TICKER   = 'SPY'   # Change to any ticker (SPY, QQQ, AAPL, TSLA …)
@@ -211,6 +212,8 @@ def base_layout(title='', height=420):
 
 
 def gex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10):
+    import plotly.graph_objects as go
+
     lo = spot * (1 - window_pct)
     hi = spot * (1 + window_pct)
     df = by_strike_df[(by_strike_df['strike'] >= lo) & (by_strike_df['strike'] <= hi)].copy()
@@ -233,6 +236,8 @@ def gex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10):
 
 
 def dex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10):
+    import plotly.graph_objects as go
+
     lo = spot * (1 - window_pct)
     hi = spot * (1 + window_pct)
     df = by_strike_df[(by_strike_df['strike'] >= lo) & (by_strike_df['strike'] <= hi)].copy()
@@ -256,6 +261,8 @@ def dex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10):
 
 
 def gex_expiry_chart(by_expiry_df, ticker):
+    import plotly.graph_objects as go
+
     fig = go.Figure()
     colors = [ACCENT_GRN if v >= 0 else ACCENT_RED for v in by_expiry_df['net_gex']]
     fig.add_trace(go.Bar(
@@ -268,6 +275,8 @@ def gex_expiry_chart(by_expiry_df, ticker):
 
 
 def oi_heatmap(raw_df, spot, ticker, window_pct=0.12):
+    import plotly.graph_objects as go
+
     lo = spot * (1 - window_pct)
     hi = spot * (1 + window_pct)
     df = raw_df[(raw_df['strike'] >= lo) & (raw_df['strike'] <= hi)].copy()
@@ -296,6 +305,9 @@ def vol_smile_chart(raw_df, spot, ticker):
     """
     expiries = sorted(raw_df['expiry'].unique())
     n_exp = len(expiries)
+
+    # Local import so module import doesn't require Plotly
+    import plotly.graph_objects as go
 
     # Keep the compact multi-line view for a small number of expiries
     if n_exp <= 4:
@@ -372,30 +384,176 @@ def vol_smile_chart(raw_df, spot, ticker):
 
 # --- Additional chart builders (from notebook)
 def iv_surface_chart(raw_df, spot, ticker, expiries_to_show=6, expiries_list=None):
-    # expiries_list: explicit list of expiry strings to use (overrides expiries_to_show)
+    """
+    IV Surface 3D con:
+    - Contour lines sovrapposte alla superficie
+    - ATM line verticale (strike = spot)
+    - Colorscale RdYlGn (verde=bassa IV, rosso=alta IV)
+    - Filtri dati sporchi + interpolazione su griglia densa per superficie continua
+    """
+    from scipy.interpolate import griddata
+    import numpy as np
+
+    # ── Selezione scadenze ────────────────────────────────────────────
     if expiries_list is not None and len(expiries_list) > 0:
         exps = list(expiries_list)
     else:
         exps = sorted(raw_df['expiry'].unique())[:expiries_to_show]
 
-    sub = raw_df[raw_df['expiry'].isin(exps) & (raw_df['flag']=='c')].copy()
-    pivot = sub.pivot_table(index='expiry', columns='strike', values='iv', aggfunc='mean')
-    if pivot.empty:
+    sub = raw_df[raw_df['expiry'].isin(exps) & (raw_df['flag'] == 'c')].copy()
+
+    # ── Filtri dati sporchi ───────────────────────────────────────────
+    sub = sub[sub['iv'] > 0.01]          # rimuovi IV quasi zero
+    sub = sub[sub['iv'] < 5.0]           # rimuovi outlier > 500%
+    sub = sub[sub['openInterest'] > 50]  # solo contratti liquidi
+    sub = sub[sub['bid'] > 0]            # solo con bid valido
+
+    if sub.empty:
         return go.Figure().update_layout(**base_layout(f'IV Surface — {ticker} (no data)'))
 
-    x = [float(c) for c in pivot.columns]
-    y = pivot.index.tolist()
-    z = (pivot.values * 100)  # percent
+    # ── Converti expiry in numero (T_days) per asse Y numerico ────────
+    exp_to_tdays = sub[['expiry', 'T_days']].drop_duplicates().set_index('expiry')['T_days'].to_dict()
+    sub['t_num'] = sub['expiry'].map(exp_to_tdays)
 
+    # ── Griglia densa per interpolazione ─────────────────────────────
+    strike_min = sub['strike'].min()
+    strike_max = sub['strike'].max()
+    t_min      = sub['t_num'].min()
+    t_max      = sub['t_num'].max()
+
+    n_strike = 80
+    n_expiry = 40
+    grid_strikes  = np.linspace(strike_min, strike_max, n_strike)
+    grid_tdays    = np.linspace(t_min, t_max, n_expiry)
+    grid_x, grid_y = np.meshgrid(grid_strikes, grid_tdays)
+
+    # Interpolazione bicubica su griglia regolare
+    points = sub[['strike', 't_num']].values
+    values = sub['iv'].values * 100  # percentuale
+
+    z_grid = griddata(points, values, (grid_x, grid_y), method='cubic')
+
+    # Fallback lineare dove il cubico non arriva (bordi)
+    z_lin  = griddata(points, values, (grid_x, grid_y), method='linear')
+    z_nn   = griddata(points, values, (grid_x, grid_y), method='nearest')
+    z_grid = np.where(np.isnan(z_grid), z_lin, z_grid)
+    z_grid = np.where(np.isnan(z_grid), z_nn,  z_grid)
+
+    # Clip valori estremi (2°-98° percentile)
+    z_lo = np.nanpercentile(z_grid, 2)
+    z_hi = np.nanpercentile(z_grid, 98)
+    z_grid = np.clip(z_grid, z_lo, z_hi)
+
+    # Etichette Y (expiry string) per ogni riga della griglia
+    tdays_sorted   = sorted(exp_to_tdays.values())
+    expiry_by_tday = {v: k for k, v in exp_to_tdays.items()}
+    # Mappa ogni valore numerico della griglia Y all'expiry string più vicina
+    y_labels = []
+    for td in grid_tdays:
+        closest = min(tdays_sorted, key=lambda x: abs(x - td))
+        y_labels.append(expiry_by_tday[closest])
+
+    # ── Figura ────────────────────────────────────────────────────────
     fig = go.Figure()
-    fig.add_trace(go.Surface(z=z, x=x, y=y, colorscale='Viridis', colorbar=dict(title='IV %')))
-    fig.update_layout(**base_layout(f'IV Surface — {ticker}', height=480),
-                      scene=dict(xaxis_title='Strike', yaxis_title='Expiry', zaxis_title='IV (%)',
-                                 xaxis=dict(gridcolor=GRID_COL), yaxis=dict(gridcolor=GRID_COL), zaxis=dict(gridcolor=GRID_COL)))
+
+    # 1) Superficie principale con colorscale RdYlGn
+    fig.add_trace(go.Surface(
+        z=z_grid,
+        x=grid_strikes,
+        y=y_labels,
+        colorscale='RdYlGn_r',   # verde=bassa IV, rosso=alta IV
+        reversescale=False,
+        cmin=z_lo,
+        cmax=z_hi,
+        colorbar=dict(
+            title='IV (%)',
+            tickfont=dict(color=TEXT_COL, family='Courier New'),
+            titlefont=dict(color=TEXT_COL, family='Courier New'),
+        ),
+        opacity=0.92,
+        # 2) Contour lines sovrapposte
+        contours=dict(
+            z=dict(
+                show=True,
+                usecolorscale=True,
+                project=dict(z=True),
+                highlightcolor=ACCENT_YLW,
+                width=1.5,
+            )
+        ),
+        hovertemplate=(
+            'Strike: %{x:.1f}<br>'
+            'Expiry: %{y}<br>'
+            'IV: %{z:.2f}%<extra></extra>'
+        ),
+        name='IV Surface',
+    ))
+
+    # 3) ATM Line — linea verticale allo strike più vicino a spot
+    atm_strike = grid_strikes[np.argmin(np.abs(grid_strikes - spot))]
+    atm_col = np.argmin(np.abs(grid_strikes - atm_strike))
+    z_atm   = z_grid[:, atm_col]
+
+    fig.add_trace(go.Scatter3d(
+        x=[atm_strike] * n_expiry,
+        y=y_labels,
+        z=z_atm,
+        mode='lines',
+        line=dict(color=ACCENT_YLW, width=6),
+        name=f'ATM  ${spot:.1f}',
+        hovertemplate='ATM Strike: %{x}<br>Expiry: %{y}<br>IV: %{z:.2f}%<extra></extra>',
+    ))
+
+    # ── Layout ────────────────────────────────────────────────────────
+    fig.update_layout(
+        title=dict(
+            text=f'IV Surface — {ticker}',
+            font=dict(color=TEXT_COL, size=14, family='Courier New'),
+        ),
+        paper_bgcolor=CARD_BG,
+        plot_bgcolor=CARD_BG,
+        font=dict(color=TEXT_COL, family='Courier New'),
+        height=540,
+        margin=dict(l=0, r=0, t=50, b=0),
+        legend=dict(
+            bgcolor='rgba(0,0,0,0)',
+            font=dict(size=11, color=TEXT_COL),
+            x=0.01, y=0.99,
+        ),
+        scene=dict(
+            bgcolor=DARK_BG,
+            xaxis=dict(
+                title='Strike',
+                gridcolor=GRID_COL,
+                backgroundcolor=CARD_BG,
+                titlefont=dict(color=TEXT_COL),
+                tickfont=dict(color=TEXT_COL),
+            ),
+            yaxis=dict(
+                title='Expiry',
+                gridcolor=GRID_COL,
+                backgroundcolor=CARD_BG,
+                titlefont=dict(color=TEXT_COL),
+                tickfont=dict(color=TEXT_COL, size=9),
+            ),
+            zaxis=dict(
+                title='IV (%)',
+                gridcolor=GRID_COL,
+                backgroundcolor=CARD_BG,
+                titlefont=dict(color=TEXT_COL),
+                tickfont=dict(color=TEXT_COL),
+            ),
+            camera=dict(eye=dict(x=1.6, y=-1.6, z=0.8)),
+        ),
+    )
+
     return fig
 
 
+
 def vega_heatmap(raw_df, spot, ticker, window_pct=0.12):
+    import plotly.graph_objects as go
+
     lo = spot * (1 - window_pct)
     hi = spot * (1 + window_pct)
     df = raw_df[(raw_df['strike'] >= lo) & (raw_df['strike'] <= hi)].copy()
@@ -415,6 +573,8 @@ def vega_heatmap(raw_df, spot, ticker, window_pct=0.12):
 
 
 def term_structure_chart(raw_df, spot, ticker):
+    import plotly.graph_objects as go
+
     rows = []
     for exp in sorted(raw_df['expiry'].unique()):
         sub = raw_df[(raw_df['expiry']==exp)].copy()
@@ -429,6 +589,9 @@ def term_structure_chart(raw_df, spot, ticker):
 
 def skew_chart(raw_df, spot, ticker):
     # For each expiry, find approx 25-delta call and put vols
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
     rows = []
     for exp in sorted(raw_df['expiry'].unique()):
         sub = raw_df[raw_df['expiry'] == exp].copy()
@@ -460,6 +623,7 @@ if __name__ == '__main__':
     import dash
     from dash import dcc, html, Input, Output, State, ctx
     import dash_bootstrap_components as dbc
+    import plotly.graph_objects as go
 
     # Shared state will be initialized lazily after first fetch
     store = {

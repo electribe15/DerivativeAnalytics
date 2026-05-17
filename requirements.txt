@@ -1,18 +1,6 @@
-
-streamlit
-dash>=2.9.0
-dash-bootstrap-components
-plotly
-pandas
+streamlit>=1.35.0
 numpy
+pandas
 scipy
-requests
 yfinance
-tqdm==4.64.0
-jinja2<3.1.0
-
-# Notes:
-# - Heavy packages like `torch`/`torchvision` are omitted because they often fail
-#   to install on hosted build systems (manylinux wheel/timeout issues).
-# - If you need PyTorch, deploy with Docker or use a provider that supports
-#   custom machine types (Render/Fly/AWS/GCP) and add the correct wheel index.
+plotly

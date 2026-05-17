@@ -4,3 +4,6 @@ pandas
 scipy
 yfinance
 plotly
+dash
+dash-bootstrap-components
+flask

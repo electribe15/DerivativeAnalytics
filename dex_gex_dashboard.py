@@ -393,6 +393,7 @@ def iv_surface_chart(raw_df, spot, ticker, expiries_to_show=6, expiries_list=Non
     """
     from scipy.interpolate import griddata
     import numpy as np
+    import plotly.graph_objects as go
 
     # ── Selezione scadenze ────────────────────────────────────────────
     if expiries_list is not None and len(expiries_list) > 0:
@@ -421,23 +422,37 @@ def iv_surface_chart(raw_df, spot, ticker, expiries_to_show=6, expiries_list=Non
     t_min      = sub['t_num'].min()
     t_max      = sub['t_num'].max()
 
-    n_strike = 80
-    n_expiry = 40
+    # Use a coarser grid to improve stability when data are sparse
+    n_strike = 40
+    n_expiry = 20
     grid_strikes  = np.linspace(strike_min, strike_max, n_strike)
     grid_tdays    = np.linspace(t_min, t_max, n_expiry)
     grid_x, grid_y = np.meshgrid(grid_strikes, grid_tdays)
 
-    # Interpolazione bicubica su griglia regolare
+    # Interpolate onto the grid. Prefer linear interpolation for stability,
+    # fall back to nearest where linear yields NaNs (sparse regions).
     points = sub[['strike', 't_num']].values
     values = sub['iv'].values * 100  # percentuale
 
-    z_grid = griddata(points, values, (grid_x, grid_y), method='cubic')
+    # Try linear first (stable), then nearest to fill remaining gaps
+    z_lin = griddata(points, values, (grid_x, grid_y), method='linear')
+    if np.isfinite(z_lin).any():
+        z_grid = z_lin
+    else:
+        # If linear produced no finite values (extremely sparse), use nearest
+        z_grid = griddata(points, values, (grid_x, grid_y), method='nearest')
 
-    # Fallback lineare dove il cubico non arriva (bordi)
-    z_lin  = griddata(points, values, (grid_x, grid_y), method='linear')
-    z_nn   = griddata(points, values, (grid_x, grid_y), method='nearest')
-    z_grid = np.where(np.isnan(z_grid), z_lin, z_grid)
-    z_grid = np.where(np.isnan(z_grid), z_nn,  z_grid)
+    # Fill any remaining NaNs with nearest-neighbor
+    z_nn = griddata(points, values, (grid_x, grid_y), method='nearest')
+    z_grid = np.where(np.isfinite(z_grid), z_grid, z_nn)
+
+    # If interpolation failed to produce any finite values, return a placeholder
+    finite_pct = np.count_nonzero(np.isfinite(z_grid)) / z_grid.size
+    if not np.isfinite(z_grid).any() or finite_pct < 0.02:
+        # If less than 2% of grid has data, consider it insufficient
+        fig = go.Figure()
+        fig.update_layout(**base_layout(f'IV Surface — {ticker} (insufficient data)'))
+        return fig
 
     # Clip valori estremi (2°-98° percentile)
     z_lo = np.nanpercentile(z_grid, 2)
@@ -490,9 +505,12 @@ def iv_surface_chart(raw_df, spot, ticker, expiries_to_show=6, expiries_list=Non
     ))
 
     # 3) ATM Line — linea verticale allo strike più vicino a spot
-    atm_strike = grid_strikes[np.argmin(np.abs(grid_strikes - spot))]
-    atm_col = np.argmin(np.abs(grid_strikes - atm_strike))
-    z_atm   = z_grid[:, atm_col]
+    atm_col = int(np.argmin(np.abs(grid_strikes - spot)))
+    z_atm = z_grid[:, atm_col]
+    # Replace any NaNs in the ATM column with the row-wise mean (best-effort)
+    if not np.isfinite(z_atm).all():
+        row_means = np.nanmean(z_grid, axis=1)
+        z_atm = np.where(np.isfinite(z_atm), z_atm, row_means)
 
     fig.add_trace(go.Scatter3d(
         x=[atm_strike] * n_expiry,

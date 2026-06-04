@@ -603,6 +603,133 @@ print('Data functions ready.')
 # by_strike  = aggregate_by_strike(raw_data)
 # by_expiry  = aggregate_by_expiry(raw_data)
 
+# ── Range & Skew analytics ────────────────────────────────────────────────────
+
+def compute_daily_range(raw_df: pd.DataFrame, spot: float) -> pd.DataFrame:
+    """For each expiry, find options near Δ±0.30 and compute the implied
+    1-day expected move: spot × IV_Δ30 × √(1/252).
+    Returns one row per expiry sorted by DTE.
+    """
+    records = []
+    for expiry, grp in raw_df.groupby('expiry'):
+        T_days = int(grp['T_days'].iloc[0])
+        calls = grp[(grp['flag'] == 'c')].dropna(subset=['delta', 'iv'])
+        puts  = grp[(grp['flag'] == 'p')].dropna(subset=['delta', 'iv'])
+        if calls.empty or puts.empty:
+            continue
+        best_call = calls.iloc[(calls['delta'] - 0.30).abs().argsort().iloc[:1]]
+        best_put  = puts.iloc[(puts['delta']  + 0.30).abs().argsort().iloc[:1]]
+        if best_call.empty or best_put.empty:
+            continue
+        iv_d30 = (float(best_call['iv'].iloc[0]) + float(best_put['iv'].iloc[0])) / 2
+        if iv_d30 <= 0:
+            continue
+        daily_move = spot * iv_d30 * np.sqrt(1 / 252)
+        records.append({
+            'expiry':         expiry,
+            'T_days':         T_days,
+            'iv_d30':         iv_d30,
+            'daily_move_pts': daily_move,
+            'daily_move_pct': (daily_move / spot) * 100,
+            'upper':          spot + daily_move,
+            'lower':          spot - daily_move,
+            'call_strike':    int(best_call['strike'].iloc[0]),
+            'put_strike':     int(best_put['strike'].iloc[0]),
+            'call_delta':     round(float(best_call['delta'].iloc[0]), 3),
+            'put_delta':      round(float(best_put['delta'].iloc[0]),  3),
+        })
+    return pd.DataFrame(records).sort_values('T_days').reset_index(drop=True)
+
+
+def get_put_skew_by_expiry(raw_df: pd.DataFrame) -> dict:
+    """Return {expiry: DataFrame(strike, iv_pct, moneyness, delta, T_days)}
+    for put options only, sorted by strike ascending.
+    """
+    spot = float(raw_df['spot'].iloc[0])
+    result = {}
+    puts = raw_df[raw_df['flag'] == 'p'].dropna(subset=['iv', 'strike'])
+    for expiry, grp in puts.groupby('expiry'):
+        df = (grp[['strike', 'iv', 'delta', 'T_days']]
+              .sort_values('strike')
+              .drop_duplicates('strike')
+              .reset_index(drop=True))
+        df['moneyness'] = (df['strike'] / spot - 1) * 100
+        df['iv_pct']    = df['iv'] * 100
+        result[expiry]  = df
+    return result
+
+
+def get_put_monitor(raw_df: pd.DataFrame, spot: float,
+                    target_deltas: list = None) -> pd.DataFrame:
+    """For monthly and quarterly expirations, find the put closest to each
+    target delta and return its mid price (premium in pts and % of spot) and IV.
+
+    Monthly:    expirationType == 'monthly'
+    Quarterly:  monthly expiries in Mar / Jun / Sep / Dec
+    """
+    if target_deltas is None:
+        target_deltas = [0.25, 0.10, 0.05]
+    puts = raw_df[(raw_df['flag'] == 'p') &
+                  (raw_df['expirationType'] == 'monthly')].copy()
+    if puts.empty:
+        return pd.DataFrame()
+
+    puts['abs_delta'] = puts['delta'].abs()
+    puts['exp_month'] = pd.to_datetime(puts['expiry']).dt.month
+    puts['is_qtr']    = puts['exp_month'].isin([3, 6, 9, 12])
+
+    records = []
+    for expiry, grp in puts.groupby('expiry'):
+        T_days  = int(grp['T_days'].iloc[0])
+        is_qtr  = bool(grp['is_qtr'].iloc[0])
+        exp_lbl = 'Quarterly' if is_qtr else 'Monthly'
+        for delta_t in target_deltas:
+            valid = grp.dropna(subset=['delta', 'mid', 'iv'])
+            if valid.empty:
+                continue
+            idx = (valid['abs_delta'] - delta_t).abs().idxmin()
+            row = valid.loc[idx]
+            records.append({
+                'expiry':       expiry,
+                'T_days':       T_days,
+                'type':         exp_lbl,
+                'delta_target': delta_t,
+                'delta_actual': round(float(row['abs_delta']), 3),
+                'strike':       int(row['strike']),
+                'mid':          round(float(row['mid']), 2),
+                'iv_pct':       round(float(row['iv']) * 100, 1),
+                'mid_pct_spot': round(float(row['mid']) / spot * 100, 3),
+            })
+    return (pd.DataFrame(records)
+              .sort_values(['T_days', 'delta_target'])
+              .reset_index(drop=True))
+
+
+def delta_strike_bounds(raw_df: pd.DataFrame,
+                        delta_lo: float = -0.5,
+                        delta_hi: float = 0.5):
+    """Derive (lo_strike, hi_strike) from the delta range using the nearest expiry.
+
+    Finds the put with delta ≈ delta_lo and the call with delta ≈ delta_hi so
+    the chart shows the strike range that corresponds to the selected delta window.
+    Returns (None, None) if raw_df is empty or missing required columns.
+    """
+    if raw_df is None or raw_df.empty:
+        return None, None
+    try:
+        min_dte = int(raw_df['T_days'].min())
+        near    = raw_df[raw_df['T_days'] == min_dte]
+        calls   = near[near['flag'] == 'c'].dropna(subset=['delta', 'strike'])
+        puts    = near[near['flag'] == 'p'].dropna(subset=['delta', 'strike'])
+        lo_strike = hi_strike = None
+        if not puts.empty:
+            lo_strike = float(puts.loc[(puts['delta'] - delta_lo).abs().idxmin(), 'strike'])
+        if not calls.empty:
+            hi_strike = float(calls.loc[(calls['delta'] - delta_hi).abs().idxmin(), 'strike'])
+        return lo_strike, hi_strike
+    except Exception:
+        return None, None
+
 # ── Chart builders ────────────────────────────────────────────────────
 
 DARK_BG    = '#0d0f14'
@@ -629,11 +756,12 @@ def base_layout(title='', height=420):
     )
 
 
-def gex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10):
+def gex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10,
+                  strike_lo=None, strike_hi=None):
     import plotly.graph_objects as go
 
-    lo = spot * (1 - window_pct)
-    hi = spot * (1 + window_pct)
+    lo = strike_lo if strike_lo is not None else spot * (1 - window_pct)
+    hi = strike_hi if strike_hi is not None else spot * (1 + window_pct)
     df = by_strike_df[(by_strike_df['strike'] >= lo) & (by_strike_df['strike'] <= hi)].copy()
 
     colors = [ACCENT_GRN if v >= 0 else ACCENT_RED for v in df['net_gex']]
@@ -653,11 +781,12 @@ def gex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10):
     return fig
 
 
-def dex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10):
+def dex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10,
+                  strike_lo=None, strike_hi=None):
     import plotly.graph_objects as go
 
-    lo = spot * (1 - window_pct)
-    hi = spot * (1 + window_pct)
+    lo = strike_lo if strike_lo is not None else spot * (1 - window_pct)
+    hi = strike_hi if strike_hi is not None else spot * (1 + window_pct)
     df = by_strike_df[(by_strike_df['strike'] >= lo) & (by_strike_df['strike'] <= hi)].copy()
 
     fig = go.Figure()
@@ -692,11 +821,12 @@ def gex_expiry_chart(by_expiry_df, ticker):
     return fig
 
 
-def oi_heatmap(raw_df, spot, ticker, window_pct=0.12):
+def oi_heatmap(raw_df, spot, ticker, window_pct=0.12,
+               strike_lo=None, strike_hi=None):
     import plotly.graph_objects as go
 
-    lo = spot * (1 - window_pct)
-    hi = spot * (1 + window_pct)
+    lo = strike_lo if strike_lo is not None else spot * (1 - window_pct)
+    hi = strike_hi if strike_hi is not None else spot * (1 + window_pct)
     df = raw_df[(raw_df['strike'] >= lo) & (raw_df['strike'] <= hi)].copy()
 
     pivot = df.pivot_table(index='expiry', columns='strike',
@@ -1051,7 +1181,177 @@ def skew_chart(raw_df, spot, ticker):
     return fig
 
 
+def daily_range_chart(raw_df: pd.DataFrame, spot: float, ticker: str):
+    """Bar chart of implied 1-day expected move (Δ0.30 IV) per expiry."""
+    import plotly.graph_objects as go
+    dr = compute_daily_range(raw_df, spot)
+    fig = go.Figure()
+    if dr.empty:
+        fig.update_layout(**base_layout(f'Daily Range — {ticker} (no data)'))
+        return fig
+
+    fig.add_trace(go.Bar(
+        x=dr['expiry'],
+        y=dr['daily_move_pts'],
+        name='Expected daily move (pts)',
+        marker_color=ACCENT_BLU,
+        opacity=0.85,
+        text=[f'±{v:.1f} ({p:.2f}%)'
+              for v, p in zip(dr['daily_move_pts'], dr['daily_move_pct'])],
+        textposition='outside',
+        textfont=dict(color=TEXT_COL, size=9),
+        hovertemplate=(
+            '<b>%{x}</b><br>'
+            'Daily move: ±%{y:.1f} pts<br>'
+            'IV Δ30: %{customdata[0]:.1f}%<br>'
+            'Call strike: %{customdata[1]}<br>'
+            'Put strike: %{customdata[2]}<br>'
+            '<extra></extra>'
+        ),
+        customdata=list(zip(
+            (dr['iv_d30'] * 100).round(1),
+            dr['call_strike'],
+            dr['put_strike'],
+        )),
+    ))
+
+    # Horizontal reference from nearest expiry
+    primary = float(dr.iloc[0]['daily_move_pts'])
+    fig.add_hline(y=primary, line_dash='dot', line_color=ACCENT_YLW,
+                  annotation_text=f'Near-term ±{primary:.1f}',
+                  annotation_font_color=ACCENT_YLW, annotation_font_size=11)
+
+    layout = base_layout(f'Implied Daily Range (Δ0.30) — {ticker}')
+    layout.update(yaxis_title='Expected daily move (pts)', xaxis_title='Expiry',
+                  showlegend=False)
+    fig.update_layout(**layout)
+    return fig
+
+
+def iv_skew_overlay_chart(raw_df: pd.DataFrame, spot: float, ticker: str,
+                           selected_expiries: list = None,
+                           iv_levels: list = None):
+    """Overlaid put IV skew curves per expiry.
+    Horizontal dashed lines at iv_levels (e.g. [0.16, 0.18, 0.20]).
+    x = moneyness (% from spot), y = IV %.
+    """
+    import plotly.graph_objects as go
+    if iv_levels is None:
+        iv_levels = [0.16, 0.18, 0.20]
+
+    skew_data = get_put_skew_by_expiry(raw_df)
+    fig = go.Figure()
+    if not skew_data:
+        fig.update_layout(**base_layout(f'IV Skew Overlay — {ticker} (no data)'))
+        return fig
+
+    if selected_expiries:
+        skew_data = {k: v for k, v in skew_data.items() if k in selected_expiries}
+
+    expiries_sorted = sorted(skew_data,
+                             key=lambda e: int(skew_data[e]['T_days'].iloc[0]))
+    n = max(len(expiries_sorted), 1)
+    # Blue → green gradient along the term structure
+    hues = [int(200 + 60 * i / max(n - 1, 1)) for i in range(n)]
+    colors = [f'hsl({h},70%,55%)' for h in hues]
+
+    for i, expiry in enumerate(expiries_sorted):
+        df = skew_data[expiry]
+        T  = int(df['T_days'].iloc[0])
+        df = df[(df['moneyness'] >= -20) & (df['moneyness'] <= 5)]
+        if df.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=df['moneyness'], y=df['iv_pct'],
+            mode='lines', name=f'{expiry} ({T}d)',
+            line=dict(color=colors[i], width=2),
+            hovertemplate=(
+                f'<b>{expiry} ({T}d)</b><br>'
+                'Moneyness: %{x:.1f}%<br>'
+                'IV: %{y:.1f}%<extra></extra>'
+            ),
+        ))
+
+    lv_colors = {0.16: ACCENT_GRN, 0.18: ACCENT_YLW, 0.20: ACCENT_RED}
+    for lv in iv_levels:
+        lv_pct = lv * 100
+        col = lv_colors.get(lv, '#aaaaaa')
+        fig.add_hline(y=lv_pct, line_dash='dash', line_color=col, line_width=1.5,
+                      annotation_text=f'IV {lv_pct:.0f}%', annotation_position='left',
+                      annotation_font_color=col, annotation_font_size=11)
+
+    fig.add_vline(x=0, line_dash='dot', line_color=TEXT_COL, line_width=1, opacity=0.4)
+
+    layout = base_layout(f'Put IV Skew Overlay — {ticker}')
+    layout.update(
+        xaxis_title='Moneyness (% from spot)',
+        yaxis_title='Implied Volatility (%)',
+        legend=dict(orientation='v', x=1.01, y=1,
+                    font=dict(color=TEXT_COL, size=10),
+                    bgcolor='rgba(0,0,0,0)'),
+    )
+    fig.update_layout(**layout)
+    return fig
+
+
+def put_monitor_chart(raw_df: pd.DataFrame, spot: float, ticker: str):
+    """Grouped bar chart of put mid price (% of spot) at Δ0.25/0.10/0.05
+    across monthly and quarterly expirations.
+    """
+    import plotly.graph_objects as go
+    pm = get_put_monitor(raw_df, spot)
+    fig = go.Figure()
+    if pm.empty:
+        fig.update_layout(**base_layout(
+            f'Put Monitor — {ticker} (no monthly expirations in loaded chain)'))
+        return fig
+
+    delta_styles = {
+        0.25: (ACCENT_BLU,  'Δ 0.25'),
+        0.10: (ACCENT_YLW,  'Δ 0.10'),
+        0.05: (ACCENT_RED,  'Δ 0.05'),
+    }
+    for delta_t, (color, label) in delta_styles.items():
+        sub = pm[pm['delta_target'] == delta_t]
+        if sub.empty:
+            continue
+        fig.add_trace(go.Bar(
+            x=sub.apply(lambda r: f"{r['expiry']}\n({r['type']})", axis=1),
+            y=sub['mid_pct_spot'],
+            name=label,
+            marker_color=color,
+            opacity=0.85,
+            text=[f"{v:.3f}%" for v in sub['mid_pct_spot']],
+            textposition='outside',
+            textfont=dict(color=TEXT_COL, size=9),
+            hovertemplate=(
+                '<b>%{x}</b><br>'
+                f'Target delta: {delta_t:.2f}<br>'
+                'Premium: %{customdata[0]:.2f} pts (%{y:.3f}% of spot)<br>'
+                'Strike: %{customdata[1]}<br>'
+                'IV: %{customdata[2]:.1f}%<br>'
+                'Actual Δ: %{customdata[3]:.3f}<br>'
+                '<extra></extra>'
+            ),
+            customdata=list(zip(
+                sub['mid'],
+                sub['strike'],
+                sub['iv_pct'],
+                sub['delta_actual'],
+            )),
+        ))
+
+    layout = base_layout(f'Put Premium Monitor — {ticker}  (Monthly / Quarterly)')
+    layout.update(barmode='group', yaxis_title='Premium (% of spot)',
+                  xaxis_title='Expiry',
+                  legend=dict(orientation='h', y=1.08,
+                              font=dict(color=TEXT_COL, size=11)))
+    fig.update_layout(**layout)
+    return fig
+
+
 print('Chart builders ready.')
+
 
 
 if __name__ == '__main__':
@@ -1322,19 +1622,20 @@ if __name__ == '__main__':
                              'color': TEXT_COL, 'padding': '8px 12px', 'borderRadius': '4px',
                              'fontFamily': 'Courier New', 'fontSize': '14px',
                              'width': '180px', 'textTransform': 'uppercase'}),
-            html.Div(
-                dcc.Slider(
-                    id='window-slider',
-                    min=5,
-                    max=25,
-                    step=5,
-                    value=10,
-                    marks={v: f'{v}%' for v in [5, 10, 15, 20, 25]},
-                    tooltip={'always_visible': False},
-                    className='mx-3',
-                ),
-                style={'width': '200px'}
-            ),
+            html.Div([
+                    html.Label('Δ Filter',
+                               style={'color': '#7a8399', 'fontFamily': 'Courier New',
+                                      'fontSize': '10px', 'letterSpacing': '1px',
+                                      'display': 'block', 'marginBottom': '2px'}),
+                    dcc.RangeSlider(
+                        id='delta-range-slider',
+                        min=-1, max=1, step=0.05,
+                        value=[-0.5, 0.5],
+                        marks={v: f'{v:+.1f}' for v in [-1, -0.5, 0, 0.5, 1]},
+                        tooltip={'always_visible': False, 'placement': 'bottom'},
+                        className='mx-2',
+                    ),
+                ], style={'width': '260px'}),
                    html.Button('⬇ LOAD DATA', id='refresh-btn',
                         style={'background': 'transparent', 'border': f'1px solid {ACCENT_GRN}',
                                'color': ACCENT_GRN, 'padding': '8px 20px',
@@ -1417,7 +1718,80 @@ if __name__ == '__main__':
             'oi_max': None,
             'timestamp': datetime.now().isoformat(),
         }),
+        dcc.Store(id='skew-expiry-store'),
         dcc.Interval(id='loading-interval', interval=1500, n_intervals=0),
+
+        # ── Section: Range & Skew ───────────────────────────────────────────
+        html.Div([
+            html.Span('📐  DAILY RANGE  &  IV SKEW',
+                      style={'color': ACCENT_BLU, 'fontFamily': 'Courier New',
+                             'fontSize': '13px', 'letterSpacing': '3px'}),
+        ], style={'padding': '18px 28px 4px',
+                  'borderTop': f'1px solid {GRID_COL}',
+                  'marginTop': '12px'}),
+
+        # Controls: IV level checkboxes + expiry selector
+        html.Div([
+            html.Div([
+                html.Label('IV Reference Levels',
+                           style={'color': '#7a8399', 'fontSize': '11px',
+                                  'letterSpacing': '1px', 'display': 'block',
+                                  'marginBottom': '6px'}),
+                dcc.Checklist(
+                    id='iv-levels-checklist',
+                    options=[
+                        {'label': ' 16%', 'value': 0.16},
+                        {'label': ' 18%', 'value': 0.18},
+                        {'label': ' 20%', 'value': 0.20},
+                    ],
+                    value=[0.16, 0.18, 0.20],
+                    inline=True,
+                    style={'color': TEXT_COL, 'fontFamily': 'Courier New',
+                           'fontSize': '13px', 'gap': '12px'},
+                    inputStyle={'marginRight': '4px'},
+                ),
+            ], style={'flex': '0 0 auto'}),
+
+            html.Div([
+                html.Label('Expiries on Skew Chart (leave blank = all ≤90d)',
+                           style={'color': '#7a8399', 'fontSize': '11px',
+                                  'letterSpacing': '1px', 'display': 'block',
+                                  'marginBottom': '4px'}),
+                dcc.Dropdown(
+                    id='skew-expiry-dropdown',
+                    options=[],
+                    value=[],
+                    multi=True,
+                    placeholder='All near-term expiries…',
+                    style={'background': '#1a1d27', 'color': TEXT_COL,
+                           'fontFamily': 'Courier New', 'fontSize': '12px',
+                           'border': f'1px solid {GRID_COL}', 'minWidth': '420px'},
+                ),
+            ], style={'flex': '1'}),
+        ], style={'display': 'flex', 'gap': '28px', 'padding': '6px 28px 10px',
+                  'alignItems': 'flex-end', 'flexWrap': 'wrap'}),
+
+        html.Div([
+            html.Div(dcc.Graph(id='daily-range-chart'), style={'flex': '1', 'minWidth': '400px'}),
+            html.Div(dcc.Graph(id='skew-overlay-chart'), style={'flex': '1.2', 'minWidth': '440px'}),
+        ], style={'display': 'flex', 'gap': '12px', 'padding': '0 28px 28px'}),
+
+        # ── Section: Put Monitor ────────────────────────────────────────────
+        html.Div([
+            html.Span('💰  PUT PREMIUM MONITOR  —  Monthly / Quarterly',
+                      style={'color': ACCENT_GRN, 'fontFamily': 'Courier New',
+                             'fontSize': '13px', 'letterSpacing': '3px'}),
+        ], style={'padding': '18px 28px 4px',
+                  'borderTop': f'1px solid {GRID_COL}'}),
+
+        html.Div([
+            html.Div(dcc.Graph(id='put-monitor-chart'),
+                     style={'flex': '1.2', 'minWidth': '440px'}),
+            html.Div(id='put-monitor-table',
+                     style={'flex': '1', 'minWidth': '360px',
+                            'overflowX': 'auto', 'padding': '8px 0'}),
+        ], style={'display': 'flex', 'gap': '12px', 'padding': '0 28px 36px',
+                  'flexWrap': 'wrap'}),
 
     ], style={'background': DARK_BG, 'minHeight': '100vh', 'fontFamily': 'Courier New'})
 
@@ -1509,19 +1883,19 @@ if __name__ == '__main__':
         Output('load-progress', 'striped'),
         Output('load-message', 'children'),
         Input('loading-interval', 'n_intervals'),
-        Input('window-slider', 'value'),
+        Input('delta-range-slider', 'value'),
         Input('load-request-store', 'data'),
         Input('filter-store', 'data'),
         prevent_initial_call=False,
      )
     def update_dashboard(
         n_intervals,
-        window_pct,
+        delta_range,
         load_request,
         filter_store,
     ):
         try:
-            return _update_dashboard_inner(n_intervals, window_pct, load_request, filter_store)
+            return _update_dashboard_inner(n_intervals, delta_range, load_request, filter_store)
         except Exception as _cb_exc:
             import traceback, tempfile, os as _os
             _tb = traceback.format_exc()
@@ -1540,11 +1914,12 @@ if __name__ == '__main__':
 
     def _update_dashboard_inner(
         n_intervals,
-        window_pct,
+        delta_range,
         load_request,
         filter_store,
     ):
-        wpct = (window_pct or 10) / 100
+        dr      = delta_range or [-0.5, 0.5]
+        delta_lo, delta_hi = float(dr[0]), float(dr[1])
         current_store = snapshot_store()
         loader = snapshot_loader()
         progress_color, progress_animated, progress_striped = progress_style(loader)
@@ -1602,11 +1977,12 @@ if __name__ == '__main__':
         bs_df = aggregate_by_strike(filtered_df)
         be_df = aggregate_by_expiry(filtered_df)
 
-        stats = build_stats(filtered_df, bs_df, spot)
-        fig_gex = gex_bar_chart(bs_df, spot, ticker, wpct)
-        fig_dex = dex_bar_chart(bs_df, spot, ticker, wpct)
+        lo, hi = delta_strike_bounds(raw_df, delta_lo, delta_hi)
+        stats   = build_stats(filtered_df, bs_df, spot)
+        fig_gex = gex_bar_chart(bs_df, spot, ticker, strike_lo=lo, strike_hi=hi)
+        fig_dex = dex_bar_chart(bs_df, spot, ticker, strike_lo=lo, strike_hi=hi)
         fig_exp = gex_expiry_chart(be_df, ticker)
-        fig_oi  = oi_heatmap(filtered_df, spot, ticker, wpct)
+        fig_oi  = oi_heatmap(filtered_df, spot, ticker, strike_lo=lo, strike_hi=hi)
         fig_vol = vol_smile_chart(filtered_df, spot, ticker)
 
         status = (f'Updated: {ts}  |  {ticker}  |  {len(filtered_df):,} contracts  |  '
@@ -1645,6 +2021,114 @@ if __name__ == '__main__':
         port = s.getsockname()[1]
         s.close()
         return port
+
+
+    # ── Callback: Range & Skew ──────────────────────────────────────────────
+    @app.callback(
+        Output('daily-range-chart',   'figure'),
+        Output('skew-overlay-chart',  'figure'),
+        Output('skew-expiry-dropdown', 'options'),
+        Input('loading-interval',     'n_intervals'),
+        Input('load-request-store',   'data'),
+        Input('iv-levels-checklist',  'value'),
+        Input('skew-expiry-dropdown', 'value'),
+        prevent_initial_call=False,
+    )
+    def update_range_skew(n_intervals, load_request, iv_levels, selected_expiries):
+        empty = empty_figure()
+        raw_df = snapshot_store().get('raw')
+        spot   = snapshot_store().get('spot')
+        if raw_df is None or spot is None:
+            return empty, empty, []
+
+        try:
+            fig_range = daily_range_chart(raw_df, spot,
+                                          snapshot_store().get('ticker', DEFAULT_TICKER))
+        except Exception:
+            fig_range = empty
+
+        # Dropdown options: expiries within 90 days (most relevant for skew)
+        near = raw_df[raw_df['T_days'] <= MAX_EXPIRY_DAYS]['expiry'].unique()
+        options = [{'label': e, 'value': e} for e in sorted(near)]
+
+        try:
+            # If user hasn't picked any, default to all ≤90d expiries
+            exp_for_chart = selected_expiries if selected_expiries else list(sorted(near))
+            fig_skew = iv_skew_overlay_chart(
+                raw_df, spot,
+                snapshot_store().get('ticker', DEFAULT_TICKER),
+                selected_expiries=exp_for_chart,
+                iv_levels=iv_levels or [0.16, 0.18, 0.20],
+            )
+        except Exception:
+            fig_skew = empty
+
+        return fig_range, fig_skew, options
+
+
+    # ── Callback: Put Monitor ───────────────────────────────────────────────
+    @app.callback(
+        Output('put-monitor-chart', 'figure'),
+        Output('put-monitor-table', 'children'),
+        Input('loading-interval',   'n_intervals'),
+        Input('load-request-store', 'data'),
+        prevent_initial_call=False,
+    )
+    def update_put_monitor(n_intervals, load_request):
+        empty = empty_figure()
+        raw_df = snapshot_store().get('raw')
+        spot   = snapshot_store().get('spot')
+        ticker = snapshot_store().get('ticker', DEFAULT_TICKER)
+        if raw_df is None or spot is None:
+            return empty, html.Div()
+
+        try:
+            fig_pm = put_monitor_chart(raw_df, spot, ticker)
+        except Exception:
+            fig_pm = empty
+
+        # DataTable-style HTML table for the put monitor
+        try:
+            from dash import dash_table
+            pm = get_put_monitor(raw_df, spot)
+            if pm.empty:
+                tbl = html.Div('No monthly/quarterly expirations in loaded chain.',
+                               style={'color': '#7a8399', 'fontFamily': 'Courier New',
+                                      'fontSize': '12px', 'padding': '16px'})
+            else:
+                disp = pm[['expiry', 'type', 'T_days', 'delta_target',
+                            'strike', 'mid', 'iv_pct', 'mid_pct_spot', 'delta_actual']].copy()
+                disp.columns = ['Expiry', 'Type', 'DTE', 'Δ Target',
+                                'Strike', 'Mid (pts)', 'IV %', 'Mid % Spot', 'Δ Actual']
+                tbl = dash_table.DataTable(
+                    data=disp.to_dict('records'),
+                    columns=[{'name': c, 'id': c} for c in disp.columns],
+                    style_table={'overflowX': 'auto'},
+                    style_header={
+                        'backgroundColor': CARD_BG, 'color': '#7a8399',
+                        'fontFamily': 'Courier New', 'fontSize': '11px',
+                        'border': f'1px solid {GRID_COL}', 'letterSpacing': '1px',
+                    },
+                    style_cell={
+                        'backgroundColor': DARK_BG, 'color': TEXT_COL,
+                        'fontFamily': 'Courier New', 'fontSize': '12px',
+                        'border': f'1px solid {GRID_COL}', 'padding': '6px 10px',
+                        'textAlign': 'center',
+                    },
+                    style_data_conditional=[
+                        {'if': {'filter_query': '{Type} = "Quarterly"'},
+                         'color': ACCENT_YLW},
+                        {'if': {'column_id': 'Δ Target', 'filter_query': '{Δ Target} = 0.05'},
+                         'color': ACCENT_RED},
+                    ],
+                    page_size=20,
+                    sort_action='native',
+                )
+        except Exception:
+            tbl = html.Div()
+
+        return fig_pm, tbl
+
 
 
     preferred_ports = [PORT, 8051, 8052]

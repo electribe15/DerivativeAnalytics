@@ -1,6 +1,5 @@
 """
 DEX / GEX Options Exposure Dashboard — Streamlit version
-Deploy su https://share.streamlit.io puntando a questo file.
 """
 
 import warnings
@@ -12,7 +11,6 @@ import time
 import streamlit as st
 import plotly.graph_objects as go
 
-# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="DEX / GEX Dashboard",
     page_icon="⚡",
@@ -20,107 +18,40 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&display=swap');
-
-html, body, [class*="css"] {
-    font-family: 'Share Tech Mono', monospace;
-    background-color: #0d0f14;
-    color: #c9d1e0;
-}
+html, body, [class*="css"] { font-family: 'Share Tech Mono', monospace; background-color: #0d0f14; color: #c9d1e0; }
 .stApp { background-color: #0d0f14; }
-
-section[data-testid="stSidebar"] {
-    background-color: #13161e;
-    border-right: 1px solid #1e2130;
+section[data-testid="stSidebar"] { background-color: #13161e; border-right: 1px solid #1e2130; }
+div[data-testid="metric-container"], div[data-testid="stMetric"] {
+    background: #13161e; border: 1px solid #1e2130; border-top: 3px solid #00e5a0;
+    border-radius: 4px; padding: 12px 16px;
 }
-
-/* Metric cards — both old and new Streamlit testid names */
-div[data-testid="metric-container"],
-div[data-testid="stMetric"] {
-    background: #13161e;
-    border: 1px solid #1e2130;
-    border-top: 3px solid #00e5a0;
-    border-radius: 4px;
-    padding: 12px 16px;
-}
-div[data-testid="metric-container"] label,
-div[data-testid="stMetric"] label {
-    color: #7a8399 !important;
-    font-size: 11px !important;
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
+div[data-testid="metric-container"] label, div[data-testid="stMetric"] label {
+    color: #7a8399 !important; font-size: 11px !important; letter-spacing: 1.5px; text-transform: uppercase;
 }
 div[data-testid="metric-container"] [data-testid="stMetricValue"],
 div[data-testid="stMetric"] [data-testid="stMetricValue"] {
-    color: #00e5a0 !important;
-    font-size: 20px !important;
-    font-family: 'Share Tech Mono', monospace !important;
+    color: #00e5a0 !important; font-size: 20px !important; font-family: 'Share Tech Mono', monospace !important;
 }
-
 .stButton > button {
-    background: transparent;
-    border: 1px solid #00e5a0;
-    color: #00e5a0;
-    font-family: 'Share Tech Mono', monospace;
-    letter-spacing: 1px;
-    border-radius: 4px;
-    width: 100%;
+    background: transparent; border: 1px solid #00e5a0; color: #00e5a0;
+    font-family: 'Share Tech Mono', monospace; letter-spacing: 1px; border-radius: 4px; width: 100%;
 }
-.stButton > button:hover {
-    background: #00e5a020;
-    border-color: #00e5a0;
-    color: #00e5a0;
-}
-
-h1 {
-    font-family: 'Rajdhani', sans-serif !important;
-    color: #00e5a0 !important;
-    letter-spacing: 6px;
-    font-size: 2.2rem !important;
-}
-h2, h3 {
-    font-family: 'Rajdhani', sans-serif !important;
-    color: #c9d1e0 !important;
-    letter-spacing: 2px;
-}
-
+.stButton > button:hover { background: #00e5a020; }
+h1 { font-family: 'Rajdhani', sans-serif !important; color: #00e5a0 !important; letter-spacing: 6px; font-size: 2.2rem !important; }
+h2, h3 { font-family: 'Rajdhani', sans-serif !important; color: #c9d1e0 !important; letter-spacing: 2px; }
 .status-bar {
-    background: #13161e;
-    border: 1px solid #1e2130;
-    border-left: 3px solid #4db8ff;
-    border-radius: 4px;
-    padding: 8px 14px;
-    font-size: 12px;
-    color: #7a8399;
-    margin-bottom: 16px;
-    letter-spacing: 0.5px;
+    background: #13161e; border: 1px solid #1e2130; border-left: 3px solid #4db8ff;
+    border-radius: 4px; padding: 8px 14px; font-size: 12px; color: #7a8399; margin-bottom: 16px;
 }
-
-div[data-baseweb="tab-list"] {
-    background: #13161e;
-    border-bottom: 1px solid #1e2130;
-}
-button[data-baseweb="tab"] {
-    color: #7a8399 !important;
-    font-family: 'Share Tech Mono', monospace !important;
-    letter-spacing: 1px;
-}
-button[data-baseweb="tab"][aria-selected="true"] {
-    color: #00e5a0 !important;
-    border-bottom: 2px solid #00e5a0 !important;
-}
-
+div[data-baseweb="tab-list"] { background: #13161e; border-bottom: 1px solid #1e2130; }
+button[data-baseweb="tab"] { color: #7a8399 !important; font-family: 'Share Tech Mono', monospace !important; letter-spacing: 1px; }
+button[data-baseweb="tab"][aria-selected="true"] { color: #00e5a0 !important; border-bottom: 2px solid #00e5a0 !important; }
 .stSpinner > div { border-top-color: #00e5a0 !important; }
 div[data-testid="stSlider"] label { color: #7a8399 !important; font-size: 12px; }
-input[type="text"] {
-    background: #1a1d27 !important;
-    border: 1px solid #1e2130 !important;
-    color: #c9d1e0 !important;
-    font-family: 'Share Tech Mono', monospace !important;
-}
+input[type="text"] { background: #1a1d27 !important; border: 1px solid #1e2130 !important; color: #c9d1e0 !important; font-family: 'Share Tech Mono', monospace !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -132,12 +63,17 @@ try:
         aggregate_by_expiry,
         apply_dashboard_filters,
         _csv_paths,
+        delta_strike_bounds,
+        get_put_monitor,
         gex_bar_chart,
         dex_bar_chart,
         gex_expiry_chart,
         oi_heatmap,
         vol_smile_chart,
         iv_surface_chart,
+        iv_skew_overlay_chart,
+        daily_range_chart,
+        put_monitor_chart,
         term_structure_chart,
         skew_chart,
         DEFAULT_TICKER,
@@ -155,12 +91,10 @@ except ImportError as e:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def fmt_billions(v):
-    sign = "+" if v >= 0 else ""
-    return f"{sign}${v/1e9:.2f}B"
+    return f"{'+'if v>=0 else ''}${v/1e9:.2f}B"
 
 def fmt_millions(v):
-    sign = "+" if v >= 0 else ""
-    return f"{sign}${v/1e6:.0f}M"
+    return f"{'+'if v>=0 else ''}${v/1e6:.0f}M"
 
 def build_stat_metrics(raw_df, by_strike_df, spot):
     total_gex   = raw_df["gex"].sum()
@@ -184,11 +118,9 @@ def build_stat_metrics(raw_df, by_strike_df, spot):
 def empty_fig(msg="No data"):
     fig = go.Figure()
     fig.update_layout(
-        paper_bgcolor="#13161e", plot_bgcolor="#13161e",
-        font=dict(color="#c9d1e0"),
-        annotations=[dict(text=msg, xref="paper", yref="paper",
-                          x=0.5, y=0.5, showarrow=False,
-                          font=dict(size=14, color="#7a8399"))],
+        paper_bgcolor="#13161e", plot_bgcolor="#13161e", font=dict(color="#c9d1e0"),
+        annotations=[dict(text=msg, xref="paper", yref="paper", x=0.5, y=0.5,
+                          showarrow=False, font=dict(size=14, color="#7a8399"))],
         height=380,
     )
     return fig
@@ -198,14 +130,21 @@ with st.sidebar:
     st.markdown("## ⚡ DEX / GEX")
     st.markdown("---")
 
-    ticker     = st.text_input("Ticker", value=DEFAULT_TICKER).strip().upper()
-    window_pct = st.slider("Finestra strike (%)", min_value=5, max_value=25,
-                           value=10, step=5) / 100
-    max_days   = st.slider("Max giorni scadenza", min_value=14,
-                           max_value=FETCH_EXPIRY_DAYS,   # up to the full download horizon
-                           value=MAX_EXPIRY_DAYS, step=7)
-    oi_thresh  = st.number_input("Min Open Interest", min_value=10,
-                                 max_value=500, value=OI_THRESHOLD, step=10)
+    ticker      = st.text_input("Ticker", value=DEFAULT_TICKER).strip().upper()
+
+    # Delta range slider (replaces the old strike ±% window)
+    delta_range = st.slider(
+        "Delta range (strike filter)",
+        min_value=-1.0, max_value=1.0,
+        value=(-0.5, 0.5), step=0.05,
+        help="Filters charts to the strikes whose options have delta within this range "
+             "(derived from the nearest expiry). Puts have negative delta, calls positive.",
+    )
+
+    max_days    = st.slider("Max giorni scadenza", min_value=14,
+                            max_value=FETCH_EXPIRY_DAYS, value=MAX_EXPIRY_DAYS, step=7)
+    oi_thresh   = st.number_input("Min Open Interest", min_value=10,
+                                  max_value=500, value=OI_THRESHOLD, step=10)
 
     st.markdown("---")
     fetch_btn = st.button("↻ CARICA DATI", use_container_width=True)
@@ -213,12 +152,9 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(
         "<div style='font-size:11px;color:#7a8399;'>"
-        "Dati: Barchart<br>"
-        "Modello: Black-Scholes<br>"
-        "DEX = Δ × OI × 100<br>"
-        "GEX = γ × OI × 100 × Spot"
-        "</div>",
-        unsafe_allow_html=True,
+        "Dati: Barchart<br>Modello: Black-Scholes<br>"
+        "DEX = Δ × OI × 100<br>GEX = γ × OI × 100 × Spot"
+        "</div>", unsafe_allow_html=True,
     )
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -230,8 +166,6 @@ st.markdown(
 )
 
 # ── Fetch ─────────────────────────────────────────────────────────────────────
-# Only fetch on explicit button press — never auto-load on page open.
-# force_refresh=True bypasses the CSV cache so the button always hits Barchart.
 if fetch_btn:
     progress_bar = st.progress(0, text="⏳ Avvio…")
     csv_slot     = st.empty()
@@ -245,46 +179,29 @@ if fetch_btn:
             pass
 
     try:
-        raw_full, spot = fetch_options_data(
-            ticker,
-            progress_callback=_report,
-            force_refresh=True,
-        )
-
-        # Apply sidebar filters (DTE cap + min OI) independently of the download
+        raw_full, spot = fetch_options_data(ticker, progress_callback=_report, force_refresh=True)
         raw_df = apply_dashboard_filters(raw_full, dte_max=max_days, oi_min=oi_thresh)
         if raw_df.empty:
             progress_bar.empty()
-            st.warning(
-                f"Nessun contratto per {ticker} con DTE ≤ {max_days} e OI ≥ {oi_thresh}. "
-                "Allenta i filtri nella sidebar."
-            )
+            st.warning(f"Nessun contratto per {ticker} con DTE ≤ {max_days} e OI ≥ {oi_thresh}.")
             st.stop()
 
         by_strike = aggregate_by_strike(raw_df)
         by_expiry = aggregate_by_expiry(raw_df)
+        st.session_state["data"] = dict(raw=raw_df, by_strike=by_strike,
+                                         by_expiry=by_expiry, spot=spot,
+                                         ticker=ticker, raw_full=raw_full)
 
-        st.session_state["data"] = {
-            "raw":       raw_df,
-            "by_strike": by_strike,
-            "by_expiry": by_expiry,
-            "spot":      spot,
-            "ticker":    ticker,
-        }
-
-        # CSV cache status — background thread writes it after fetch returns
+        # CSV cache confirmation
         try:
             csv_path, _ = _csv_paths(ticker)
             waited = 0.0
             while waited < 3.0 and not (
-                os.path.exists(csv_path)
-                and (time.time() - os.path.getmtime(csv_path)) < 120
+                os.path.exists(csv_path) and (time.time() - os.path.getmtime(csv_path)) < 120
             ):
-                time.sleep(0.25)
-                waited += 0.25
+                time.sleep(0.25); waited += 0.25
             if os.path.exists(csv_path) and (time.time() - os.path.getmtime(csv_path)) < 120:
-                size_kb = os.path.getsize(csv_path) / 1024
-                csv_slot.caption(f"💾 CSV cache salvata → {csv_path}  ({size_kb:,.0f} KB)")
+                csv_slot.caption(f"💾 CSV → {csv_path}  ({os.path.getsize(csv_path)/1024:,.0f} KB)")
             else:
                 csv_slot.caption(f"💾 {last_msg['text']}")
         except Exception:
@@ -292,7 +209,6 @@ if fetch_btn:
 
         progress_bar.progress(1.0, text="✅ Completato")
         progress_bar.empty()
-
     except Exception as err:
         progress_bar.empty()
         st.error(f"⚠️ Errore: {err}")
@@ -300,113 +216,184 @@ if fetch_btn:
 
 # ── Idle state ────────────────────────────────────────────────────────────────
 if "data" not in st.session_state:
-    st.info("👈 Inserisci un ticker nella sidebar e premi **↻ CARICA DATI** per iniziare.")
+    st.info("👈 Inserisci un ticker e premi **↻ CARICA DATI** per iniziare.")
     st.stop()
 
-# ── Read session data ─────────────────────────────────────────────────────────
 d         = st.session_state["data"]
 raw_df    = d["raw"]
 by_strike = d["by_strike"]
 by_expiry = d["by_expiry"]
 spot      = d["spot"]
 cur_tick  = d["ticker"]
+raw_full  = d.get("raw_full", raw_df)   # unfiltered chain for vol analytics
+
+# ── Delta → strike bounds ─────────────────────────────────────────────────────
+strike_lo, strike_hi = delta_strike_bounds(raw_df, delta_range[0], delta_range[1])
 
 # ── Status bar ────────────────────────────────────────────────────────────────
 from datetime import datetime
 ts = datetime.now().strftime("%H:%M:%S")
 st.markdown(
     f"<div class='status-bar'>Last updated: {ts} &nbsp;|&nbsp; "
-    f"{len(raw_df):,} contracts &nbsp;|&nbsp; "
-    f"{raw_df['expiry'].nunique()} expiries &nbsp;|&nbsp; "
-    f"Spot <b style='color:#ffd166'>${spot:.2f}</b></div>",
+    f"{len(raw_df):,} contracts &nbsp;|&nbsp; {raw_df['expiry'].nunique()} expiries &nbsp;|&nbsp; "
+    f"Spot <b style='color:#ffd166'>${spot:.2f}</b> &nbsp;|&nbsp; "
+    f"Δ filter: [{delta_range[0]:+.2f}, {delta_range[1]:+.2f}]</div>",
     unsafe_allow_html=True,
 )
 
 # ── Metric cards ──────────────────────────────────────────────────────────────
 stats = build_stat_metrics(raw_df, by_strike, spot)
-cols  = st.columns(len(stats))
-for col, (label, (value, _color)) in zip(cols, stats.items()):
+metric_cols = st.columns(len(stats))
+for col, (label, (value, _color)) in zip(metric_cols, stats.items()):
     col.metric(label=label, value=value)
 
 st.markdown("---")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📊 GEX / DEX", "📈 Volatilità", "🔥 Open Interest"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊 GEX / DEX",
+    "📐 Range & Skew",
+    "💰 Put Monitor",
+    "📈 Volatilità",
+    "🔥 Open Interest",
+])
 
 # ── Tab 1: GEX / DEX ─────────────────────────────────────────────────────────
 with tab1:
     col_l, col_r = st.columns(2)
     with col_l:
         try:
-            st.plotly_chart(gex_bar_chart(by_strike, spot, cur_tick, window_pct),
+            st.plotly_chart(gex_bar_chart(by_strike, spot, cur_tick,
+                                          strike_lo=strike_lo, strike_hi=strike_hi),
                             use_container_width=True)
         except Exception as e:
             st.plotly_chart(empty_fig(str(e)), use_container_width=True)
-
     with col_r:
         try:
-            st.plotly_chart(dex_bar_chart(by_strike, spot, cur_tick, window_pct),
+            st.plotly_chart(dex_bar_chart(by_strike, spot, cur_tick,
+                                          strike_lo=strike_lo, strike_hi=strike_hi),
                             use_container_width=True)
         except Exception as e:
             st.plotly_chart(empty_fig(str(e)), use_container_width=True)
-
     try:
         st.plotly_chart(gex_expiry_chart(by_expiry, cur_tick), use_container_width=True)
     except Exception as e:
         st.plotly_chart(empty_fig(str(e)), use_container_width=True)
 
-# ── Tab 2: Volatilità ─────────────────────────────────────────────────────────
+# ── Tab 2: Range & Skew ───────────────────────────────────────────────────────
 with tab2:
+    st.markdown("##### Implied Daily Range  (Δ 0.30 IV)")
+    try:
+        st.plotly_chart(daily_range_chart(raw_full, spot, cur_tick),
+                        use_container_width=True)
+    except Exception as e:
+        st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("##### Put IV Skew Overlay")
+
+    # Controls
+    skew_col1, skew_col2 = st.columns([1, 2])
+    with skew_col1:
+        iv_levels = st.multiselect(
+            "IV reference levels",
+            options=[0.12, 0.14, 0.16, 0.18, 0.20, 0.22, 0.25],
+            default=[0.16, 0.18, 0.20],
+            format_func=lambda x: f"{int(x*100)}%",
+        )
+    with skew_col2:
+        all_expiries = sorted(raw_full["expiry"].unique())
+        near_expiries = [e for e in all_expiries
+                         if (raw_full[raw_full["expiry"]==e]["T_days"].iloc[0]) <= MAX_EXPIRY_DAYS]
+        selected_exp = st.multiselect(
+            "Scadenze (vuoto = tutte ≤ MAX_EXPIRY_DAYS)",
+            options=all_expiries,
+            default=[],
+        )
+
+    try:
+        exp_for_chart = selected_exp if selected_exp else near_expiries
+        st.plotly_chart(
+            iv_skew_overlay_chart(raw_full, spot, cur_tick,
+                                  selected_expiries=exp_for_chart,
+                                  iv_levels=iv_levels or [0.16, 0.18, 0.20]),
+            use_container_width=True,
+        )
+    except Exception as e:
+        st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+
+# ── Tab 3: Put Monitor ────────────────────────────────────────────────────────
+with tab3:
+    try:
+        st.plotly_chart(put_monitor_chart(raw_full, spot, cur_tick),
+                        use_container_width=True)
+    except Exception as e:
+        st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+
+    with st.expander("📋 Tabella dettaglio premi put", expanded=True):
+        try:
+            pm = get_put_monitor(raw_full, spot)
+            if pm.empty:
+                st.info("Nessuna scadenza mensile/trimestrale nel chain caricato.")
+            else:
+                disp = pm[["expiry","type","T_days","delta_target",
+                            "strike","mid","iv_pct","mid_pct_spot","delta_actual"]].copy()
+                disp.columns = ["Expiry","Tipo","DTE","Δ Target",
+                                "Strike","Mid (pts)","IV %","Mid % Spot","Δ Eff."]
+                st.dataframe(
+                    disp.style
+                        .format({"Mid (pts)":"{:.2f}", "IV %":"{:.1f}",
+                                 "Mid % Spot":"{:.3f}%", "Δ Eff.":"{:.3f}",
+                                 "Δ Target":"{:.2f}"})
+                        .background_gradient(subset=["Mid % Spot"], cmap="YlOrRd"),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        except Exception as e:
+            st.error(str(e))
+
+# ── Tab 4: Volatilità ─────────────────────────────────────────────────────────
+with tab4:
     col_a, col_b = st.columns(2)
     with col_a:
         try:
-            st.plotly_chart(vol_smile_chart(raw_df, spot, cur_tick),
-                            use_container_width=True)
+            st.plotly_chart(vol_smile_chart(raw_df, spot, cur_tick), use_container_width=True)
         except Exception as e:
             st.plotly_chart(empty_fig(str(e)), use_container_width=True)
-
     with col_b:
         try:
-            st.plotly_chart(term_structure_chart(raw_df, spot, cur_tick),
-                            use_container_width=True)
+            st.plotly_chart(term_structure_chart(raw_df, spot, cur_tick), use_container_width=True)
         except Exception as e:
             st.plotly_chart(empty_fig(str(e)), use_container_width=True)
-
     try:
         st.plotly_chart(skew_chart(raw_df, spot, cur_tick), use_container_width=True)
     except Exception as e:
         st.plotly_chart(empty_fig(str(e)), use_container_width=True)
 
     st.markdown("#### 🌐 IV Surface (3D)")
-    expiry_options   = sorted(raw_df["expiry"].unique())
-    selected_expiries = st.multiselect(
-        "Seleziona scadenze per la superficie IV",
-        options=expiry_options,
-        default=expiry_options[:6],
-    )
+    expiry_opts    = sorted(raw_df["expiry"].unique())
+    sel_expiries   = st.multiselect("Scadenze per IV Surface", options=expiry_opts,
+                                    default=expiry_opts[:6])
     try:
-        st.plotly_chart(
-            iv_surface_chart(raw_df, spot, cur_tick, expiries_list=selected_expiries),
-            use_container_width=True,
-        )
+        st.plotly_chart(iv_surface_chart(raw_df, spot, cur_tick, expiries_list=sel_expiries),
+                        use_container_width=True)
     except Exception as e:
         st.plotly_chart(empty_fig(str(e)), use_container_width=True)
 
-# ── Tab 3: Open Interest ──────────────────────────────────────────────────────
-with tab3:
+# ── Tab 5: Open Interest ──────────────────────────────────────────────────────
+with tab5:
     try:
-        st.plotly_chart(oi_heatmap(raw_df, spot, cur_tick, window_pct),
+        st.plotly_chart(oi_heatmap(raw_df, spot, cur_tick,
+                                   strike_lo=strike_lo, strike_hi=strike_hi),
                         use_container_width=True)
     except Exception as e:
         st.plotly_chart(empty_fig(str(e)), use_container_width=True)
 
     with st.expander("📋 Dati per strike (tabella)"):
-        cols_to_show = ["strike", "net_gex", "net_dex", "call_gex", "put_gex",
-                        "call_dex", "put_dex", "total_oi"]
+        cols_to_show = ["strike","net_gex","net_dex","call_gex","put_gex",
+                        "call_dex","put_dex","total_oi"]
         available = [c for c in cols_to_show if c in by_strike.columns]
         st.dataframe(
-            by_strike[available]
-            .sort_values("net_gex", ascending=False)
-            .reset_index(drop=True),
+            by_strike[available].sort_values("net_gex", ascending=False).reset_index(drop=True),
             use_container_width=True,
         )

@@ -13,11 +13,15 @@ Note: running this will start the Dash app and bind to `PORT` as defined in the 
 import warnings
 warnings.filterwarnings('ignore')
 
+import re
+import time
+import tempfile
+import threading
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
 from scipy.optimize import brentq
-import yfinance as yf
+import requests
 import socket
 from datetime import datetime, date
 # Defer Plotly imports to inside plotting functions so this module can be
@@ -26,11 +30,16 @@ from datetime import datetime, date
 # chart functions for local imports.
 
 # ── Dashboard config ──────────────────────────────────────────────────────────
-DEFAULT_TICKER   = 'SPY'   # Change to any ticker (SPY, QQQ, AAPL, TSLA …)
-RISK_FREE_RATE   = 0.053221  # Update to current Fed funds rate
-OI_THRESHOLD     = 100     # Minimum open interest to keep a strike
-MAX_EXPIRY_DAYS  = 90      # Only look at expiries within this window
-PORT             = 8051    # Browser port (safe default)
+DEFAULT_TICKER    = '$SPX'  # Use $ prefix for indices (SPY, QQQ, AAPL work without)
+RISK_FREE_RATE    = 0.053221  # Update to current Fed funds rate
+OI_THRESHOLD      = 100     # Minimum open interest to keep a strike
+FETCH_EXPIRY_DAYS = 270     # Max DTE when downloading the chain.
+                            # 270d (9 months) gives a full IV term structure while
+                            # staying clear of LEAP expirations (>9m) where Barchart's
+                            # API becomes unreliable for $SPX (slow response, partial
+                            # JSON, or server-side hangs that bypass read timeouts).
+MAX_EXPIRY_DAYS   = 90      # Default display window (sidebar DTE filter, post-fetch)
+PORT              = 8051    # Browser port (safe default)
 
 print(f'Config loaded. Default ticker: {DEFAULT_TICKER}')
 
@@ -55,6 +64,32 @@ def bs_gamma(S, K, T, r, sigma):
     return norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
 
+def bs_greeks_vectorized(S, K, T, r, sigma, flag):
+    """Vectorized Black-Scholes delta and gamma."""
+    K = np.asarray(K, dtype=float)
+    T = np.asarray(T, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    flag = np.asarray(flag)
+
+    delta = np.zeros_like(K, dtype=float)
+    gamma = np.zeros_like(K, dtype=float)
+
+    valid = (T > 0) & (sigma > 0) & np.isfinite(K) & np.isfinite(T) & np.isfinite(sigma)
+    if not np.any(valid):
+        return delta, gamma
+
+    sqrt_T = np.sqrt(T[valid])
+    d1 = (np.log(S / K[valid]) + (r + 0.5 * sigma[valid] ** 2) * T[valid]) / (sigma[valid] * sqrt_T)
+    cdf_d1 = norm.cdf(d1)
+
+    delta_valid = np.where(flag[valid] == 'c', cdf_d1, cdf_d1 - 1.0)
+    gamma_valid = norm.pdf(d1) / (S * sigma[valid] * sqrt_T)
+
+    delta[valid] = delta_valid
+    gamma[valid] = gamma_valid
+    return delta, gamma
+
+
 def implied_vol(price, S, K, T, r, flag, tol=1e-6):
     """Implied volatility via Brent's method. Returns NaN on failure."""
     if T <= 0 or price <= 0:
@@ -76,96 +111,448 @@ def implied_vol(price, S, K, T, r, flag, tol=1e-6):
 
 print('Black-Scholes functions ready.')
 
+# ── In-memory data cache ───────────────────────────────────────────────
+_DATA_CACHE: dict = {}
+_CACHE_TTL = 600  # seconds (10 minutes)
+
+
+def _cache_key(ticker, max_days, oi_thresh, r):
+    return (ticker.upper(), max_days, oi_thresh, round(r, 6))
+
+
+def _cache_get(key):
+    entry = _DATA_CACHE.get(key)
+    if entry and time.time() - entry[2] < _CACHE_TTL:
+        return entry[0], entry[1]
+    return None, None
+
+
+def _cache_set(key, data, spot):
+    _DATA_CACHE[key] = (data, spot, time.time())
+
+
+# ── CSV file cache ─────────────────────────────────────────────────────
+import os, json as _json
+
+_CSV_CACHE_DIR = os.path.join(tempfile.gettempdir(), 'dex_gex_cache')
+os.makedirs(_CSV_CACHE_DIR, exist_ok=True)
+_CSV_MAX_AGE_HOURS = 8  # treat file as stale after this many hours
+
+
+def _csv_paths(ticker: str):
+    safe = ticker.upper().lstrip('$')
+    return (
+        os.path.join(_CSV_CACHE_DIR, f'{safe}_options.csv'),
+        os.path.join(_CSV_CACHE_DIR, f'{safe}_meta.json'),
+    )
+
+
+def _csv_load(ticker: str):
+    csv_path, meta_path = _csv_paths(ticker)
+    if not (os.path.exists(csv_path) and os.path.exists(meta_path)):
+        return None, None
+    age_hours = (time.time() - os.path.getmtime(csv_path)) / 3600
+    if age_hours > _CSV_MAX_AGE_HOURS:
+        return None, None
+    try:
+        data = pd.read_csv(csv_path, low_memory=False)
+        with open(meta_path) as f:
+            meta = _json.load(f)
+        print(f'CSV cache hit for {ticker} ({age_hours:.1f}h old).')
+        return data, float(meta['spot'])
+    except Exception as exc:
+        print(f'CSV cache read failed: {exc}')
+        return None, None
+
+
+def _csv_save(ticker: str, data: pd.DataFrame, spot: float):
+    csv_path, meta_path = _csv_paths(ticker)
+    try:
+        data.to_csv(csv_path, index=False)
+        with open(meta_path, 'w') as f:
+            _json.dump({'spot': spot, 'saved_at': time.time()}, f)
+        print(f'CSV cache saved → {csv_path}')
+    except Exception as exc:
+        print(f'CSV cache write failed: {exc}')
+
+
 # ── Data fetching & processing ────────────────────────────────────────
 
-def fetch_options_data(ticker: str, max_days: int = MAX_EXPIRY_DAYS,
-                        oi_thresh: int = OI_THRESHOLD, r: float = RISK_FREE_RATE):
-    """
-    Fetches options chain from Yahoo Finance and computes:
-    - Implied Volatility
-    - Delta per contract
-    - Gamma per contract
-    - DEX = delta * OI * 100
-    - GEX = gamma * OI * 100 * spot  (dealer convention: calls +, puts -)
-    """
-    print(f'Fetching data for {ticker} …')
-    tk   = yf.Ticker(ticker)
-    info = tk.fast_info
-    S    = info.last_price
-    print(f'  Spot price: ${S:.2f}')
+BARCHART_USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/124.0.0.0 Safari/537.36'
+)
+BARCHART_API_URL = 'https://www.barchart.com/proxies/core-api/v1/options/get'
+BARCHART_FIELDS = (
+    'symbol,baseSymbol,strikePrice,expirationDate,moneyness,bidPrice,midpoint,'
+    'askPrice,lastPrice,priceChange,percentChange,volume,openInterest,'
+    'openInterestChange,volatility,delta,optionType,daysToExpiration,'
+    'tradeTime,averageVolatility,historicVolatility30d,baseNextEarningsDate,'
+    'dividendExDate,baseTimeCode,expirationType,impliedVolatilityRank1y'
+)
 
-    today      = date.today()
-    expiries   = tk.options           # tuple of expiry strings
-    rows       = []
 
-    for exp_str in expiries:
-        exp_date = datetime.strptime(exp_str, '%Y-%m-%d').date()
-        T_days   = (exp_date - today).days
-        if T_days < 1 or T_days > max_days:
+def build_barchart_session(ticker: str) -> requests.Session:
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': BARCHART_USER_AGENT,
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+    response = session.get(barchart_page_url(ticker), timeout=30)
+    response.raise_for_status()
+    return session
+
+
+def resolve_barchart_symbol(ticker: str) -> str:
+    raw = (ticker or '').strip().upper()
+    if not raw:
+        raise ValueError('Ticker is required.')
+
+    candidates = [raw]
+    if not raw.startswith('$'):
+        candidates.append(f'${raw}')
+
+    # Only one possible form (e.g. an index already in canonical '$' form like
+    # $SPX / $VIX / $NDX): there is nothing to disambiguate, so skip the network
+    # probe entirely — it cannot change the result and can only add latency or
+    # hang. build_barchart_session() validates the symbol on the next step.
+    if len(candidates) == 1:
+        return raw
+
+    for candidate in candidates:
+        try:
+            response = requests.get(
+                barchart_page_url(candidate),
+                headers={
+                    'User-Agent': BARCHART_USER_AGENT,
+                    'Accept-Language': 'en-US,en;q=0.9',
+                },
+                timeout=8,
+            )
+            if response.ok and 'Page not found' not in response.text:
+                return candidate
+        except requests.RequestException:
             continue
-        T_years = T_days / 365.0
 
-        chain = tk.option_chain(exp_str)
+    return raw
 
-        for flag, df in [('c', chain.calls), ('p', chain.puts)]:
-            df = df.copy()
-            df['flag']       = flag
-            df['expiry']     = exp_str
-            df['T_days']     = T_days
-            df['T_years']    = T_years
-            df['spot']       = S
-            df['mid']        = (df['bid'] + df['ask']) / 2
-            rows.append(df)
+
+def barchart_page_url(ticker: str) -> str:
+    return f'https://www.barchart.com/stocks/quotes/{ticker}/options'
+
+
+def barchart_api_headers(session: requests.Session, ticker: str) -> dict:
+    xsrf_token = requests.utils.unquote(session.cookies.get('XSRF-TOKEN', ''))
+    return {
+        'User-Agent': BARCHART_USER_AGENT,
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': barchart_page_url(ticker),
+        'Origin': 'https://www.barchart.com',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-XSRF-TOKEN': xsrf_token,
+    }
+
+
+def barchart_api_params(ticker: str, expiration: str) -> dict:
+    return {
+        'baseSymbol': ticker,
+        'fields': BARCHART_FIELDS,
+        'groupBy': 'optionType',
+        'expirationDate': expiration,
+        'meta': 'field.shortName,expirations',
+        'orderBy': 'strikePrice',
+        'orderDir': 'asc',
+        'optionsOverview': 'true',
+    }
+
+
+def flatten_barchart_expirations(meta: dict, max_dte: int = FETCH_EXPIRY_DAYS) -> list[str]:
+    """Return future expirations (weekly + monthly) within max_dte days.
+
+    Caps at FETCH_EXPIRY_DAYS (1 year) by default so the download never touches
+    thin, slow LEAP expirations beyond that horizon. Display filtering is handled
+    separately by apply_dashboard_filters / the sidebar DTE slider.
+    """
+    expirations = []
+    exp_meta = meta.get('expirations', {}) if isinstance(meta, dict) else {}
+    for group_name in ('weekly', 'monthly'):
+        expirations.extend(exp_meta.get(group_name, []))
+
+    today = date.today()
+    filtered = []
+    for expiration in sorted(set(expirations)):
+        exp_date = datetime.strptime(expiration, '%Y-%m-%d').date()
+        dte = (exp_date - today).days
+        if 1 <= dte <= max_dte:
+            filtered.append(expiration)
+    return filtered
+
+
+def to_float(value):
+    if value in (None, '', 'N/A', 'unch', '--'):
+        return np.nan
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = str(value).replace(',', '').replace('%', '')
+    try:
+        return float(cleaned)
+    except ValueError:
+        return np.nan
+
+
+def normalize_barchart_row(row: dict, expiration: str, option_type: str) -> dict:
+    return {
+        'contractSymbol': row.get('symbol'),
+        'strike': to_float(row.get('strikePrice')),
+        'bid': to_float(row.get('bidPrice')),
+        'ask': to_float(row.get('askPrice')),
+        'lastPrice': to_float(row.get('lastPrice')),
+        'volume': to_float(row.get('volume')),
+        'openInterest': to_float(row.get('openInterest')),
+        'impliedVolatility': to_float(row.get('volatility')),
+        'delta_barchart': to_float(row.get('delta')),
+        'moneyness': to_float(row.get('moneyness')),
+        'optionType': option_type.lower(),
+        'expiry': expiration,
+        'expirationType': row.get('expirationType'),
+        'tradeTime': row.get('tradeTime'),
+    }
+
+
+def barchart_payload_to_frame(payload: dict, expiration: str) -> pd.DataFrame:
+    rows = []
+    data = payload.get('data', {}) if isinstance(payload, dict) else {}
+    for option_type in ('Call', 'Put'):
+        for contract in data.get(option_type, []):
+            if isinstance(contract, dict):
+                rows.append(normalize_barchart_row(contract, expiration, option_type))
+    return pd.DataFrame(rows)
+
+
+def fetch_barchart_payload(session: requests.Session, ticker: str, expiration: str) -> dict:
+    response = session.get(
+        BARCHART_API_URL,
+        headers=barchart_api_headers(session, ticker),
+        params=barchart_api_params(ticker, expiration),
+        timeout=_FETCH_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_barchart_spot(session: requests.Session, ticker: str) -> float:
+    response = session.get(barchart_page_url(ticker), timeout=30)
+    response.raise_for_status()
+
+    match = re.search(r'"lastPrice":"([0-9,]+(?:\.[0-9]+)?)"', response.text)
+    if not match:
+        raise ValueError(f'Unable to parse Barchart spot quote for {ticker}.')
+
+    spot = float(match.group(1).replace(',', ''))
+    if not np.isfinite(spot):
+        raise ValueError(f'Parsed Barchart spot for {ticker} is not finite.')
+    return spot
+
+
+_FETCH_ATTEMPTS   = 3
+_FETCH_DELAY      = 0.1   # seconds between expiration requests
+_FETCH_TIMEOUT    = 15    # seconds per request (reduced: API calls should be fast;
+                          # timeouts mean Barchart is slow, not that session expired)
+
+
+def fetch_options_data(ticker: str, r: float = RISK_FREE_RATE,
+                       progress_callback=None, force_refresh: bool = False):
+    """
+    Fetch the FULL option chain from Barchart (no DTE or OI filters).
+    Computes per-contract Greeks, DEX and GEX and saves to CSV.
+    Filters are applied later in the dashboard from the cached dataset.
+    """
+
+    def notify(progress: int, message: str):
+        if progress_callback is not None:
+            progress_callback(progress, message)
+
+    key = _cache_key(ticker.upper().lstrip('$'), 0, 0, r)
+
+    if not force_refresh:
+        # 1. In-memory cache — instant
+        cached_data, cached_spot = _cache_get(key)
+        if cached_data is not None:
+            notify(100, f'Using cached {ticker} data (< 10 min old)')
+            return cached_data, cached_spot
+
+        # 2. CSV file cache — survives restarts. Read on a background thread so a
+        #    slow disk (OneDrive-synced home, network share, AV scan) never freezes
+        #    the progress bar. If the read takes > 10 s, skip and do a live fetch.
+        notify(5, f'Loading {ticker} from local CSV cache ...')
+        _csv_result = [None, None]
+        def _do_csv_load():
+            _csv_result[0], _csv_result[1] = _csv_load(ticker)
+        _t = threading.Thread(target=_do_csv_load, daemon=True)
+        _t.start()
+        _t.join(timeout=10)
+        if _csv_result[0] is not None:
+            notify(100, f'Loaded {ticker} from local CSV cache')
+            _cache_set(key, _csv_result[0], _csv_result[1])
+            return _csv_result[0], _csv_result[1]
+        elif _t.is_alive():
+            notify(5, f'CSV cache read too slow, switching to live feed ...')
+
+    # ── Live fetch from Barchart (full dataset, no filters) ────────────
+    print(f'Fetching full dataset for {ticker} ...')
+    notify(5, f'Opening Barchart session for {ticker} ...')
+
+    # Open session + read spot + expiry list, retrying with a fresh session on
+    # transient failure — mirrors the standalone scraper, which retries every
+    # request. Previously these three were single-shot, so one slow response or
+    # hiccup on the heavy $SPX page killed the whole load with no recovery.
+    last_exc = None
+    for attempt in range(_FETCH_ATTEMPTS):
+        try:
+            session = build_barchart_session(ticker)
+            notify(15, f'Fetching {ticker} spot quote ...')
+            S = fetch_barchart_spot(session, ticker)
+            notify(20, f'Fetching {ticker} expiration list ...')
+            nearest_payload = fetch_barchart_payload(session, ticker, 'nearest')
+            break
+        except Exception as exc:
+            last_exc = exc
+            print(f'  Barchart open attempt {attempt+1}/{_FETCH_ATTEMPTS} failed: '
+                  f'{type(exc).__name__}: {str(exc).splitlines()[0]}')
+            if attempt < _FETCH_ATTEMPTS - 1:
+                notify(5, f'Retry {attempt+2}/{_FETCH_ATTEMPTS}: reconnecting to Barchart ...')
+                time.sleep(1)
+    else:
+        raise RuntimeError(
+            f'Barchart connection failed after {_FETCH_ATTEMPTS} attempts: {last_exc}'
+        )
+
+    expiries = flatten_barchart_expirations(nearest_payload.get('meta', {}))
+
+    if not expiries:
+        raise ValueError('No expirations found.')
+
+    print(f'  {len(expiries)} expirations to fetch. Spot: ${S:.2f}')
+
+    rows = []
+    loop_base = 25
+    loop_span = 60
+
+    for index, exp_str in enumerate(expiries, 1):
+        pct = loop_base + int(loop_span * index / len(expiries))
+        notify(pct, f'[{index}/{len(expiries)}] Fetching {exp_str} ...')
+        frame = pd.DataFrame()
+
+        # Near-term expirations (≤180 DTE) get full retries — they're the core
+        # GEX/DEX data. Long-dated ones (>180 DTE, thin OI, IV-surface only)
+        # get one attempt: if Barchart is slow for them, skip rather than stall.
+        exp_dte  = (date.fromisoformat(exp_str) - date.today()).days
+        attempts = _FETCH_ATTEMPTS if exp_dte <= 180 else 1
+
+        for attempt in range(attempts):
+            try:
+                payload = fetch_barchart_payload(session, ticker, exp_str)
+                frame = barchart_payload_to_frame(payload, exp_str)
+                break
+            except requests.exceptions.Timeout:
+                print(f'  [{index}/{len(expiries)}] {exp_str} attempt {attempt+1} timed out')
+                if attempt < attempts - 1:
+                    notify(pct, f'[{index}/{len(expiries)}] Retry {attempt+2}: {exp_str} ...')
+                    time.sleep(0.5)
+            except Exception as exc:
+                print(f'  [{index}/{len(expiries)}] {exp_str} attempt {attempt+1} failed: '
+                      f'{type(exc).__name__}: {str(exc).splitlines()[0]}')
+                if attempt < attempts - 1:
+                    notify(pct, f'[{index}/{len(expiries)}] Reconnecting, retry {attempt+2}: {exp_str} ...')
+                    try:
+                        session = build_barchart_session(ticker)
+                    except Exception:
+                        pass
+                    time.sleep(1)
+
+        if not frame.empty:
+            rows.append(frame)
+        else:
+            print(f'  [{index}/{len(expiries)}] {exp_str} — no data, skipping')
+
+        time.sleep(_FETCH_DELAY)
 
     if not rows:
-        raise ValueError('No options data found within the expiry window.')
+        raise ValueError('No options data returned from Barchart.')
 
+    notify(87, f'Assembling {ticker} chain ({len(rows)} expiries) ...')
     data = pd.concat(rows, ignore_index=True)
 
-    # Filter low OI
-    data = data[data['openInterest'] >= oi_thresh].copy()
+    notify(90, f'Processing {ticker} option chain ({len(data):,} rows) ...')
+    today = date.today()
+    expiry_dt    = pd.to_datetime(data['expiry'])
+    data['T_days']  = (expiry_dt - pd.Timestamp(today)).dt.days
+    data = data[data['T_days'] >= 1].copy()          # drop expired only
+    data['T_years'] = data['T_days'] / 365.0
+    data['spot']    = S
+    data['mid']     = data[['bid', 'ask']].mean(axis=1, skipna=True)
+    data['flag']    = data['optionType'].map({'call': 'c', 'put': 'p'})
+    data['iv']      = data['impliedVolatility'] / 100.0
 
-    # Compute IV
-    data['iv'] = data.apply(
-        lambda row: implied_vol(row['mid'], S, row['strike'], row['T_years'], r, row['flag']),
-        axis=1
-    )
+    # No OI or DTE filter here — full dataset goes to CSV
+    data = data[data['mid'].notna()].copy()
     data.dropna(subset=['iv'], inplace=True)
     data = data[data['iv'] > 0].copy()
 
-    # Greeks
-    data['delta'] = data.apply(
-        lambda row: bs_delta(S, row['strike'], row['T_years'], r, row['iv'], row['flag']),
-        axis=1,
+    notify(93, f'Computing Greeks for {ticker} ...')
+    delta_calc, gamma_calc = bs_greeks_vectorized(
+        S,
+        data['strike'].to_numpy(),
+        data['T_years'].to_numpy(),
+        r,
+        data['iv'].to_numpy(),
+        data['flag'].to_numpy(),
     )
-    data['gamma'] = data.apply(
-        lambda row: bs_gamma(S, row['strike'], row['T_years'], r, row['iv']),
-        axis=1,
-    )
+    delta_available = data['delta_barchart'].notna()
+    data['delta'] = np.where(delta_available, data['delta_barchart'], delta_calc)
+    data['gamma'] = gamma_calc
+    data['dex']   = data['delta'] * data['openInterest'] * 100
+    sign          = data['flag'].map({'c': 1, 'p': -1})
+    data['gex']   = sign * data['gamma'] * data['openInterest'] * 100 * S
 
-    # DEX = net delta dollars per 1-point move  (delta * OI * 100)
-    data['dex'] = data['delta'] * data['openInterest'] * 100
+    notify(96, f'Computed Greeks — {len(data):,} contracts across {data["expiry"].nunique()} expiries')
+    print(f'  Loaded {len(data):,} contracts across {data["expiry"].nunique()} expiries.')
+    _cache_set(key, data, S)
 
-    # GEX = gamma * OI * 100 * spot  (dealer flip: puts negative)
-    sign = data['flag'].map({'c': 1, 'p': -1})
-    data['gex'] = sign * data['gamma'] * data['openInterest'] * 100 * S
-
-    print(f'  Loaded {len(data):,} option contracts across {data["expiry"].nunique()} expiries.')
+    # Write the CSV cache OFF the critical path. A slow or locked disk
+    # (OneDrive sync, antivirus scan, file open in Excel, network home dir)
+    # must never freeze the dashboard — the CSV is only a cache for next time.
+    notify(98, f'Caching {ticker} chain to disk in background ...')
+    threading.Thread(
+        target=_csv_save, args=(ticker, data.copy(), S), daemon=True
+    ).start()
+    notify(100, f'Ready — {len(data):,} contracts across {data["expiry"].nunique()} expiries')
     return data, S
 
 
 def aggregate_by_strike(data: pd.DataFrame):
-    """Roll up DEX and GEX to per-strike totals."""
-    agg = data.groupby('strike').agg(
-        net_dex = ('dex', 'sum'),
-        net_gex = ('gex', 'sum'),
-        call_dex = ('dex', lambda x: x[data.loc[x.index, 'flag'] == 'c'].sum()),
-        put_dex  = ('dex', lambda x: x[data.loc[x.index, 'flag'] == 'p'].sum()),
-        call_gex = ('gex', lambda x: x[data.loc[x.index, 'flag'] == 'c'].sum()),
-        put_gex  = ('gex', lambda x: x[data.loc[x.index, 'flag'] == 'p'].sum()),
-        total_oi = ('openInterest', 'sum'),
-    ).reset_index()
-    return agg
+    """Roll up DEX and GEX to per-strike totals — fully vectorised.
+
+    The previous implementation used per-group lambdas that re-indexed into
+    the full DataFrame on every group (O(n × n_groups)).  With 16 k contracts
+    across ~200 strikes that ran millions of index lookups on every 1.5-second
+    interval tick.  This version uses three plain groupby-sum calls and a join,
+    which is O(n) total and completes in single-digit milliseconds.
+    """
+    calls  = (data[data['flag'] == 'c']
+               .groupby('strike', sort=True)
+               .agg(call_dex=('dex', 'sum'), call_gex=('gex', 'sum')))
+    puts   = (data[data['flag'] == 'p']
+               .groupby('strike', sort=True)
+               .agg(put_dex=('dex', 'sum'), put_gex=('gex', 'sum')))
+    totals = (data.groupby('strike', sort=True)
+               .agg(net_dex=('dex', 'sum'), net_gex=('gex', 'sum'),
+                    total_oi=('openInterest', 'sum')))
+    return (totals.join(calls, how='left')
+                  .join(puts,  how='left')
+                  .fillna(0)
+                  .reset_index())
 
 
 def aggregate_by_expiry(data: pd.DataFrame):
@@ -175,6 +562,37 @@ def aggregate_by_expiry(data: pd.DataFrame):
         net_gex = ('gex', 'sum'),
         total_oi = ('openInterest', 'sum'),
     ).reset_index().sort_values('T_days')
+
+
+def apply_dashboard_filters(
+    data: pd.DataFrame,
+    delta_min=None,
+    delta_max=None,
+    dte_min=None,
+    dte_max=None,
+    oi_min=None,
+    oi_max=None,
+    option_flags=None,
+):
+    filtered = data.copy()
+
+    if option_flags:
+        filtered = filtered[filtered['flag'].isin(option_flags)]
+
+    if delta_min is not None:
+        filtered = filtered[filtered['delta'] >= delta_min]
+    if delta_max is not None:
+        filtered = filtered[filtered['delta'] <= delta_max]
+    if dte_min is not None:
+        filtered = filtered[filtered['T_days'] >= dte_min]
+    if dte_max is not None:
+        filtered = filtered[filtered['T_days'] <= dte_max]
+    if oi_min is not None:
+        filtered = filtered[filtered['openInterest'] >= oi_min]
+    if oi_max is not None:
+        filtered = filtered[filtered['openInterest'] <= oi_max]
+
+    return filtered.copy()
 
 print('Data functions ready.')
 
@@ -481,16 +899,15 @@ def iv_surface_chart(raw_df, spot, ticker, expiries_to_show=6, expiries_list=Non
         cmin=z_lo,
         cmax=z_hi,
         colorbar=dict(
-            title='IV (%)',
+            title=dict(text='IV (%)', font=dict(color=TEXT_COL, family='Courier New')),
             tickfont=dict(color=TEXT_COL, family='Courier New'),
-            titlefont=dict(color=TEXT_COL, family='Courier New'),
         ),
         opacity=0.92,
         # 2) Contour lines sovrapposte
         contours=dict(
             z=dict(
                 show=True,
-                usecolorscale=True,
+                usecolormap=True,
                 project=dict(z=True),
                 highlightcolor=ACCENT_YLW,
                 width=1.5,
@@ -513,7 +930,7 @@ def iv_surface_chart(raw_df, spot, ticker, expiries_to_show=6, expiries_list=Non
         z_atm = np.where(np.isfinite(z_atm), z_atm, row_means)
 
     fig.add_trace(go.Scatter3d(
-        x=[atm_strike] * n_expiry,
+        x=[grid_strikes[atm_col]] * n_expiry,
         y=y_labels,
         z=z_atm,
         mode='lines',
@@ -541,24 +958,21 @@ def iv_surface_chart(raw_df, spot, ticker, expiries_to_show=6, expiries_list=Non
         scene=dict(
             bgcolor=DARK_BG,
             xaxis=dict(
-                title='Strike',
+                title=dict(text='Strike', font=dict(color=TEXT_COL)),
                 gridcolor=GRID_COL,
                 backgroundcolor=CARD_BG,
-                titlefont=dict(color=TEXT_COL),
                 tickfont=dict(color=TEXT_COL),
             ),
             yaxis=dict(
-                title='Expiry',
+                title=dict(text='Expiry', font=dict(color=TEXT_COL)),
                 gridcolor=GRID_COL,
                 backgroundcolor=CARD_BG,
-                titlefont=dict(color=TEXT_COL),
                 tickfont=dict(color=TEXT_COL, size=9),
             ),
             zaxis=dict(
-                title='IV (%)',
+                title=dict(text='IV (%)', font=dict(color=TEXT_COL)),
                 gridcolor=GRID_COL,
                 backgroundcolor=CARD_BG,
-                titlefont=dict(color=TEXT_COL),
                 tickfont=dict(color=TEXT_COL),
             ),
             camera=dict(eye=dict(x=1.6, y=-1.6, z=0.8)),
@@ -571,6 +985,11 @@ def iv_surface_chart(raw_df, spot, ticker, expiries_to_show=6, expiries_list=Non
 
 def vega_heatmap(raw_df, spot, ticker, window_pct=0.12):
     import plotly.graph_objects as go
+
+    if 'vega_exposure' not in raw_df.columns:
+        fig = go.Figure()
+        fig.update_layout(**base_layout(f'Vega Exposure — {ticker} (vega not computed)'))
+        return fig
 
     lo = spot * (1 - window_pct)
     hi = spot * (1 + window_pct)
@@ -650,6 +1069,17 @@ if __name__ == '__main__':
         'by_expiry': None,
         'spot':      None,
         'ticker':    DEFAULT_TICKER,
+        'updated_at': None,
+    }
+    store_lock = threading.Lock()
+    loader_lock = threading.Lock()
+    loader_state = {
+        'request_id': 0,
+        'status': 'idle',
+        'ticker': DEFAULT_TICKER,
+        'progress': 0,
+        'message': 'Enter a ticker and press  ⬇ LOAD DATA  to begin.',
+        'error': None,
     }
 
     # Stat card helper
@@ -688,6 +1118,172 @@ if __name__ == '__main__':
             stat_card('Put/Call OI Ratio', f'{pcr:.2f}', ACCENT_YLW),
         ]
 
+    def filter_input(input_id, placeholder, value=None, width='96px'):
+        return dcc.Input(
+            id=input_id,
+            type='number',
+            value=value,
+            placeholder=placeholder,
+            debounce=True,
+            style={
+                'background': '#1a1d27',
+                'border': f'1px solid {GRID_COL}',
+                'color': TEXT_COL,
+                'padding': '8px 10px',
+                'borderRadius': '4px',
+                'fontFamily': 'Courier New',
+                'fontSize': '13px',
+                'width': width,
+            },
+        )
+
+    def filter_group(label, min_id, max_id, min_placeholder, max_placeholder, min_value=None, max_value=None):
+        return html.Div([
+            html.P(label, style={
+                'color': '#7a8399',
+                'fontSize': '11px',
+                'margin': '0 0 6px 0',
+                'letterSpacing': '1.5px',
+                'textTransform': 'uppercase',
+                'fontFamily': 'Courier New',
+            }),
+            html.Div([
+                filter_input(min_id, min_placeholder, min_value),
+                filter_input(max_id, max_placeholder, max_value),
+            ], style={'display': 'flex', 'gap': '8px'}),
+        ], style={'display': 'flex', 'flexDirection': 'column'})
+
+    def option_type_filter():
+        return html.Div([
+            html.P('Option Type', style={
+                'color': '#7a8399',
+                'fontSize': '11px',
+                'margin': '0 0 6px 0',
+                'letterSpacing': '1.5px',
+                'textTransform': 'uppercase',
+                'fontFamily': 'Courier New',
+            }),
+            dcc.Checklist(
+                id='option-type-input',
+                options=[
+                    {'label': 'Call', 'value': 'c'},
+                    {'label': 'Put', 'value': 'p'},
+                ],
+                value=['c', 'p'],
+                inline=True,
+                inputStyle={'marginRight': '6px', 'marginLeft': '0'},
+                labelStyle={
+                    'display': 'inline-flex',
+                    'alignItems': 'center',
+                    'marginRight': '14px',
+                    'color': TEXT_COL,
+                    'fontFamily': 'Courier New',
+                    'fontSize': '13px',
+                },
+                style={
+                    'background': '#13161e',
+                    'border': f'1px solid {GRID_COL}',
+                    'borderRadius': '4px',
+                    'padding': '8px 12px',
+                    'minHeight': '38px',
+                },
+            ),
+        ], style={'display': 'flex', 'flexDirection': 'column', 'minWidth': '210px'})
+
+    def empty_figure():
+        return go.Figure().update_layout(**base_layout())
+
+    def snapshot_store():
+        with store_lock:
+            return dict(store)
+
+    def snapshot_loader():
+        with loader_lock:
+            return dict(loader_state)
+
+    def set_loader_state(**updates):
+        with loader_lock:
+            loader_state.update(updates)
+            return dict(loader_state)
+
+    def report_progress(request_id: int, progress: int, message: str) -> bool:
+        with loader_lock:
+            if loader_state['request_id'] != request_id:
+                return False
+            loader_state.update({
+                'status': 'loading',
+                'progress': max(0, min(100, int(progress))),
+                'message': message,
+                'error': None,
+            })
+            return True
+
+    def load_dashboard_data(request_id: int, ticker: str, force_refresh: bool = False):
+        try:
+            report_progress(request_id, 2, f'Starting {ticker} data feed ...')
+            report_progress(request_id, 3, f'Resolving {ticker} symbol on Barchart ...')
+            resolved_barchart_ticker = resolve_barchart_symbol(ticker)
+            report_progress(request_id, 4, f'Connecting to Barchart for {ticker} ...')
+            raw_df, spot = fetch_options_data(
+                resolved_barchart_ticker,
+                progress_callback=lambda pct, msg: report_progress(request_id, pct, msg),
+                force_refresh=force_refresh,
+            )
+            report_progress(request_id, 97, f'Finalizing {ticker} dashboard feed ...')
+
+            with store_lock:
+                store['raw'] = raw_df
+                store['by_strike'] = None
+                store['by_expiry'] = None
+                store['spot'] = spot
+                store['ticker'] = resolved_barchart_ticker
+                store['updated_at'] = datetime.now()
+
+            set_loader_state(
+                status='ready',
+                ticker=ticker,
+                progress=100,
+                message=f'{ticker} feed loaded',
+                error=None,
+            )
+        except Exception as exc:
+            set_loader_state(
+                status='error',
+                ticker=ticker,
+                progress=100,
+                message=f'Error loading {ticker}',
+                error=str(exc),
+            )
+
+    def start_background_load(ticker: str, force_refresh: bool = False) -> int:
+        with loader_lock:
+            loader_state['request_id'] += 1
+            request_id = loader_state['request_id']
+            loader_state.update({
+                'status': 'loading',
+                'ticker': ticker,
+                'progress': 0,
+                'message': f'Queued {ticker} load ...',
+                'error': None,
+            })
+
+        worker = threading.Thread(target=load_dashboard_data, args=(request_id, ticker, force_refresh), daemon=True)
+        worker.start()
+        return request_id
+
+    def resolve_ticker(manual_value):
+        manual = (manual_value or '').strip().upper()
+        return manual or DEFAULT_TICKER
+
+    def progress_style(loader):
+        if loader['status'] == 'error':
+            return 'danger', False, False
+        if loader['status'] == 'loading':
+            return 'info', True, True
+        if loader['status'] == 'ready':
+            return 'success', False, False
+        return 'secondary', False, False
+
     # App
     # Create an explicit Flask server with a defined instance_path to avoid
     # Flask attempting to auto-discover package paths (which can fail in some
@@ -721,11 +1317,11 @@ if __name__ == '__main__':
         ]),
         html.Div([
             dcc.Input(id='ticker-input', value=DEFAULT_TICKER, type='text',
-                      placeholder='Ticker …',
+                      placeholder='Type ticker ...',
                       style={'background': '#1a1d27', 'border': f'1px solid {GRID_COL}',
                              'color': TEXT_COL, 'padding': '8px 12px', 'borderRadius': '4px',
                              'fontFamily': 'Courier New', 'fontSize': '14px',
-                             'width': '100px', 'textTransform': 'uppercase'}),
+                             'width': '180px', 'textTransform': 'uppercase'}),
             html.Div(
                 dcc.Slider(
                     id='window-slider',
@@ -739,7 +1335,7 @@ if __name__ == '__main__':
                 ),
                 style={'width': '200px'}
             ),
-            html.Button('↻ REFRESH', id='refresh-btn',
+                   html.Button('⬇ LOAD DATA', id='refresh-btn',
                         style={'background': 'transparent', 'border': f'1px solid {ACCENT_GRN}',
                                'color': ACCENT_GRN, 'padding': '8px 20px',
                                'borderRadius': '4px', 'cursor': 'pointer',
@@ -755,9 +1351,45 @@ if __name__ == '__main__':
     app.layout = html.Div([
         HEADER,
 
-        html.Div(id='status-bar', style={'padding': '8px 28px', 'fontSize': '12px',
+        html.Div([
+            option_type_filter(),
+            filter_group('Delta', 'delta-min-input', 'delta-max-input', 'Min <=', 'Max <=', -1, 1),
+            filter_group('Expiry Days', 'dte-min-input', 'dte-max-input', 'Min', 'Max', 0, 90),
+            filter_group('Open Interest', 'oi-min-input', 'oi-max-input', 'Min <=', 'Max <=', OI_THRESHOLD, None),
+            html.Button('⊞ APPLY FILTERS', id='apply-filters-btn',
+                style={'background': 'transparent', 'border': f'1px solid {ACCENT_BLU}',
+                       'color': ACCENT_BLU, 'padding': '8px 20px',
+                       'borderRadius': '4px', 'cursor': 'pointer',
+                       'fontFamily': 'Courier New', 'fontSize': '13px',
+                       'letterSpacing': '1px', 'alignSelf': 'flex-end'}),
+        ], style={
+            'display': 'flex',
+            'gap': '18px',
+            'padding': '12px 28px 0',
+            'flexWrap': 'wrap',
+            'alignItems': 'flex-end',
+        }),
+
+        html.Div(id='status-bar', style={'padding': '6px 28px', 'fontSize': '12px',
                                          'color': '#7a8399', 'fontFamily': 'Courier New',
                                          'borderBottom': f'1px solid {GRID_COL}'}),
+
+        html.Div([
+            dbc.Progress(
+                id='load-progress',
+                value=0,
+                label='0%',
+                striped=True,
+                animated=True,
+                color='info',
+                style={'height': '22px', 'fontSize': '13px'}
+            ),
+            html.Div(id='load-message', style={
+                'textAlign': 'center', 'fontFamily': 'Courier New',
+                'fontSize': '14px', 'color': ACCENT_BLU, 'marginTop': '8px',
+                'minHeight': '20px',
+            }),
+        ], style={'padding': '10px 28px 4px'}),
 
         html.Div(id='stat-cards',
                  style={'display': 'flex', 'gap': '12px', 'padding': '16px 28px',
@@ -774,12 +1406,94 @@ if __name__ == '__main__':
             html.Div(dcc.Graph(id='vol-smile'), style={'flex': '1', 'minWidth': '300px'}),
         ], style={'display': 'flex', 'gap': '12px', 'padding': '0 28px 28px'}),
 
-        dcc.Loading(html.Div(id='_dummy'), type='circle', color=ACCENT_GRN),
+        dcc.Store(id='load-request-store'),
+        dcc.Store(id='filter-store', data={
+            'option_flags': ['c', 'p'],
+            'delta_min': -1,
+            'delta_max': 1,
+            'dte_min': 0,
+            'dte_max': 90,
+            'oi_min': OI_THRESHOLD,
+            'oi_max': None,
+            'timestamp': datetime.now().isoformat(),
+        }),
+        dcc.Interval(id='loading-interval', interval=1500, n_intervals=0),
 
     ], style={'background': DARK_BG, 'minHeight': '100vh', 'fontFamily': 'Courier New'})
 
-
     # Callbacks
+    @app.callback(
+        Output('load-request-store', 'data'),
+        Output('filter-store', 'data'),
+        Output('ticker-input', 'value'),
+        Input('refresh-btn', 'n_clicks'),
+        Input('apply-filters-btn', 'n_clicks'),
+        State('option-type-input', 'value'),
+        State('ticker-input', 'value'),
+        State('delta-min-input', 'value'),
+        State('delta-max-input', 'value'),
+        State('dte-min-input', 'value'),
+        State('dte-max-input', 'value'),
+        State('oi-min-input', 'value'),
+        State('oi-max-input', 'value'),
+        prevent_initial_call=False,
+     )
+    def update_request(
+        n_clicks,
+        n_clicks_filter,
+        option_flags,
+        ticker_val,
+        delta_min,
+        delta_max,
+        dte_min,
+        dte_max,
+        oi_min,
+        oi_max,
+    ):
+        triggered = ctx.triggered_id
+        ticker = resolve_ticker(ticker_val)
+        current_store = snapshot_store()
+        loader = snapshot_loader()
+        current_ticker = resolve_ticker(current_store.get('ticker'))
+        has_cached_data = current_store.get('raw') is not None and current_store.get('spot') is not None
+        load_clicked = triggered == 'refresh-btn'
+        filter_clicked = triggered == 'apply-filters-btn'
+
+        if loader['status'] == 'loading' and resolve_ticker(loader.get('ticker')) == ticker:
+            # Already loading this ticker — don't start a second thread
+            request_id = loader['request_id']
+        elif load_clicked:
+            # Explicit LOAD DATA press always goes straight to Barchart.
+            # force_refresh=True skips both the in-memory and CSV cache so the
+            # button is never blocked by a slow or stale cached file.
+            request_id = start_background_load(ticker, force_refresh=True)
+        elif filter_clicked and has_cached_data:
+            # Apply filters only — reuse in-memory data, no reload
+            request_id = loader['request_id']
+        else:
+            # Initial page load (or any non-load trigger before data exists):
+            # do NOT auto-fetch. Stay idle until the user presses LOAD DATA.
+            request_id = loader['request_id']
+
+        load_request = {
+            'request_id': request_id,
+            'ticker': ticker,
+            'triggered_by': triggered or 'initial-load',
+            'timestamp': datetime.now().isoformat(),
+        }
+        filter_request = {
+            'option_flags': option_flags or [],
+            'delta_min': delta_min,
+            'delta_max': delta_max,
+            'dte_min': dte_min,
+            'dte_max': dte_max,
+            'oi_min': oi_min,
+            'oi_max': oi_max,
+            'timestamp': datetime.now().isoformat(),
+        }
+        return load_request, filter_request, ticker
+
+
     @app.callback(
         Output('stat-cards', 'children'),
         Output('gex-bar', 'figure'),
@@ -788,46 +1502,130 @@ if __name__ == '__main__':
         Output('oi-heatmap', 'figure'),
         Output('vol-smile', 'figure'),
         Output('status-bar', 'children'),
-        Output('_dummy', 'children'),
-        Input('refresh-btn', 'n_clicks'),
+        Output('load-progress', 'value'),
+        Output('load-progress', 'label'),
+        Output('load-progress', 'color'),
+        Output('load-progress', 'animated'),
+        Output('load-progress', 'striped'),
+        Output('load-message', 'children'),
+        Input('loading-interval', 'n_intervals'),
         Input('window-slider', 'value'),
-        State('ticker-input', 'value'),
+        Input('load-request-store', 'data'),
+        Input('filter-store', 'data'),
         prevent_initial_call=False,
      )
-    def update_dashboard(n_clicks, window_pct, ticker_val):
-        triggered = ctx.triggered_id
-        ticker = (ticker_val or DEFAULT_TICKER).strip().upper()
-        wpct = (window_pct or 10) / 100
-
-        if triggered == 'refresh-btn' or store['raw'] is None or ticker != store['ticker']:
+    def update_dashboard(
+        n_intervals,
+        window_pct,
+        load_request,
+        filter_store,
+    ):
+        try:
+            return _update_dashboard_inner(n_intervals, window_pct, load_request, filter_store)
+        except Exception as _cb_exc:
+            import traceback, tempfile, os as _os
+            _tb = traceback.format_exc()
+            print(f'[CALLBACK ERROR] {_tb}')
             try:
-                raw_df, spot = fetch_options_data(ticker)
-                store['raw'] = raw_df
-                store['by_strike'] = aggregate_by_strike(raw_df)
-                store['by_expiry'] = aggregate_by_expiry(raw_df)
-                store['spot'] = spot
-                store['ticker'] = ticker
-            except Exception as e:
-                status = f'⚠  Error fetching {ticker}: {e}'
-                empty = go.Figure().update_layout(**base_layout())
-                return [], empty, empty, empty, empty, empty, status, ''
+                _logp = _os.path.join(tempfile.gettempdir(), 'dash_cb_error.txt')
+                with open(_logp, 'a') as _f:
+                    _f.write(_tb + '\n---\n')
+            except Exception:
+                pass
+            empty = empty_figure()
+            err_msg = str(_cb_exc)[:200]
+            return ([], empty, empty, empty, empty, empty,
+                    f'Callback error: {err_msg}',
+                    0, '0%', 'danger', False, False, err_msg)
 
-        raw_df = store['raw']
-        bs_df = store['by_strike']
-        be_df = store['by_expiry']
-        spot = store['spot']
-        ticker = store['ticker']
-        ts = datetime.now().strftime('%H:%M:%S')
+    def _update_dashboard_inner(
+        n_intervals,
+        window_pct,
+        load_request,
+        filter_store,
+    ):
+        wpct = (window_pct or 10) / 100
+        current_store = snapshot_store()
+        loader = snapshot_loader()
+        progress_color, progress_animated, progress_striped = progress_style(loader)
+        active_filters = filter_store or {}
 
-        stats = build_stats(raw_df, bs_df, spot)
+        raw_df = current_store['raw']
+        spot = current_store['spot']
+        ticker = current_store['ticker']
+
+        if raw_df is None or spot is None:
+            if loader['error']:
+                msg = f"ERROR: {loader['error']}"
+                status = f"Feed error: {loader['error']}"
+            elif loader['status'] == 'idle':
+                msg = loader['message']
+                status = loader['message']
+            else:
+                msg = loader['message']
+                status = f"{loader['progress']}%  |  {loader['message']}"
+            empty = empty_figure()
+            return (
+                [], empty, empty, empty, empty, empty,
+                status,
+                loader['progress'], f"{loader['progress']}%",
+                progress_color, progress_animated, progress_striped,
+                msg,
+            )
+
+        updated_at = current_store['updated_at']
+        ts = updated_at.strftime('%H:%M:%S') if updated_at else datetime.now().strftime('%H:%M:%S')
+
+        filtered_df = apply_dashboard_filters(
+            raw_df,
+            option_flags=active_filters.get('option_flags'),
+            delta_min=active_filters.get('delta_min'),
+            delta_max=active_filters.get('delta_max'),
+            dte_min=active_filters.get('dte_min'),
+            dte_max=active_filters.get('dte_max'),
+            oi_min=active_filters.get('oi_min'),
+            oi_max=active_filters.get('oi_max'),
+        )
+
+        if filtered_df.empty:
+            empty = empty_figure()
+            status = (f'Last updated: {ts}  |  {ticker}  |  Spot ${spot:.2f}  |  '
+                      'No contracts match the active filters')
+            return (
+                [], empty, empty, empty, empty, empty,
+                status,
+                loader['progress'], f"{loader['progress']}%",
+                progress_color, progress_animated, progress_striped,
+                '',
+            )
+
+        bs_df = aggregate_by_strike(filtered_df)
+        be_df = aggregate_by_expiry(filtered_df)
+
+        stats = build_stats(filtered_df, bs_df, spot)
         fig_gex = gex_bar_chart(bs_df, spot, ticker, wpct)
         fig_dex = dex_bar_chart(bs_df, spot, ticker, wpct)
         fig_exp = gex_expiry_chart(be_df, ticker)
-        fig_oi = oi_heatmap(raw_df, spot, ticker, wpct)
-        fig_vol = vol_smile_chart(raw_df, spot, ticker)
-        status = f'Last updated: {ts}  |  {len(raw_df):,} contracts  |  {raw_df["expiry"].nunique()} expiries  |  Spot ${spot:.2f}'
+        fig_oi  = oi_heatmap(filtered_df, spot, ticker, wpct)
+        fig_vol = vol_smile_chart(filtered_df, spot, ticker)
 
-        return stats, fig_gex, fig_dex, fig_exp, fig_oi, fig_vol, status, ''
+        status = (f'Updated: {ts}  |  {ticker}  |  {len(filtered_df):,} contracts  |  '
+                  f'{filtered_df["expiry"].nunique()} expiries  |  Spot ${spot:.2f}')
+        load_msg = ''
+        if loader['status'] == 'loading':
+            load_msg = f"{loader['progress']}%  |  {loader['message']}"
+        elif loader['status'] == 'error':
+            load_msg = f"Feed error: {loader['error']}"
+        elif loader['status'] == 'ready':
+            load_msg = loader['message']
+
+        return (
+            stats, fig_gex, fig_dex, fig_exp, fig_oi, fig_vol,
+            status,
+            loader['progress'], f"{loader['progress']}%",
+            progress_color, progress_animated, progress_striped,
+            load_msg,
+        )
 
 
     def _pick_port(preferred: list[int]) -> int:
@@ -852,8 +1650,12 @@ if __name__ == '__main__':
     preferred_ports = [PORT, 8051, 8052]
     selected_port = _pick_port(preferred_ports)
     print('Dash app built.')
-    print(f"\n🚀  Starting dashboard on  http://127.0.0.1:{selected_port}")
+    # Note: do NOT pre-load here. The initial UI callback (prevent_initial_call=False)
+    # triggers the first load once the browser is connected and polling, so the
+    # progress bar can actually show the fetch / Greeks / CSV stages live.
+    print(f"\n>>  Starting dashboard on  http://127.0.0.1:{selected_port}")
     if selected_port != PORT:
         print(f"  Note: preferred port {PORT} was unavailable; using {selected_port} instead.")
     print('   Press  Ctrl+C  in this terminal to stop.\n')
-    app.run(debug=False, port=selected_port, host='127.0.0.1')
+    app.run(debug=False, use_reloader=False, threaded=True,
+            port=selected_port, host='127.0.0.1')

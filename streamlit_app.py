@@ -147,7 +147,16 @@ with st.sidebar:
                                   max_value=500, value=OI_THRESHOLD, step=10)
 
     st.markdown("---")
-    fetch_btn = st.button("↻ CARICA DATI", use_container_width=True)
+    col_f, col_a = st.columns(2)
+    with col_f:
+        fetch_btn = st.button("⬇ CARICA FULL CHAIN", use_container_width=True)
+    with col_a:
+        apply_btn = st.button(
+            "⊞ APPLICA FILTRI",
+            use_container_width=True,
+            disabled="data" not in st.session_state,
+            help="Ricalcola i grafici applicando i filtri DTE e OI senza ri-scaricare i dati.",
+        )
 
     st.markdown("---")
     st.markdown(
@@ -213,6 +222,31 @@ if fetch_btn:
         progress_bar.empty()
         st.error(f"⚠️ Errore: {err}")
         st.stop()
+
+# ── Apply filters (no Barchart call — re-slices the already-loaded full chain) ──
+elif apply_btn and "data" in st.session_state:
+    raw_full = st.session_state["data"].get("raw_full")
+    if raw_full is None:
+        st.warning("Chain non disponibile: premi prima **⬇ CARICA FULL CHAIN**.")
+    else:
+        with st.spinner("⏳ Applicazione filtri…"):
+            raw_df = apply_dashboard_filters(raw_full, dte_max=max_days, oi_min=oi_thresh)
+        if raw_df.empty:
+            st.warning(
+                f"Nessun contratto con DTE ≤ {max_days} e OI ≥ {oi_thresh}. "
+                "Allenta i filtri."
+            )
+        else:
+            by_strike = aggregate_by_strike(raw_df)
+            by_expiry = aggregate_by_expiry(raw_df)
+            st.session_state["data"]["raw"]       = raw_df
+            st.session_state["data"]["by_strike"] = by_strike
+            st.session_state["data"]["by_expiry"] = by_expiry
+            st.success(
+                f"Filtri applicati: {len(raw_df):,} contratti  |  "
+                f"{raw_df['expiry'].nunique()} scadenze  |  "
+                f"DTE ≤ {max_days}  |  OI ≥ {oi_thresh}"
+            )
 
 # ── Idle state ────────────────────────────────────────────────────────────────
 if "data" not in st.session_state:

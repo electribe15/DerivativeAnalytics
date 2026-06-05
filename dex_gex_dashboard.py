@@ -183,7 +183,8 @@ BARCHART_USER_AGENT = (
     'AppleWebKit/537.36 (KHTML, like Gecko) '
     'Chrome/124.0.0.0 Safari/537.36'
 )
-BARCHART_API_URL = 'https://www.barchart.com/proxies/core-api/v1/options/get'
+BARCHART_API_URL  = 'https://www.barchart.com/proxies/core-api/v1/options/get'
+BARCHART_HIST_URL = 'https://www.barchart.com/proxies/core-api/v1/historical/get'
 BARCHART_FIELDS = (
     'symbol,baseSymbol,strikePrice,expirationDate,moneyness,bidPrice,midpoint,'
     'askPrice,lastPrice,priceChange,percentChange,volume,openInterest,'
@@ -357,8 +358,69 @@ def fetch_barchart_spot(session: requests.Session, ticker: str) -> float:
 
 _FETCH_ATTEMPTS   = 3
 _FETCH_DELAY      = 0.1   # seconds between expiration requests
-_FETCH_TIMEOUT    = 15    # seconds per request (reduced: API calls should be fast;
-                          # timeouts mean Barchart is slow, not that session expired)
+_FETCH_TIMEOUT    = 15    # seconds per request
+
+
+def fetch_price_history(ticker: str, n_days: int = 5) -> pd.DataFrame:
+    """Fetch the last n_days of daily OHLC for ticker from Barchart.
+
+    Uses the same authenticated session approach as the options scraper.
+    Returns a DataFrame(date, open, high, low, close, volume) sorted ascending,
+    or an empty DataFrame if Barchart is unavailable.
+    """
+    from datetime import date as _date, timedelta as _td
+    end_dt   = _date.today()
+    # Request extra calendar days to ensure we get n trading days after weekends/holidays
+    start_dt = end_dt - _td(days=n_days * 3 + 7)
+
+    params = {
+        'symbol':    ticker,
+        'startDate': start_dt.strftime('%Y-%m-%d'),
+        'endDate':   end_dt.strftime('%Y-%m-%d'),
+        'interval':  'daily',
+        'fields':    'tradingDay,open,high,low,close,volume',
+        'meta':      'field.shortName',
+        'orderBy':   'tradingDay',
+        'orderDir':  'asc',
+        'limit':     n_days + 5,
+    }
+    try:
+        session  = build_barchart_session(ticker)
+        headers  = barchart_api_headers(session, ticker)
+        response = session.get(BARCHART_HIST_URL, headers=headers,
+                               params=params, timeout=15)
+        response.raise_for_status()
+        payload  = response.json()
+
+        rows = []
+        for item in (payload.get('data') or []):
+            raw = item.get('raw', item)
+            try:
+                rows.append({
+                    'date':   pd.Timestamp(
+                        raw.get('tradingDay') or raw.get('date') or ''
+                    ),
+                    'open':   float(raw.get('open',  0) or 0),
+                    'high':   float(raw.get('high',  0) or 0),
+                    'low':    float(raw.get('low',   0) or 0),
+                    'close':  float(raw.get('close', 0) or 0),
+                    'volume': float(raw.get('volume', 0) or 0),
+                })
+            except (ValueError, TypeError):
+                continue
+
+        df = (pd.DataFrame(rows)
+                .dropna(subset=['date'])
+                .query('close > 0')
+                .sort_values('date')
+                .tail(n_days)
+                .reset_index(drop=True))
+        print(f'  OHLC history: {len(df)} sessions for {ticker}')
+        return df
+
+    except Exception as exc:
+        print(f'  fetch_price_history({ticker}) failed: {type(exc).__name__}: {exc}')
+        return pd.DataFrame()
 
 
 def fetch_options_data(ticker: str, r: float = RISK_FREE_RATE,
@@ -800,9 +862,9 @@ def gex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10,
     import plotly.graph_objects as go
 
     # Determine the initial view window from delta bounds (or ±window_pct fallback)
-    lo = strike_lo if strike_lo is not None else spot * (1 - window_pct)
-    hi = strike_hi if strike_hi is not None else spot * (1 + window_pct)
-    if lo >= hi:                          # safety: inversion or zero range
+    lo = strike_lo if (strike_lo is not None and np.isfinite(strike_lo)) else spot * (1 - window_pct)
+    hi = strike_hi if (strike_hi is not None and np.isfinite(strike_hi)) else spot * (1 + window_pct)
+    if lo >= hi:
         lo, hi = spot * (1 - window_pct), spot * (1 + window_pct)
 
     df     = by_strike_df.copy()
@@ -832,8 +894,8 @@ def dex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10,
     """
     import plotly.graph_objects as go
 
-    lo = strike_lo if strike_lo is not None else spot * (1 - window_pct)
-    hi = strike_hi if strike_hi is not None else spot * (1 + window_pct)
+    lo = strike_lo if (strike_lo is not None and np.isfinite(strike_lo)) else spot * (1 - window_pct)
+    hi = strike_hi if (strike_hi is not None and np.isfinite(strike_hi)) else spot * (1 + window_pct)
     if lo >= hi:
         lo, hi = spot * (1 - window_pct), spot * (1 + window_pct)
 
@@ -1399,7 +1461,152 @@ def put_monitor_chart(raw_df: pd.DataFrame, spot: float, ticker: str):
     return fig
 
 
+def price_vs_dex_chart(by_strike_df: pd.DataFrame, ohlc_df,
+                       spot: float, ticker: str,
+                       strike_lo=None, strike_hi=None):
+    """Dual-panel chart with shared Y-axis (price / strike level).
+
+    Left panel  — DEX exposure as horizontal bars per strike.
+    Right panel — daily OHLC candlesticks for the last N sessions.
+
+    The shared Y-axis immediately shows which DEX support/resistance levels
+    the underlying has been trading through or approaching.
+    If OHLC data is unavailable, renders only the DEX panel.
+    """
+    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go
+
+    has_ohlc = ohlc_df is not None and isinstance(ohlc_df, pd.DataFrame) \
+               and not ohlc_df.empty
+
+    # Y-range: use delta strike bounds, falling back to ±4% of spot if invalid
+    lo = strike_lo if (strike_lo is not None and np.isfinite(strike_lo)) else spot * 0.96
+    hi = strike_hi if (strike_hi is not None and np.isfinite(strike_hi)) else spot * 1.04
+    if lo >= hi:
+        lo, hi = spot * 0.96, spot * 1.04
+    y_pad = (hi - lo) * 0.05
+
+    # If OHLC available, extend Y range to cover the price candles too
+    if has_ohlc:
+        price_lo = float(ohlc_df['low'].min())
+        price_hi = float(ohlc_df['high'].max())
+        lo = min(lo, price_lo)
+        hi = max(hi, price_hi)
+
+    # Filter DEX df to the Y range (± small buffer so bars near edges are visible).
+    # If nothing survives the filter (very tight range or sparse data), use the
+    # full by_strike_df so the DEX panel is never empty.
+    buf = (hi - lo) * 0.10
+    dex = by_strike_df[
+        (by_strike_df['strike'] >= lo - buf) &
+        (by_strike_df['strike'] <= hi + buf)
+    ].copy()
+    if dex.empty:
+        dex = by_strike_df.copy()
+
+    # Build subplots
+    if has_ohlc:
+        fig = make_subplots(
+            rows=1, cols=2,
+            shared_yaxes=True,
+            column_widths=[0.28, 0.72],
+            horizontal_spacing=0.02,
+            subplot_titles=['DEX by Strike', f'{ticker}  ·  Last {len(ohlc_df)} Sessions'],
+        )
+        col_dex   = 1
+        col_price = 2
+    else:
+        fig = make_subplots(rows=1, cols=1)
+        col_dex   = 1
+
+    # ── DEX horizontal bars ──────────────────────────────────────────────
+    colors_dex = [ACCENT_GRN if v >= 0 else ACCENT_RED for v in dex['net_dex']]
+    fig.add_trace(go.Bar(
+        y=dex['strike'], x=dex['net_dex'] / 1e6,
+        orientation='h',
+        marker_color=colors_dex,
+        marker_line_width=0,
+        name='Net DEX',
+        hovertemplate='Strike %{y}<br>Net DEX: %{x:.1f}M<extra></extra>',
+    ), row=1, col=col_dex)
+
+    # Call / put breakdown (hidden by default, togglable in legend)
+    fig.add_trace(go.Bar(
+        y=dex['strike'], x=dex['call_dex'] / 1e6,
+        orientation='h', marker_color=ACCENT_GRN, opacity=0.40,
+        name='Call DEX', visible='legendonly',
+    ), row=1, col=col_dex)
+    fig.add_trace(go.Bar(
+        y=dex['strike'], x=dex['put_dex'] / 1e6,
+        orientation='h', marker_color=ACCENT_RED, opacity=0.40,
+        name='Put DEX', visible='legendonly',
+    ), row=1, col=col_dex)
+
+    # Zero baseline
+    fig.add_vline(x=0, line_color=GRID_COL, line_width=1,
+                  row=1, col=col_dex)
+
+    # ── OHLC candlestick ────────────────────────────────────────────────
+    if has_ohlc:
+        fig.add_trace(go.Candlestick(
+            x=ohlc_df['date'],
+            open=ohlc_df['open'],
+            high=ohlc_df['high'],
+            low=ohlc_df['low'],
+            close=ohlc_df['close'],
+            name=ticker,
+            increasing_line_color=ACCENT_GRN,
+            decreasing_line_color=ACCENT_RED,
+            whiskerwidth=0.8,
+        ), row=1, col=col_price)
+
+        # Current spot line on price panel
+        fig.add_hline(y=spot, line_color=ACCENT_YLW, line_dash='dash',
+                      line_width=1.5, row=1, col=col_price,
+                      annotation_text=f'  Spot ${spot:.1f}',
+                      annotation_font_color=ACCENT_YLW,
+                      annotation_font_size=11)
+        fig.update_xaxes(rangeslider_visible=False, row=1, col=col_price)
+
+    # Spot line on DEX panel (horizontal, in Y-axis space)
+    fig.add_hline(y=spot, line_color=ACCENT_YLW, line_dash='dash',
+                  line_width=1.5, row=1, col=col_dex)
+
+    # ── Styling ──────────────────────────────────────────────────────────
+    fig.update_layout(
+        paper_bgcolor=CARD_BG,
+        plot_bgcolor=CARD_BG,
+        font=dict(color=TEXT_COL, family='Courier New'),
+        height=520,
+        title=dict(
+            text=f'Price vs DEX Levels — {ticker}',
+            font=dict(color=TEXT_COL, size=14, family='Courier New'),
+        ),
+        barmode='overlay',
+        bargap=0.1,
+        legend=dict(bgcolor='rgba(0,0,0,0)', font=dict(size=10, color=TEXT_COL),
+                    orientation='h', y=-0.10),
+        margin=dict(l=50, r=20, t=60, b=50),
+    )
+    fig.update_yaxes(range=[lo - y_pad, hi + y_pad],
+                     gridcolor=GRID_COL, zerolinecolor=GRID_COL)
+    fig.update_xaxes(gridcolor=GRID_COL, zerolinecolor=GRID_COL)
+    fig.update_xaxes(title_text='DEX ($M)', row=1, col=col_dex)
+    fig.update_yaxes(title_text=f'{ticker} Level', row=1, col=1)
+    if has_ohlc:
+        fig.update_xaxes(title_text='Data', row=1, col=col_price)
+
+    if not has_ohlc:
+        fig.add_annotation(
+            text='Storico prezzi non disponibile (Barchart history API)',
+            xref='paper', yref='paper', x=0.65, y=0.5,
+            showarrow=False, font=dict(color='#7a8399', size=12),
+        )
+    return fig
+
+
 print('Chart builders ready.')
+
 
 
 
@@ -1419,6 +1626,7 @@ if __name__ == '__main__':
         'spot':      None,
         'ticker':    DEFAULT_TICKER,
         'updated_at': None,
+        'ohlc':      None,   # last N sessions of OHLC — fetched alongside the chain
     }
     store_lock = threading.Lock()
     loader_lock = threading.Lock()
@@ -1580,6 +1788,12 @@ if __name__ == '__main__':
             )
             report_progress(request_id, 97, f'Finalizing {ticker} dashboard feed ...')
 
+            # Fetch last 5 sessions of OHLC — lightweight call, non-fatal if unavailable
+            try:
+                ohlc = fetch_price_history(resolved_barchart_ticker, n_days=5)
+            except Exception:
+                ohlc = pd.DataFrame()
+
             with store_lock:
                 store['raw'] = raw_df
                 store['by_strike'] = None
@@ -1587,6 +1801,7 @@ if __name__ == '__main__':
                 store['spot'] = spot
                 store['ticker'] = resolved_barchart_ticker
                 store['updated_at'] = datetime.now()
+                store['ohlc'] = ohlc
 
             set_loader_state(
                 status='ready',
@@ -1744,6 +1959,10 @@ if __name__ == '__main__':
         html.Div(id='stat-cards',
                  style={'display': 'flex', 'gap': '12px', 'padding': '16px 28px',
                         'flexWrap': 'wrap'}),
+
+        # Price vs DEX Levels — full width, the new centrepiece chart
+        html.Div(dcc.Graph(id='price-dex-chart'),
+                 style={'padding': '0 28px 12px'}),
 
         html.Div([
             html.Div(dcc.Graph(id='gex-bar'), style={'flex': '1', 'minWidth': '400px'}),
@@ -1919,6 +2138,7 @@ if __name__ == '__main__':
 
     @app.callback(
         Output('stat-cards', 'children'),
+        Output('price-dex-chart', 'figure'),
         Output('gex-bar', 'figure'),
         Output('dex-bar', 'figure'),
         Output('gex-expiry', 'figure'),
@@ -1957,7 +2177,7 @@ if __name__ == '__main__':
                 pass
             empty = empty_figure()
             err_msg = str(_cb_exc)[:200]
-            return ([], empty, empty, empty, empty, empty,
+            return ([], empty, empty, empty, empty, empty, empty,
                     f'Callback error: {err_msg}',
                     0, '0%', 'danger', False, False, err_msg)
 
@@ -1990,7 +2210,7 @@ if __name__ == '__main__':
                 status = f"{loader['progress']}%  |  {loader['message']}"
             empty = empty_figure()
             return (
-                [], empty, empty, empty, empty, empty,
+                [], empty, empty, empty, empty, empty, empty,
                 status,
                 loader['progress'], f"{loader['progress']}%",
                 progress_color, progress_animated, progress_striped,
@@ -2016,7 +2236,7 @@ if __name__ == '__main__':
             status = (f'Last updated: {ts}  |  {ticker}  |  Spot ${spot:.2f}  |  '
                       'No contracts match the active filters')
             return (
-                [], empty, empty, empty, empty, empty,
+                [], empty, empty, empty, empty, empty, empty,
                 status,
                 loader['progress'], f"{loader['progress']}%",
                 progress_color, progress_animated, progress_striped,
@@ -2025,9 +2245,12 @@ if __name__ == '__main__':
 
         bs_df = aggregate_by_strike(filtered_df)
         be_df = aggregate_by_expiry(filtered_df)
+        ohlc  = current_store.get('ohlc')
 
         lo, hi = delta_strike_bounds(raw_df, delta_lo, delta_hi)
-        stats   = build_stats(filtered_df, bs_df, spot)
+        stats        = build_stats(filtered_df, bs_df, spot)
+        fig_pricedex = price_vs_dex_chart(bs_df, ohlc, spot, ticker,
+                                           strike_lo=lo, strike_hi=hi)
         fig_gex = gex_bar_chart(bs_df, spot, ticker, strike_lo=lo, strike_hi=hi)
         fig_dex = dex_bar_chart(bs_df, spot, ticker, strike_lo=lo, strike_hi=hi)
         fig_exp = gex_expiry_chart(be_df, ticker)
@@ -2045,7 +2268,7 @@ if __name__ == '__main__':
             load_msg = loader['message']
 
         return (
-            stats, fig_gex, fig_dex, fig_exp, fig_oi, fig_vol,
+            stats, fig_pricedex, fig_gex, fig_dex, fig_exp, fig_oi, fig_vol,
             status,
             loader['progress'], f"{loader['progress']}%",
             progress_color, progress_animated, progress_striped,

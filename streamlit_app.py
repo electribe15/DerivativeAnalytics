@@ -64,7 +64,9 @@ try:
         apply_dashboard_filters,
         _csv_paths,
         delta_strike_bounds,
+        fetch_price_history,
         get_put_monitor,
+        price_vs_dex_chart,
         gex_bar_chart,
         dex_bar_chart,
         gex_expiry_chart,
@@ -213,9 +215,15 @@ if fetch_btn:
 
         by_strike = aggregate_by_strike(raw_df)
         by_expiry = aggregate_by_expiry(raw_df)
+
+        # Fetch last 5 sessions of OHLC — lightweight, non-fatal if unavailable
+        with st.spinner("⏳ Storico prezzi…"):
+            ohlc = fetch_price_history(ticker, n_days=5)
+
         st.session_state["data"] = dict(raw=raw_df, by_strike=by_strike,
                                          by_expiry=by_expiry, spot=spot,
-                                         ticker=ticker, raw_full=raw_full)
+                                         ticker=ticker, raw_full=raw_full,
+                                         ohlc=ohlc)
 
         # CSV cache confirmation
         try:
@@ -276,9 +284,13 @@ by_expiry = d["by_expiry"]
 spot      = d["spot"]
 cur_tick  = d["ticker"]
 raw_full  = d.get("raw_full", raw_df)   # unfiltered chain for vol analytics
+ohlc      = d.get("ohlc")
 
 # ── Delta → strike bounds ─────────────────────────────────────────────────────
-strike_lo, strike_hi = delta_strike_bounds(raw_df, delta_range[0], delta_range[1])
+# Use raw_full (complete unfiltered chain) for delta_strike_bounds so the
+# nearest-expiry always has dense, realistic delta values regardless of what
+# DTE / OI filters are active on raw_df.
+strike_lo, strike_hi = delta_strike_bounds(raw_full, delta_range[0], delta_range[1])
 
 # ── Status bar ────────────────────────────────────────────────────────────────
 from datetime import datetime
@@ -310,6 +322,17 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 
 # ── Tab 1: GEX / DEX ─────────────────────────────────────────────────────────
 with tab1:
+    # Price vs DEX Levels — the centrepiece: shared Y-axis chart
+    try:
+        st.plotly_chart(
+            price_vs_dex_chart(by_strike, ohlc, spot, cur_tick,
+                               strike_lo=strike_lo, strike_hi=strike_hi),
+            use_container_width=True,
+        )
+    except Exception as e:
+        st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+
+    st.markdown("---")
     col_l, col_r = st.columns(2)
     with col_l:
         try:

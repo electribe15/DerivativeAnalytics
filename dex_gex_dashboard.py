@@ -790,37 +790,54 @@ def base_layout(title='', height=420):
 
 def gex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10,
                   strike_lo=None, strike_hi=None):
+    """GEX by strike bar chart.
+
+    Renders ALL strikes in by_strike_df and uses xaxis.range to set the
+    initial zoom window.  This way the chart is never empty regardless of
+    the delta range selected: the user can always zoom out to see the full
+    picture.
+    """
     import plotly.graph_objects as go
 
+    # Determine the initial view window from delta bounds (or ±window_pct fallback)
     lo = strike_lo if strike_lo is not None else spot * (1 - window_pct)
     hi = strike_hi if strike_hi is not None else spot * (1 + window_pct)
-    df = by_strike_df[(by_strike_df['strike'] >= lo) & (by_strike_df['strike'] <= hi)].copy()
+    if lo >= hi:                          # safety: inversion or zero range
+        lo, hi = spot * (1 - window_pct), spot * (1 + window_pct)
 
+    df     = by_strike_df.copy()
     colors = [ACCENT_GRN if v >= 0 else ACCENT_RED for v in df['net_gex']]
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=df['strike'], y=df['net_gex'] / 1e6,
         marker_color=colors,
-        name='Net GEX'
+        name='Net GEX',
     ))
     fig.add_vline(x=spot, line_color=ACCENT_YLW, line_dash='dash',
                   annotation_text=f' Spot ${spot:.1f}',
                   annotation_font_color=ACCENT_YLW)
-    fig.update_layout(**base_layout(f'GEX by Strike — {ticker}'),
-                       yaxis_title='GEX ($M)',
-                       xaxis_title='Strike')
+    layout = base_layout(f'GEX by Strike — {ticker}')
+    layout['xaxis'].update(range=[lo, hi])
+    layout.update(yaxis_title='GEX ($M)', xaxis_title='Strike')
+    fig.update_layout(**layout)
     return fig
 
 
 def dex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10,
                   strike_lo=None, strike_hi=None):
+    """DEX by strike chart (call / put / net).
+
+    Same approach as gex_bar_chart: all data rendered, xaxis.range for zoom.
+    """
     import plotly.graph_objects as go
 
     lo = strike_lo if strike_lo is not None else spot * (1 - window_pct)
     hi = strike_hi if strike_hi is not None else spot * (1 + window_pct)
-    df = by_strike_df[(by_strike_df['strike'] >= lo) & (by_strike_df['strike'] <= hi)].copy()
+    if lo >= hi:
+        lo, hi = spot * (1 - window_pct), spot * (1 + window_pct)
 
+    df = by_strike_df.copy()
     fig = go.Figure()
     fig.add_trace(go.Bar(x=df['strike'], y=df['call_dex'] / 1e6,
                           name='Call DEX', marker_color=ACCENT_GRN))
@@ -832,10 +849,10 @@ def dex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10,
     fig.add_vline(x=spot, line_color=ACCENT_BLU, line_dash='dash',
                   annotation_text=f' Spot ${spot:.1f}',
                   annotation_font_color=ACCENT_BLU)
-    fig.update_layout(**base_layout(f'DEX by Strike — {ticker}'),
-                       barmode='relative',
-                       yaxis_title='DEX ($M)',
-                       xaxis_title='Strike')
+    layout = base_layout(f'DEX by Strike — {ticker}')
+    layout['xaxis'].update(range=[lo, hi])
+    layout.update(barmode='relative', yaxis_title='DEX ($M)', xaxis_title='Strike')
+    fig.update_layout(**layout)
     return fig
 
 

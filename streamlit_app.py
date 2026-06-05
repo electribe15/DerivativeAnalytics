@@ -132,17 +132,33 @@ with st.sidebar:
 
     ticker      = st.text_input("Ticker", value=DEFAULT_TICKER).strip().upper()
 
-    # Delta range slider (replaces the old strike ±% window)
+    # Delta range slider — maps to OTM strike range on the charts.
+    # (-0.20, +0.20) = show from 20-delta put to 20-delta call (~±2-3% of spot).
+    # Smaller absolute value → wider range (more OTM).
+    # Larger absolute value → narrower range (near-ATM only).
     delta_range = st.slider(
         "Delta range (strike filter)",
         min_value=-1.0, max_value=1.0,
-        value=(-0.5, 0.5), step=0.05,
-        help="Filters charts to the strikes whose options have delta within this range "
-             "(derived from the nearest expiry). Puts have negative delta, calls positive.",
+        value=(-0.20, 0.20), step=0.05,
+        help="Mostra i strike tra la put con Δ≈min e la call con Δ≈max "
+             "(calcolato dalla scadenza più vicina). "
+             "Valore assoluto più basso = range più ampio (opzioni OTM).",
     )
 
-    max_days    = st.slider("Max giorni scadenza", min_value=14,
-                            max_value=FETCH_EXPIRY_DAYS, value=MAX_EXPIRY_DAYS, step=7)
+    # DTE slider — min starts from the shortest available expiry in the loaded chain
+    _min_dte = 1
+    if "data" in st.session_state:
+        _rf = st.session_state["data"].get("raw_full")
+        if _rf is not None and not _rf.empty:
+            _min_dte = max(1, int(_rf["T_days"].min()))
+
+    max_days = st.slider(
+        "Max giorni scadenza",
+        min_value=_min_dte,
+        max_value=FETCH_EXPIRY_DAYS,
+        value=max(_min_dte, min(MAX_EXPIRY_DAYS, FETCH_EXPIRY_DAYS)),
+        step=1,
+    )
     oi_thresh   = st.number_input("Min Open Interest", min_value=10,
                                   max_value=500, value=OI_THRESHOLD, step=10)
 

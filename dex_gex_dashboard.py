@@ -1630,8 +1630,8 @@ if __name__ == '__main__':
                     dcc.RangeSlider(
                         id='delta-range-slider',
                         min=-1, max=1, step=0.05,
-                        value=[-0.5, 0.5],
-                        marks={v: f'{v:+.1f}' for v in [-1, -0.5, 0, 0.5, 1]},
+                        value=[-0.20, 0.20],
+                        marks={v: f'{v:+.2f}' for v in [-1, -0.5, -0.20, 0, 0.20, 0.5, 1]},
                         tooltip={'always_visible': False, 'placement': 'bottom'},
                         className='mx-2',
                     ),

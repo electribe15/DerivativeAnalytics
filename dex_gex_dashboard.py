@@ -706,26 +706,58 @@ def get_put_monitor(raw_df: pd.DataFrame, spot: float,
 
 
 def delta_strike_bounds(raw_df: pd.DataFrame,
-                        delta_lo: float = -0.5,
-                        delta_hi: float = 0.5):
-    """Derive (lo_strike, hi_strike) from the delta range using the nearest expiry.
+                        delta_lo: float = -0.20,
+                        delta_hi: float = 0.20):
+    """Derive (lo_strike, hi_strike) for the GEX/DEX chart window.
 
-    Finds the put with delta ≈ delta_lo and the call with delta ≈ delta_hi so
-    the chart shows the strike range that corresponds to the selected delta window.
-    Returns (None, None) if raw_df is empty or missing required columns.
+    Maps delta values to strikes using the nearest expiry:
+    - delta_lo in (-0.50, 0) → OTM put at that delta → strike below spot
+    - delta_lo ≤ -0.50       → ATM/ITM territory: use the minimum available
+                                strike (widest range to the downside)
+    - delta_hi in (0, 0.50)  → OTM call at that delta → strike above spot
+    - delta_hi ≥  0.50       → ATM/ITM territory: use the maximum available
+                                strike (widest range to the upside)
+
+    This prevents the inversion bug where ITM deltas (|Δ|>0.5) would produce
+    lo_strike > hi_strike and an empty chart.
     """
     if raw_df is None or raw_df.empty:
         return None, None
     try:
         min_dte = int(raw_df['T_days'].min())
-        near    = raw_df[raw_df['T_days'] == min_dte]
-        calls   = near[near['flag'] == 'c'].dropna(subset=['delta', 'strike'])
-        puts    = near[near['flag'] == 'p'].dropna(subset=['delta', 'strike'])
-        lo_strike = hi_strike = None
+        near    = raw_df[raw_df['T_days'] == min_dte].dropna(subset=['delta', 'strike'])
+        if near.empty:
+            return None, None
+
+        puts  = near[near['flag'] == 'p']
+        calls = near[near['flag'] == 'c']
+
+        lo_strike = None
         if not puts.empty:
-            lo_strike = float(puts.loc[(puts['delta'] - delta_lo).abs().idxmin(), 'strike'])
+            if delta_lo <= -0.50:
+                # At or beyond ATM: show all the way to the lowest available strike
+                lo_strike = float(puts['strike'].min())
+            else:
+                # OTM region (-0.499 to 0): find the put with closest delta
+                lo_strike = float(
+                    puts.loc[(puts['delta'] - delta_lo).abs().idxmin(), 'strike']
+                )
+
+        hi_strike = None
         if not calls.empty:
-            hi_strike = float(calls.loc[(calls['delta'] - delta_hi).abs().idxmin(), 'strike'])
+            if delta_hi >= 0.50:
+                # At or beyond ATM: show all the way to the highest available strike
+                hi_strike = float(calls['strike'].max())
+            else:
+                # OTM region (0 to 0.499): find the call with closest delta
+                hi_strike = float(
+                    calls.loc[(calls['delta'] - delta_hi).abs().idxmin(), 'strike']
+                )
+
+        # Final safety: ensure lo ≤ hi regardless of edge cases
+        if lo_strike is not None and hi_strike is not None:
+            lo_strike, hi_strike = min(lo_strike, hi_strike), max(lo_strike, hi_strike)
+
         return lo_strike, hi_strike
     except Exception:
         return None, None

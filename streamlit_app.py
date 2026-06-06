@@ -20,38 +20,100 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&display=swap');
-html, body, [class*="css"] { font-family: 'Share Tech Mono', monospace; background-color: #0d0f14; color: #c9d1e0; }
-.stApp { background-color: #0d0f14; }
-section[data-testid="stSidebar"] { background-color: #13161e; border-right: 1px solid #1e2130; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* ── Base ───────────────────────────────────────────── */
+html, body, [class*="css"] {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif !important;
+    background-color: #F8F9FD; color: #374151;
+}
+.stApp { background-color: #F8F9FD; }
+
+/* ── Sidebar ─────────────────────────────────────────── */
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #1E1B4B 0%, #312E81 100%);
+    border-right: none;
+    box-shadow: 4px 0 20px rgba(0,0,0,0.15);
+}
+section[data-testid="stSidebar"] * { color: #E0E7FF !important; }
+section[data-testid="stSidebar"] h2 { color: #FFFFFF !important; font-size: 1.1rem !important; letter-spacing: 0.5px; }
+section[data-testid="stSidebar"] label { color: #A5B4FC !important; font-size: 12px !important; font-weight: 500; letter-spacing: 0.3px; text-transform: uppercase; }
+section[data-testid="stSidebar"] .stMarkdown p { color: #818CF8 !important; font-size: 11px; }
+section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.1) !important; }
+
+/* ── Buttons ─────────────────────────────────────────── */
+.stButton > button {
+    background: linear-gradient(135deg, #6C63FF 0%, #8B5CF6 100%);
+    color: #FFFFFF !important; border: none; border-radius: 8px;
+    font-weight: 600; font-size: 13px; width: 100%;
+    box-shadow: 0 4px 12px rgba(108,99,255,0.35);
+    transition: all 0.2s ease;
+}
+.stButton > button:hover {
+    background: linear-gradient(135deg, #5B54EE 0%, #7C3AED 100%);
+    box-shadow: 0 6px 16px rgba(108,99,255,0.45); transform: translateY(-1px);
+}
+
+/* ── Metric cards ────────────────────────────────────── */
 div[data-testid="metric-container"], div[data-testid="stMetric"] {
-    background: #13161e; border: 1px solid #1e2130; border-top: 3px solid #00e5a0;
-    border-radius: 4px; padding: 12px 16px;
+    background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 12px; border-top: none;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06), 0 4px 12px rgba(0,0,0,0.04); padding: 14px 18px;
 }
 div[data-testid="metric-container"] label, div[data-testid="stMetric"] label {
-    color: #7a8399 !important; font-size: 11px !important; letter-spacing: 1.5px; text-transform: uppercase;
+    color: #9CA3AF !important; font-size: 11px !important; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.8px;
 }
 div[data-testid="metric-container"] [data-testid="stMetricValue"],
 div[data-testid="stMetric"] [data-testid="stMetricValue"] {
-    color: #00e5a0 !important; font-size: 20px !important; font-family: 'Share Tech Mono', monospace !important;
+    color: #111827 !important; font-size: 22px !important; font-weight: 700;
+    font-family: 'Inter', sans-serif !important;
 }
-.stButton > button {
-    background: transparent; border: 1px solid #00e5a0; color: #00e5a0;
-    font-family: 'Share Tech Mono', monospace; letter-spacing: 1px; border-radius: 4px; width: 100%;
+
+/* ── Tabs ────────────────────────────────────────────── */
+div[data-baseweb="tab-list"] {
+    background: #FFFFFF; border-radius: 10px; padding: 4px;
+    border-bottom: none; gap: 2px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
 }
-.stButton > button:hover { background: #00e5a020; }
-h1 { font-family: 'Rajdhani', sans-serif !important; color: #00e5a0 !important; letter-spacing: 6px; font-size: 2.2rem !important; }
-h2, h3 { font-family: 'Rajdhani', sans-serif !important; color: #c9d1e0 !important; letter-spacing: 2px; }
+button[data-baseweb="tab"] {
+    color: #6B7280 !important; font-family: 'Inter', sans-serif !important;
+    font-size: 13px !important; font-weight: 500; border-radius: 7px; padding: 6px 14px;
+}
+button[data-baseweb="tab"][aria-selected="true"] {
+    background: linear-gradient(135deg, #6C63FF 0%, #8B5CF6 100%) !important;
+    color: #FFFFFF !important; border: none !important;
+    box-shadow: 0 2px 8px rgba(108,99,255,0.4);
+}
+
+/* ── Typography ──────────────────────────────────────── */
+h1 { font-family: 'Inter', sans-serif !important; color: #111827 !important;
+     font-size: 1.9rem !important; font-weight: 700 !important; letter-spacing: -0.5px; }
+h2, h3, h4, h5 { font-family: 'Inter', sans-serif !important; color: #1F2937 !important; font-weight: 600 !important; }
+
+/* ── Status bar ──────────────────────────────────────── */
 .status-bar {
-    background: #13161e; border: 1px solid #1e2130; border-left: 3px solid #4db8ff;
-    border-radius: 4px; padding: 8px 14px; font-size: 12px; color: #7a8399; margin-bottom: 16px;
+    background: #FFFFFF; border: 1px solid #E5E7EB; border-left: 4px solid #6C63FF;
+    border-radius: 10px; padding: 10px 16px; font-size: 12px; color: #6B7280;
+    margin-bottom: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.05);
 }
-div[data-baseweb="tab-list"] { background: #13161e; border-bottom: 1px solid #1e2130; }
-button[data-baseweb="tab"] { color: #7a8399 !important; font-family: 'Share Tech Mono', monospace !important; letter-spacing: 1px; }
-button[data-baseweb="tab"][aria-selected="true"] { color: #00e5a0 !important; border-bottom: 2px solid #00e5a0 !important; }
-.stSpinner > div { border-top-color: #00e5a0 !important; }
-div[data-testid="stSlider"] label { color: #7a8399 !important; font-size: 12px; }
-input[type="text"] { background: #1a1d27 !important; border: 1px solid #1e2130 !important; color: #c9d1e0 !important; font-family: 'Share Tech Mono', monospace !important; }
+
+/* ── Plotly charts — card wrapper ────────────────────── */
+div[data-testid="stPlotlyChart"] {
+    background: #FFFFFF; border-radius: 12px; border: 1px solid #E5E7EB;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06); padding: 4px; overflow: hidden;
+}
+
+/* ── Misc ────────────────────────────────────────────── */
+.stSpinner > div { border-top-color: #6C63FF !important; }
+div[data-testid="stSlider"] label { color: #6B7280 !important; font-size: 12px; font-weight: 500; }
+input[type="text"], input[type="number"] {
+    background: #F9FAFB !important; border: 1.5px solid #E5E7EB !important;
+    border-radius: 8px !important; color: #374151 !important;
+    font-family: 'Inter', sans-serif !important;
+}
+details { border-radius: 10px !important; border: 1px solid #E5E7EB !important; }
+div[data-testid="stProgress"] > div > div { background: #6C63FF !important; border-radius: 8px !important; }
+hr { border-color: #E5E7EB !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -64,9 +126,13 @@ try:
         apply_dashboard_filters,
         _csv_paths,
         delta_strike_bounds,
+        compute_0dte_metrics,
         fetch_price_history,
         get_put_monitor,
         price_vs_dex_chart,
+        gex_dex_0dte_chart,
+        oi_0dte_chart,
+        smile_0dte_chart,
         gex_bar_chart,
         dex_bar_chart,
         gex_expiry_chart,
@@ -129,7 +195,9 @@ def empty_fig(msg="No data"):
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## ⚡ DEX / GEX")
+    st.markdown("## DEX / GEX")
+    st.markdown("<p style='color:#818CF8;font-size:11px;margin-top:-8px;'>Options Analytics</p>",
+                unsafe_allow_html=True)
     st.markdown("---")
 
     ticker      = st.text_input("Ticker", value=DEFAULT_TICKER).strip().upper()
@@ -148,11 +216,11 @@ with st.sidebar:
     )
 
     # DTE slider — min starts from the shortest available expiry in the loaded chain
-    _min_dte = 1
+    _min_dte = 0
     if "data" in st.session_state:
         _rf = st.session_state["data"].get("raw_full")
         if _rf is not None and not _rf.empty:
-            _min_dte = max(1, int(_rf["T_days"].min()))
+            _min_dte = max(0, int(_rf["T_days"].min()))
 
     max_days = st.slider(
         "Max giorni scadenza",
@@ -178,17 +246,17 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown(
-        "<div style='font-size:11px;color:#7a8399;'>"
-        "Dati: Barchart<br>Modello: Black-Scholes<br>"
+        "<div style='font-size:11px;color:#818CF8;line-height:1.8;'>"
+        "📡 Dati: Barchart<br>🧮 Modello: Black-Scholes<br>"
         "DEX = Δ × OI × 100<br>GEX = γ × OI × 100 × Spot"
         "</div>", unsafe_allow_html=True,
     )
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.markdown("# ⚡ DEX / GEX")
+st.markdown("# DEX / GEX")
 st.markdown(
-    "<p style='color:#7a8399;font-size:13px;letter-spacing:3px;"
-    "margin-top:-12px;margin-bottom:20px;'>OPTIONS EXPOSURE DASHBOARD</p>",
+    "<p style='color:#9CA3AF;font-size:13px;font-weight:500;letter-spacing:0.5px;"
+    "margin-top:-10px;margin-bottom:20px;'>Options Exposure Dashboard</p>",
     unsafe_allow_html=True,
 )
 
@@ -311,14 +379,90 @@ for col, (label, (value, _color)) in zip(metric_cols, stats.items()):
 
 st.markdown("---")
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+# ── 0DTE metrics (computed once, used in the first tab) ───────────────────────
+dte0_metrics = compute_0dte_metrics(raw_full, spot)
+has_0dte     = bool(dte0_metrics)
+
+# ── Tabs — 0DTE is always first and shown by default ─────────────────────────
+tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "⚡ 0DTE",
     "📊 GEX / DEX",
     "📐 Range & Skew",
     "💰 Put Monitor",
     "📈 Volatilità",
     "🔥 Open Interest",
 ])
+
+# ── Tab 0: 0DTE ───────────────────────────────────────────────────────────────
+with tab0:
+    if not has_0dte:
+        st.info(
+            "Nessuna opzione con scadenza **oggi** nel chain caricato.  \n"
+            "Le 0DTE compaiono solo nei giorni in cui SPX ha una scadenza intraday "
+            "(Lun, Mer, Ven per le settimanali; ogni giorno per SPXW).  \n"
+            "Ricarica durante la sessione di trading oppure verifica che "
+            "`FETCH_EXPIRY_DAYS` includa DTE=0."
+        )
+    else:
+        m = dte0_metrics
+        # ── Metric cards ──
+        mc = st.columns(6)
+        mc[0].metric("0DTE ATM IV",
+                     f"{m['atm_iv']*100:.1f}%" if m['atm_iv'] else "—")
+        mc[1].metric("Expected Move",
+                     f"±{m['exp_move_pts']:.1f} pts  ({m['exp_move_pct']:.2f}%)"
+                     if m['exp_move_pts'] else "—")
+        mc[2].metric("GEX Flip",
+                     f"${m['gex_flip']:.0f}" if m['gex_flip'] else "—")
+        mc[3].metric("Max Gamma Strike",
+                     f"${m['max_gex_strike']:.0f}" if m['max_gex_strike'] else "—")
+        mc[4].metric("Total 0DTE GEX",
+                     f"{'+'if m['total_gex']>=0 else ''}{m['total_gex']/1e9:.2f}B")
+        mc[5].metric("0DTE Contracts", f"{m['n_contracts']:,}")
+
+        st.markdown("---")
+
+        # ── GEX + DEX chart ──
+        col_a, col_b = st.columns([1.4, 1])
+        with col_a:
+            try:
+                st.plotly_chart(
+                    gex_dex_0dte_chart(m, spot, cur_tick),
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+        with col_b:
+            try:
+                st.plotly_chart(
+                    smile_0dte_chart(m, spot, cur_tick),
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+
+        # ── Call vs Put OI ──
+        try:
+            st.plotly_chart(oi_0dte_chart(m, spot, cur_tick),
+                            use_container_width=True)
+        except Exception as e:
+            st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+
+        # ── Key strikes table ──
+        with st.expander("📋 Strikes chiave 0DTE"):
+            bs0 = m['by_strike']
+            if not bs0.empty:
+                tbl = bs0.copy()
+                tbl = tbl.sort_values('net_gex', ascending=False)
+                disp_cols = [c for c in
+                             ['strike','net_gex','net_dex','call_gex','put_gex',
+                              'call_dex','put_dex','total_oi']
+                             if c in tbl.columns]
+                st.dataframe(
+                    tbl[disp_cols].reset_index(drop=True),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
 # ── Tab 1: GEX / DEX ─────────────────────────────────────────────────────────
 with tab1:

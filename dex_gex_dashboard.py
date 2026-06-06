@@ -285,7 +285,7 @@ def flatten_barchart_expirations(meta: dict, max_dte: int = FETCH_EXPIRY_DAYS) -
     for expiration in sorted(set(expirations)):
         exp_date = datetime.strptime(expiration, '%Y-%m-%d').date()
         dte = (exp_date - today).days
-        if 1 <= dte <= max_dte:
+        if 0 <= dte <= max_dte:   # 0 = today (0DTE), previously excluded
             filtered.append(expiration)
     return filtered
 
@@ -364,62 +364,104 @@ _FETCH_TIMEOUT    = 15    # seconds per request
 def fetch_price_history(ticker: str, n_days: int = 5) -> pd.DataFrame:
     """Fetch the last n_days of daily OHLC for ticker from Barchart.
 
-    Uses the same authenticated session approach as the options scraper.
-    Returns a DataFrame(date, open, high, low, close, volume) sorted ascending,
-    or an empty DataFrame if Barchart is unavailable.
+    Tries several parameter variants of the Barchart historical endpoint
+    because the exact accepted parameters vary by account tier.  Prints
+    diagnostic output so stall/failure reasons are visible in the terminal.
+
+    Returns a DataFrame(date, open, high, low, close, volume) sorted
+    ascending, or an empty DataFrame if no attempt succeeds.
     """
     from datetime import date as _date, timedelta as _td
     end_dt   = _date.today()
-    # Request extra calendar days to ensure we get n trading days after weekends/holidays
-    start_dt = end_dt - _td(days=n_days * 3 + 7)
+    start_dt = end_dt - _td(days=n_days * 3 + 10)
 
-    params = {
-        'symbol':    ticker,
-        'startDate': start_dt.strftime('%Y-%m-%d'),
-        'endDate':   end_dt.strftime('%Y-%m-%d'),
-        'interval':  'daily',
-        'fields':    'tradingDay,open,high,low,close,volume',
-        'meta':      'field.shortName',
-        'orderBy':   'tradingDay',
-        'orderDir':  'asc',
-        'limit':     n_days + 5,
-    }
-    try:
-        session  = build_barchart_session(ticker)
-        headers  = barchart_api_headers(session, ticker)
-        response = session.get(BARCHART_HIST_URL, headers=headers,
-                               params=params, timeout=15)
-        response.raise_for_status()
-        payload  = response.json()
+    # Multiple parameter combinations to try — different Barchart tiers accept
+    # different keys (interval vs type, dashed vs bare dates, etc.)
+    _attempts = [
+        dict(type='daily',    orderBy='tradingDay', orderDir='asc'),
+        dict(interval='daily', orderBy='tradingDay', orderDir='asc'),
+        dict(type='daily'),
+        dict(interval='daily'),
+    ]
 
+    def _parse_items(items: list) -> pd.DataFrame:
         rows = []
-        for item in (payload.get('data') or []):
+        for item in items:
             raw = item.get('raw', item)
+            # Field names vary: tradingDay / date / tradeDay / dateTime
+            date_str = (raw.get('tradingDay') or raw.get('date')
+                        or raw.get('tradeDay') or raw.get('dateTime') or '')
+            if not date_str:
+                continue
             try:
                 rows.append({
-                    'date':   pd.Timestamp(
-                        raw.get('tradingDay') or raw.get('date') or ''
-                    ),
-                    'open':   float(raw.get('open',  0) or 0),
-                    'high':   float(raw.get('high',  0) or 0),
-                    'low':    float(raw.get('low',   0) or 0),
-                    'close':  float(raw.get('close', 0) or 0),
+                    'date':  pd.Timestamp(str(date_str)[:10]),
+                    'open':  float(raw.get('open',  raw.get('dailyOpen',  0)) or 0),
+                    'high':  float(raw.get('high',  raw.get('dailyHigh',  0)) or 0),
+                    'low':   float(raw.get('low',   raw.get('dailyLow',   0)) or 0),
+                    'close': float(raw.get('close', raw.get('lastPrice',
+                                   raw.get('dailyClose', 0))) or 0),
                     'volume': float(raw.get('volume', 0) or 0),
                 })
             except (ValueError, TypeError):
                 continue
+        if not rows:
+            return pd.DataFrame()
+        return (pd.DataFrame(rows)
+                  .dropna(subset=['date'])
+                  .query('close > 0')
+                  .sort_values('date')
+                  .tail(n_days)
+                  .reset_index(drop=True))
 
-        df = (pd.DataFrame(rows)
-                .dropna(subset=['date'])
-                .query('close > 0')
-                .sort_values('date')
-                .tail(n_days)
-                .reset_index(drop=True))
-        print(f'  OHLC history: {len(df)} sessions for {ticker}')
-        return df
+    try:
+        session = build_barchart_session(ticker)
+        headers = barchart_api_headers(session, ticker)
+
+        for extra in _attempts:
+            params = {
+                'symbol':    ticker,
+                'startDate': start_dt.strftime('%Y-%m-%d'),
+                'endDate':   end_dt.strftime('%Y-%m-%d'),
+                'fields':    'tradingDay,open,high,low,close,volume',
+                'meta':      'field.shortName',
+                'limit':     n_days + 10,
+                **extra,
+            }
+            try:
+                resp = session.get(BARCHART_HIST_URL, headers=headers,
+                                   params=params, timeout=15)
+                print(f'  [hist] {extra} → HTTP {resp.status_code}')
+                if resp.status_code != 200:
+                    print(f'  [hist] body preview: {resp.text[:200]}')
+                    continue
+
+                payload = resp.json()
+                # Response can nest data under 'data', 'results', or directly as list
+                items = (payload.get('data')
+                         or payload.get('results')
+                         or (payload if isinstance(payload, list) else []))
+                print(f'  [hist] keys={list(payload.keys()) if isinstance(payload,dict) else "list"}'
+                      f'  items={len(items)}')
+                if not items:
+                    print(f'  [hist] empty payload preview: {str(payload)[:300]}')
+                    continue
+
+                df = _parse_items(items)
+                if not df.empty:
+                    print(f'  [hist] OK: {len(df)} sessions for {ticker}')
+                    return df
+                print(f'  [hist] items found but none parsed — sample: {items[0]}')
+
+            except Exception as e:
+                print(f'  [hist] attempt {extra} error: {type(e).__name__}: {e}')
+                continue
+
+        print(f'  [hist] all attempts exhausted — price chart will be empty')
+        return pd.DataFrame()
 
     except Exception as exc:
-        print(f'  fetch_price_history({ticker}) failed: {type(exc).__name__}: {exc}')
+        print(f'  fetch_price_history({ticker}) session error: {type(exc).__name__}: {exc}')
         return pd.DataFrame()
 
 
@@ -550,8 +592,10 @@ def fetch_options_data(ticker: str, r: float = RISK_FREE_RATE,
     today = date.today()
     expiry_dt    = pd.to_datetime(data['expiry'])
     data['T_days']  = (expiry_dt - pd.Timestamp(today)).dt.days
-    data = data[data['T_days'] >= 1].copy()          # drop expired only
-    data['T_years'] = data['T_days'] / 365.0
+    data = data[data['T_days'] >= 0].copy()     # keep 0DTE (today's expiry)
+    # Clip T_years to a 1-hour floor so BS gamma stays finite for 0DTE options
+    _T_MIN = 1 / (365 * 24)                     # ≈ 1 hour expressed in years
+    data['T_years'] = (data['T_days'] / 365.0).clip(lower=_T_MIN)
     data['spot']    = S
     data['mid']     = data[['bid', 'ask']].mean(axis=1, skipna=True)
     data['flag']    = data['optionType'].map({'call': 'c', 'put': 'p'})
@@ -767,6 +811,72 @@ def get_put_monitor(raw_df: pd.DataFrame, spot: float,
               .reset_index(drop=True))
 
 
+def compute_0dte_metrics(raw_df: pd.DataFrame, spot: float) -> dict:
+    """Compute key metrics for the 0DTE (today's expiry) chain.
+
+    Returns a dict with:
+      atm_iv, exp_move_pts, exp_move_pct  — intraday expected range
+      gex_flip                             — strike where net GEX crosses zero
+      max_gex_strike                       — strike with highest |GEX|
+      total_gex, total_dex                 — aggregate exposures
+      by_strike                            — aggregated DataFrame for 0DTE
+      raw                                  — raw 0DTE rows
+      n_contracts                          — number of 0DTE contracts
+    Returns empty dict if no 0DTE data is present.
+    """
+    dte0 = raw_df[raw_df['T_days'] == 0].copy()
+    if dte0.empty:
+        return {}
+
+    calls = dte0[dte0['flag'] == 'c'].dropna(subset=['delta', 'iv'])
+    puts  = dte0[dte0['flag'] == 'p'].dropna(subset=['delta', 'iv'])
+
+    # ATM IV: mean of the call and put closest to Δ ±0.50
+    atm_iv = None
+    if not calls.empty and not puts.empty:
+        c = calls.iloc[(calls['delta'] - 0.50).abs().argsort().iloc[:1]]
+        p = puts.iloc[(puts['delta']  + 0.50).abs().argsort().iloc[:1]]
+        atm_iv = (float(c['iv'].iloc[0]) + float(p['iv'].iloc[0])) / 2
+
+    bs_0dte = aggregate_by_strike(dte0)
+
+    # GEX flip: interpolated strike where net_gex crosses zero
+    gex_flip = None
+    if not bs_0dte.empty and len(bs_0dte) > 1:
+        srt = bs_0dte.sort_values('strike').reset_index(drop=True)
+        sgn = np.sign(srt['net_gex'].values)
+        flips = np.where(np.diff(sgn) != 0)[0]
+        if len(flips):
+            i  = flips[0]
+            s1, g1 = float(srt['strike'].iloc[i]),   float(srt['net_gex'].iloc[i])
+            s2, g2 = float(srt['strike'].iloc[i+1]), float(srt['net_gex'].iloc[i+1])
+            gex_flip = s1 - g1 * (s2 - s1) / (g2 - g1) if g2 != g1 else (s1 + s2) / 2
+
+    max_gex_strike = None
+    if not bs_0dte.empty:
+        max_gex_strike = float(
+            bs_0dte.loc[bs_0dte['net_gex'].abs().idxmax(), 'strike']
+        )
+
+    exp_move_pts = exp_move_pct = None
+    if atm_iv is not None and atm_iv > 0:
+        exp_move_pts = spot * atm_iv * np.sqrt(1 / 252)
+        exp_move_pct = atm_iv / np.sqrt(252) * 100
+
+    return {
+        'atm_iv':         atm_iv,
+        'exp_move_pts':   exp_move_pts,
+        'exp_move_pct':   exp_move_pct,
+        'gex_flip':       gex_flip,
+        'max_gex_strike': max_gex_strike,
+        'total_gex':      float(dte0['gex'].sum()),
+        'total_dex':      float(dte0['dex'].sum()),
+        'n_contracts':    len(dte0),
+        'by_strike':      bs_0dte,
+        'raw':            dte0,
+    }
+
+
 def delta_strike_bounds(raw_df: pd.DataFrame,
                         delta_lo: float = -0.20,
                         delta_hi: float = 0.20):
@@ -826,27 +936,35 @@ def delta_strike_bounds(raw_df: pd.DataFrame,
 
 # ── Chart builders ────────────────────────────────────────────────────
 
-DARK_BG    = '#0d0f14'
-CARD_BG    = '#13161e'
-ACCENT_GRN = '#00e5a0'
-ACCENT_RED = '#ff4d6d'
-ACCENT_BLU = '#4db8ff'
-ACCENT_YLW = '#ffd166'
-GRID_COL   = '#1e2130'
-TEXT_COL   = '#c9d1e0'
+DARK_BG    = '#F8F9FD'   # page background (very light gray)
+CARD_BG    = '#FFFFFF'   # card background (white)
+ACCENT_GRN = '#10B981'   # emerald green  (positive / calls)
+ACCENT_RED = '#EF4444'   # red            (negative / puts)
+ACCENT_BLU = '#6C63FF'   # violet         (primary accent / DEX)
+ACCENT_YLW = '#F59E0B'   # amber          (spot / neutral)
+ACCENT_PRP = '#8B5CF6'   # purple         (secondary / skew)
+GRID_COL   = '#E5E7EB'   # light gray grid
+TEXT_COL   = '#374151'   # dark gray text
+TEXT_SEC   = '#9CA3AF'   # secondary gray
 
 
 def base_layout(title='', height=420):
     return dict(
-        title=dict(text=title, font=dict(color=TEXT_COL, size=14, family='Courier New')),
-        paper_bgcolor=CARD_BG,
-        plot_bgcolor=CARD_BG,
-        font=dict(color=TEXT_COL, family='Courier New'),
+        title=dict(text=title,
+                   font=dict(color=TEXT_COL, size=13,
+                             family='Inter, system-ui, -apple-system, sans-serif')),
+        paper_bgcolor='rgba(0,0,0,0)',   # transparent → CSS card shows through
+        plot_bgcolor='#F9FAFB',
+        font=dict(color=TEXT_COL,
+                  family='Inter, system-ui, -apple-system, sans-serif'),
         height=height,
-        xaxis=dict(gridcolor=GRID_COL, zerolinecolor=GRID_COL),
-        yaxis=dict(gridcolor=GRID_COL, zerolinecolor=GRID_COL),
-        margin=dict(l=50, r=20, t=40, b=40),
-        legend=dict(bgcolor='rgba(0,0,0,0)', font=dict(size=11))
+        xaxis=dict(gridcolor=GRID_COL, zerolinecolor=GRID_COL,
+                   tickfont=dict(color=TEXT_SEC, size=11)),
+        yaxis=dict(gridcolor=GRID_COL, zerolinecolor=GRID_COL,
+                   tickfont=dict(color=TEXT_SEC, size=11)),
+        margin=dict(l=50, r=20, t=45, b=40),
+        legend=dict(bgcolor='rgba(0,0,0,0)',
+                    font=dict(size=11, color=TEXT_COL)),
     )
 
 
@@ -1605,7 +1723,147 @@ def price_vs_dex_chart(by_strike_df: pd.DataFrame, ohlc_df,
     return fig
 
 
+def gex_dex_0dte_chart(dte0_metrics: dict, spot: float, ticker: str):
+    """Combined GEX + net-DEX chart for 0DTE, zoomed to the relevant strike range.
+
+    Uses a tight delta-derived window so the chart shows only the strikes where
+    0DTE gamma is actually meaningful — typically ±30–35 delta from spot.
+    """
+    import plotly.graph_objects as go
+    bs = dte0_metrics.get('by_strike', pd.DataFrame())
+    if bs.empty:
+        fig = go.Figure()
+        fig.update_layout(**base_layout(f'0DTE GEX/DEX — {ticker} (no data)'))
+        return fig
+
+    # Default strike window: ±35-delta strikes from the nearest expiry data
+    raw0 = dte0_metrics.get('raw', pd.DataFrame())
+    lo, hi = delta_strike_bounds(raw0, -0.35, 0.35) if not raw0.empty else (None, None)
+    lo = lo if (lo is not None and np.isfinite(lo)) else spot * 0.975
+    hi = hi if (hi is not None and np.isfinite(hi)) else spot * 1.025
+    if lo >= hi:
+        lo, hi = spot * 0.975, spot * 1.025
+    pad = (hi - lo) * 0.05
+
+    fig = go.Figure()
+
+    # GEX bars (primary axis)
+    colors = [ACCENT_GRN if v >= 0 else ACCENT_RED for v in bs['net_gex']]
+    fig.add_trace(go.Bar(
+        x=bs['strike'], y=bs['net_gex'] / 1e6,
+        marker_color=colors, marker_line_width=0,
+        name='Net GEX ($M)', opacity=0.85,
+        hovertemplate='Strike %{x}<br>Net GEX: %{y:.1f}M<extra></extra>',
+    ))
+
+    # Net DEX overlay (secondary axis)
+    fig.add_trace(go.Scatter(
+        x=bs['strike'], y=bs['net_dex'] / 1e6,
+        mode='lines+markers', name='Net DEX ($M)',
+        line=dict(color=ACCENT_BLU, width=2),
+        marker=dict(size=5),
+        yaxis='y2',
+        hovertemplate='Strike %{x}<br>Net DEX: %{y:.1f}M<extra></extra>',
+    ))
+
+    # Spot, GEX flip, max-gamma annotations
+    fig.add_vline(x=spot, line_color=ACCENT_YLW, line_dash='dash', line_width=1.5,
+                  annotation_text=f' Spot', annotation_font_color=ACCENT_YLW,
+                  annotation_font_size=10)
+    if dte0_metrics.get('gex_flip') and np.isfinite(dte0_metrics['gex_flip']):
+        fig.add_vline(x=dte0_metrics['gex_flip'], line_color=ACCENT_RED,
+                      line_dash='dot', line_width=1.5,
+                      annotation_text=' GEX Flip', annotation_font_color=ACCENT_RED,
+                      annotation_font_size=10)
+    if dte0_metrics.get('max_gex_strike'):
+        fig.add_vline(x=dte0_metrics['max_gex_strike'], line_color='#cc99ff',
+                      line_dash='dot', line_width=1,
+                      annotation_text=' Max Γ', annotation_font_color='#cc99ff',
+                      annotation_font_size=10)
+
+    layout = base_layout(f'0DTE  GEX & DEX by Strike — {ticker}')
+    layout['xaxis'].update(range=[lo - pad, hi + pad])
+    layout.update(
+        barmode='overlay',
+        yaxis=dict(title='GEX ($M)', gridcolor=GRID_COL, zerolinecolor=GRID_COL,
+                   color=TEXT_COL),
+        yaxis2=dict(title='DEX ($M)', overlaying='y', side='right',
+                    gridcolor='rgba(0,0,0,0)', color=ACCENT_BLU),
+        legend=dict(orientation='h', y=1.08, font=dict(color=TEXT_COL, size=11)),
+    )
+    fig.update_layout(**layout)
+    return fig
+
+
+def oi_0dte_chart(dte0_metrics: dict, spot: float, ticker: str):
+    """Call vs Put open interest per strike for the 0DTE chain."""
+    import plotly.graph_objects as go
+    raw0 = dte0_metrics.get('raw', pd.DataFrame())
+    if raw0.empty:
+        fig = go.Figure()
+        fig.update_layout(**base_layout(f'0DTE OI — {ticker} (no data)'))
+        return fig
+
+    lo, hi = delta_strike_bounds(raw0, -0.35, 0.35) if not raw0.empty else (None, None)
+    lo = lo if (lo is not None and np.isfinite(lo)) else spot * 0.975
+    hi = hi if (hi is not None and np.isfinite(hi)) else spot * 1.025
+    if lo >= hi:
+        lo, hi = spot * 0.975, spot * 1.025
+    pad = (hi - lo) * 0.05
+
+    calls = raw0[raw0['flag'] == 'c'].groupby('strike')['openInterest'].sum().reset_index()
+    puts  = raw0[raw0['flag'] == 'p'].groupby('strike')['openInterest'].sum().reset_index()
+    puts['openInterest'] = -puts['openInterest']    # flip puts below zero
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=calls['strike'], y=calls['openInterest'] / 1e3,
+                          name='Call OI (k)', marker_color=ACCENT_GRN, opacity=0.85))
+    fig.add_trace(go.Bar(x=puts['strike'], y=puts['openInterest'] / 1e3,
+                          name='Put OI (k)', marker_color=ACCENT_RED, opacity=0.85))
+    fig.add_vline(x=spot, line_color=ACCENT_YLW, line_dash='dash', line_width=1.5)
+
+    layout = base_layout(f'0DTE  Call vs Put OI — {ticker}')
+    layout['xaxis'].update(range=[lo - pad, hi + pad])
+    layout.update(barmode='overlay', yaxis_title='Open Interest (k)',
+                  legend=dict(orientation='h', y=1.08, font=dict(color=TEXT_COL, size=11)))
+    fig.update_layout(**layout)
+    return fig
+
+
+def smile_0dte_chart(dte0_metrics: dict, spot: float, ticker: str):
+    """IV smile (call and put) for the 0DTE chain."""
+    import plotly.graph_objects as go
+    raw0 = dte0_metrics.get('raw', pd.DataFrame())
+    if raw0.empty:
+        fig = go.Figure()
+        fig.update_layout(**base_layout(f'0DTE Vol Smile — {ticker} (no data)'))
+        return fig
+
+    fig = go.Figure()
+    for flag, color, label in [('c', ACCENT_GRN, 'Call IV'), ('p', ACCENT_RED, 'Put IV')]:
+        side = raw0[raw0['flag'] == flag].dropna(subset=['strike', 'iv'])
+        side = side.sort_values('strike')
+        moneyness = (side['strike'] / spot - 1) * 100
+        mask = (moneyness >= -15) & (moneyness <= 5)
+        fig.add_trace(go.Scatter(
+            x=moneyness[mask], y=side['iv'][mask] * 100,
+            mode='lines+markers', name=label,
+            line=dict(color=color, width=2), marker=dict(size=4),
+            hovertemplate='Moneyness: %{x:.1f}%<br>IV: %{y:.1f}%<extra></extra>',
+        ))
+
+    fig.add_vline(x=0, line_color=ACCENT_YLW, line_dash='dot', line_width=1,
+                  annotation_text=' ATM', annotation_font_color=ACCENT_YLW,
+                  annotation_font_size=10)
+    layout = base_layout(f'0DTE  Vol Smile — {ticker}')
+    layout.update(xaxis_title='Moneyness (% from spot)', yaxis_title='IV (%)',
+                  legend=dict(orientation='h', y=1.08, font=dict(color=TEXT_COL, size=11)))
+    fig.update_layout(**layout)
+    return fig
+
+
 print('Chart builders ready.')
+
 
 
 

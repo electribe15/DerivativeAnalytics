@@ -128,6 +128,13 @@ try:
         delta_strike_bounds,
         compute_0dte_metrics,
         fetch_price_history,
+        fetch_ohlc_history,
+        fetch_vix_history,
+        compute_rvol_all,
+        compute_rvol_cones,
+        compute_intraday_rvol,
+        rvol_models_chart,
+        rvol_cones_chart,
         get_put_monitor,
         price_vs_dex_chart,
         gex_dex_0dte_chart,
@@ -284,14 +291,21 @@ if fetch_btn:
         by_strike = aggregate_by_strike(raw_df)
         by_expiry = aggregate_by_expiry(raw_df)
 
-        # Fetch last 5 sessions of OHLC — lightweight, non-fatal if unavailable
-        with st.spinner("⏳ Storico prezzi…"):
-            ohlc = fetch_price_history(ticker, n_days=5)
+        # Fetch today's intraday bars — lightweight, non-fatal if unavailable
+        with st.spinner("⏳ Dati intraday…"):
+            intraday = fetch_intraday_history(ticker, interval_min=5)
+
+        # Fetch 6-month daily OHLC (SPX) + VIX for Realized Vol tab
+        with st.spinner("⏳ Storico SPX + VIX (6 mesi)…"):
+            ohlc_spx  = fetch_ohlc_history('$SPX', n_calendar_days=210)
+            vix_hist  = fetch_vix_history(n_calendar_days=210)
 
         st.session_state["data"] = dict(raw=raw_df, by_strike=by_strike,
                                          by_expiry=by_expiry, spot=spot,
                                          ticker=ticker, raw_full=raw_full,
-                                         ohlc=ohlc)
+                                         intraday=intraday,
+                                         ohlc_spx=ohlc_spx,
+                                         vix_hist=vix_hist)
 
         # CSV cache confirmation
         try:
@@ -351,8 +365,32 @@ by_strike = d["by_strike"]
 by_expiry = d["by_expiry"]
 spot      = d["spot"]
 cur_tick  = d["ticker"]
-raw_full  = d.get("raw_full", raw_df)   # unfiltered chain for vol analytics
-ohlc      = d.get("ohlc")
+raw_full  = d.get("raw_full", raw_df)
+intraday  = d.get("intraday")
+ohlc_spx  = d.get("ohlc_spx")
+vix_hist  = d.get("vix_hist")
+
+# ── Refresh Intraday (lightweight — no chain re-download) ─────────────────────
+with st.sidebar:
+    st.markdown("---")
+    refresh_intra_btn = st.button("🔄 Aggiorna Intraday", use_container_width=True)
+    if intraday is not None and not (intraday.empty if hasattr(intraday,'empty') else True):
+        last_bar = intraday['datetime'].iloc[-1]
+        ts_str   = last_bar.strftime('%H:%M') if hasattr(last_bar, 'strftime') else str(last_bar)
+        st.markdown(f"<p style='font-size:10px;color:#818CF8;text-align:center;"
+                    f"margin-top:-8px;'>intraday last bar: {ts_str}</p>",
+                    unsafe_allow_html=True)
+
+if refresh_intra_btn and "data" in st.session_state:
+    with st.spinner("⏳ Aggiornamento intraday…"):
+        new_intra = fetch_intraday_history(cur_tick, interval_min=5)
+    st.session_state["data"]["intraday"] = new_intra
+    intraday = new_intra
+    if not new_intra.empty:
+        st.success(f"Intraday aggiornato — {len(new_intra)} barre  |  "
+                   f"Last ${float(new_intra['close'].iloc[-1]):,.2f}")
+    else:
+        st.warning("Intraday non disponibile — verrà mostrato l'ultimo prezzo noto.")
 
 # ── Delta → strike bounds ─────────────────────────────────────────────────────
 # Use raw_full (complete unfiltered chain) for delta_strike_bounds so the
@@ -384,13 +422,14 @@ dte0_metrics = compute_0dte_metrics(raw_full, spot)
 has_0dte     = bool(dte0_metrics)
 
 # ── Tabs — 0DTE is always first and shown by default ─────────────────────────
-tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "⚡ 0DTE",
     "📊 GEX / DEX",
     "📐 Range & Skew",
     "💰 Put Monitor",
     "📈 Volatilità",
     "🔥 Open Interest",
+    "📉 Realized Vol",
 ])
 
 # ── Tab 0: 0DTE ───────────────────────────────────────────────────────────────
@@ -469,7 +508,7 @@ with tab1:
     # Price vs DEX Levels — the centrepiece: shared Y-axis chart
     try:
         st.plotly_chart(
-            price_vs_dex_chart(by_strike, ohlc, spot, cur_tick,
+            price_vs_dex_chart(by_strike, intraday, spot, cur_tick,
                                strike_lo=strike_lo, strike_hi=strike_hi),
             use_container_width=True,
         )
@@ -614,3 +653,148 @@ with tab5:
             by_strike[available].sort_values("net_gex", ascending=False).reset_index(drop=True),
             use_container_width=True,
         )
+
+# ── Tab 6: Realized Vol ───────────────────────────────────────────────────────
+with tab6:
+    has_ohlc = ohlc_spx is not None and isinstance(ohlc_spx, pd.DataFrame) and not ohlc_spx.empty
+    has_vix  = vix_hist is not None and isinstance(vix_hist, pd.DataFrame) and not vix_hist.empty
+
+    if not has_ohlc:
+        st.info(
+            "Dati OHLC storici non disponibili.  \n"
+            "Premi **⬇ CARICA FULL CHAIN** per avviare il download da Barchart "
+            "(storico 6 mesi $SPX + VIX).  \n"
+            "Se il messaggio persiste, l'endpoint Barchart storico potrebbe richiedere "
+            "un abbonamento premium — il log del terminale mostra i dettagli."
+        )
+    else:
+        rvol_window = 30   # 30-day rolling window (standard)
+        rvol_df   = compute_rvol_all(ohlc_spx, window=rvol_window)
+        cones_df  = compute_rvol_cones(ohlc_spx)
+        intra_rv  = compute_intraday_rvol(intraday) if intraday is not None else None
+
+        # ── Metric cards ──────────────────────────────────────────────────
+        mc = st.columns(5)
+        last_yz = float(rvol_df['Yang-Zhang'].iloc[-1]) if not rvol_df.empty else None
+        last_vix = float(vix_hist['vix'].iloc[-1] * 100) if has_vix else None
+        vol_premium = (last_vix - last_yz) if (last_vix and last_yz) else None
+
+        mc[0].metric("Intraday RVol",
+                     f"{intra_rv*100:.1f}%" if intra_rv else "—",
+                     help="RVol annualizzata della sessione odierna (barre 5-min)")
+        mc[1].metric("30d RVol  (Yang-Zhang)",
+                     f"{last_yz:.1f}%" if last_yz else "—",
+                     help="Stima più robusta: gestisce drift e overnight gap")
+        mc[2].metric("VIX",
+                     f"{last_vix:.1f}%" if last_vix else "—",
+                     help="Volatilità implicita 30-day degli SPX OTM options")
+        mc[3].metric("Vol Premium  (VIX−RVol)",
+                     (f"+{vol_premium:.1f}%" if vol_premium > 0 else f"{vol_premium:.1f}%")
+                     if vol_premium is not None else "—",
+                     delta=f"{vol_premium:.1f}%" if vol_premium else None,
+                     help="VIX sopra RVol = IV cara rispetto alla vol realizzata")
+        mc[4].metric("Sessioni storiche",
+                     f"{len(ohlc_spx):,}",
+                     help=f"~{len(ohlc_spx)//21} mesi di dati giornalieri SPX")
+
+        st.markdown("---")
+
+        # ── Modelli RVol vs VIX ───────────────────────────────────────────
+        try:
+            st.plotly_chart(rvol_models_chart(rvol_df, vix_hist, '$SPX'),
+                            use_container_width=True)
+        except Exception as e:
+            st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+
+        # ── Volatility Cones ──────────────────────────────────────────────
+        try:
+            st.plotly_chart(rvol_cones_chart(cones_df, '$SPX'),
+                            use_container_width=True)
+        except Exception as e:
+            st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+
+        # ── Descrizione modelli ───────────────────────────────────────────
+        with st.expander("📖 Specifiche dei modelli di Realized Volatility", expanded=False):
+            st.markdown("""
+<div style="font-family:'Inter',sans-serif; font-size:13px; line-height:1.75;
+            color:#374151; padding:4px 0;">
+
+<p style="margin-bottom:10px; color:#6B7280; font-size:12px;">
+Tutti i modelli calcolano la volatilità annualizzata su una finestra mobile di
+<b>30 giorni di trading</b> (252 giorni/anno). Il <b>VIX</b> è usato come proxy
+della volatilità implicita 30-day degli OTM options SPX. Un VIX strutturalmente
+sopra la RVol indica un <em>vol risk premium</em> positivo a favore dei venditori
+di opzioni.
+</p>
+
+<ul style="list-style:none; padding:0; margin:0;">
+
+<li style="margin-bottom:14px;">
+  <span style="display:inline-block; width:12px; height:12px; border-radius:50%;
+               background:#6C63FF; margin-right:8px; vertical-align:middle;"></span>
+  <b>Standard Deviation</b> — modello base.
+  Annualizza la deviazione standard dei log-return giornalieri <em>ln(C_t/C_{t-1})</em>
+  su finestra mobile. Assume log-normalità e nessun drift. Il più semplice ma anche il
+  meno efficiente statisticamente: richiede più osservazioni per ridurre l'errore di
+  stima e non sfrutta le informazioni intraday (High/Low/Open).
+</li>
+
+<li style="margin-bottom:14px;">
+  <span style="display:inline-block; width:12px; height:12px; border-radius:50%;
+               background:#10B981; margin-right:8px; vertical-align:middle;"></span>
+  <b>Parkinson (1980)</b> — stimatore High-Low.
+  Usa solo il range giornaliero <em>ln(H/L)²</em> con fattore correttivo <em>1/(4·ln2)</em>.
+  Circa <b>5×</b> più efficiente dello Std Dev sotto diffusione continua senza drift.
+  Sottostima la vol in presenza di <em>gap overnight</em> e di trend sostenuti
+  perché ignora il close e l'open.
+</li>
+
+<li style="margin-bottom:14px;">
+  <span style="display:inline-block; width:12px; height:12px; border-radius:50%;
+               background:#3B82F6; margin-right:8px; vertical-align:middle;"></span>
+  <b>Garman-Klass (1980)</b> — OHLC completo.
+  Estende Parkinson aggiungendo il contributo di open e close:
+  <em>0.5·ln(H/L)² − (2·ln2−1)·ln(C/O)²</em>. Circa <b>8×</b> più efficiente
+  dello Std Dev. Assume assenza di gap overnight e nessun drift — sovrastima
+  la vol in presenza di trend direzionali forti.
+</li>
+
+<li style="margin-bottom:14px;">
+  <span style="display:inline-block; width:12px; height:12px; border-radius:50%;
+               background:#F59E0B; margin-right:8px; vertical-align:middle;"></span>
+  <b>Hodges-Tompkins (1992)</b> — Std Dev bias-corretto.
+  Applica un fattore di correzione <em>√(N/(N−1))</em> per ridurre il downward bias
+  introdotto dalle finestre mobili sovrapposte (overlapping windows). Produce stime
+  leggermente più elevate dello Std Dev standard, particolarmente rilevante per
+  finestre brevi (3-10 giorni) dove il bias è più pronunciato.
+</li>
+
+<li style="margin-bottom:14px;">
+  <span style="display:inline-block; width:12px; height:12px; border-radius:50%;
+               background:#EC4899; margin-right:8px; vertical-align:middle;"></span>
+  <b>Rogers-Satchell (1991)</b> — drift non-zero, no overnight.
+  Formula: <em>ln(H/O)·ln(H/C) + ln(L/O)·ln(L/C)</em>. Non assume drift nullo —
+  stima correttamente la vol anche in presenza di trend direzionali sostenuti.
+  Limitazione: non cattura la varianza dei <em>gap overnight</em> (salti
+  open-to-previous-close), sottostimando la vol in mercati con gap frequenti.
+</li>
+
+<li style="margin-bottom:14px;">
+  <span style="display:inline-block; width:12px; height:12px; border-radius:50%;
+               background:#EAB308; margin-right:8px; vertical-align:middle;"></span>
+  <b>Yang-Zhang (2000)</b> — stimatore di minima varianza ★
+  Il modello più completo. Combina tre componenti con peso ottimale
+  <em>k = 0.34/(1.34 + (N+1)/(N−1))</em>:
+  <ul style="margin:4px 0 0 20px; padding:0; list-style:disc;">
+    <li>Varianza <b>overnight</b> <em>ln(O_t/C_{t-1})</em> — cattura i gap</li>
+    <li>Varianza <b>open-to-close</b> <em>ln(C/O)</em> — componente direzionale</li>
+    <li>Componente <b>Rogers-Satchell</b> — varianza intraday con drift</li>
+  </ul>
+  Invariante rispetto al drift, minima varianza tra tutti gli stimatori OHLC,
+  gestisce sia gap overnight che trend intraday. <b>Usato come modello di riferimento
+  per i Volatility Cones.</b>
+</li>
+
+</ul>
+</div>
+""", unsafe_allow_html=True)

@@ -361,7 +361,112 @@ _FETCH_DELAY      = 0.1   # seconds between expiration requests
 _FETCH_TIMEOUT    = 15    # seconds per request
 
 
+def fetch_intraday_history(ticker: str, interval_min: int = 5) -> pd.DataFrame:
+    """Fetch today's intraday price bars for ticker from Barchart.
+
+    Tries the historical endpoint with type=minutes, then interval=minutes.
+    Returns a DataFrame(datetime, open, high, low, close, volume) with intraday
+    bars sorted ascending, or an empty DataFrame if unavailable (market closed,
+    weekend, endpoint not accessible).  In that case the caller should fall back
+    to displaying the spot price fetched from the options page.
+    """
+    from datetime import date as _date, datetime as _dt
+    today = _date.today()
+    today_str = today.strftime('%Y-%m-%d')
+
+    _attempts = [
+        dict(type='minutes',   interval=str(interval_min)),
+        dict(type='minute',    interval=str(interval_min)),
+        dict(interval='minutes', period=str(interval_min)),
+    ]
+
+    def _parse_intraday(items: list) -> pd.DataFrame:
+        rows = []
+        for item in items:
+            raw = item.get('raw', item)
+            try:
+                day_s  = (raw.get('tradingDay') or raw.get('date') or today_str)
+                time_s = (raw.get('time') or raw.get('tradeTime') or '00:00:00')
+                # Combine date + time; Barchart uses HH:MM:SS or HH:MM format
+                if len(str(time_s)) <= 8:
+                    dt = _dt.strptime(f'{day_s} {time_s}', '%Y-%m-%d %H:%M:%S')
+                else:
+                    dt = pd.Timestamp(time_s)
+                rows.append({
+                    'datetime': dt,
+                    'open':  float(raw.get('open',  0) or 0),
+                    'high':  float(raw.get('high',  0) or 0),
+                    'low':   float(raw.get('low',   0) or 0),
+                    'close': float(raw.get('close', raw.get('lastPrice', 0)) or 0),
+                    'volume': float(raw.get('volume', 0) or 0),
+                })
+            except (ValueError, TypeError):
+                continue
+        if not rows:
+            return pd.DataFrame()
+        df = (pd.DataFrame(rows)
+                .dropna(subset=['datetime'])
+                .query('close > 0')
+                .sort_values('datetime')
+                .reset_index(drop=True))
+        return df
+
+    try:
+        session = build_barchart_session(ticker)
+        headers = barchart_api_headers(session, ticker)
+
+        for extra in _attempts:
+            params = {
+                'symbol':    ticker,
+                'startDate': today_str,
+                'endDate':   today_str,
+                'fields':    'tradingDay,time,open,high,low,close,volume',
+                'meta':      'field.shortName',
+                'orderBy':   'tradingDay',
+                'orderDir':  'asc',
+                'limit':     500,
+                **extra,
+            }
+            try:
+                resp = session.get(BARCHART_HIST_URL, headers=headers,
+                                   params=params, timeout=12)
+                print(f'  [intraday] {extra} → HTTP {resp.status_code}')
+                if resp.status_code != 200:
+                    print(f'  [intraday] body: {resp.text[:150]}')
+                    continue
+                payload = resp.json()
+                items = (payload.get('data')
+                         or payload.get('results')
+                         or (payload if isinstance(payload, list) else []))
+                print(f'  [intraday] items={len(items)}  '
+                      f'keys={list(payload.keys()) if isinstance(payload, dict) else "list"}')
+                if not items:
+                    print(f'  [intraday] empty: {str(payload)[:200]}')
+                    continue
+                df = _parse_intraday(items)
+                if not df.empty:
+                    print(f'  [intraday] OK: {len(df)} bars for {ticker}')
+                    return df
+                print(f'  [intraday] items found but not parsed — sample: {items[0]}')
+            except Exception as e:
+                print(f'  [intraday] attempt {extra} error: {type(e).__name__}: {e}')
+                continue
+
+        print(f'  [intraday] all attempts exhausted — will use spot fallback')
+        return pd.DataFrame()
+
+    except Exception as exc:
+        print(f'  fetch_intraday_history({ticker}) session error: {type(exc).__name__}: {exc}')
+        return pd.DataFrame()
+
+
+# Keep old alias for backward compatibility
 def fetch_price_history(ticker: str, n_days: int = 5) -> pd.DataFrame:
+    """Deprecated alias — use fetch_intraday_history for intraday data."""
+    return fetch_intraday_history(ticker)
+
+
+
     """Fetch the last n_days of daily OHLC for ticker from Barchart.
 
     Tries several parameter variants of the Barchart historical endpoint
@@ -463,6 +568,110 @@ def fetch_price_history(ticker: str, n_days: int = 5) -> pd.DataFrame:
     except Exception as exc:
         print(f'  fetch_price_history({ticker}) session error: {type(exc).__name__}: {exc}')
         return pd.DataFrame()
+
+
+
+def fetch_ohlc_history(ticker: str = '$SPX',
+                       n_calendar_days: int = 210) -> pd.DataFrame:
+    """Fetch n_calendar_days of daily OHLC from Barchart.
+
+    210 calendar days ≈ 6 months of trading history (~126 trading days).
+    Returns DataFrame(date, open, high, low, close, volume) sorted ascending,
+    or an empty DataFrame if the endpoint is unavailable.
+    """
+    from datetime import date as _date, timedelta as _td
+    end_dt   = _date.today()
+    start_dt = end_dt - _td(days=n_calendar_days)
+
+    _attempts = [
+        dict(type='daily'),
+        dict(type='eod'),
+        dict(interval='daily'),
+    ]
+
+    def _parse(items):
+        rows = []
+        for item in items:
+            raw = item.get('raw', item)
+            ds  = raw.get('tradingDay') or raw.get('date') or ''
+            if not ds:
+                continue
+            try:
+                rows.append({
+                    'date':   pd.Timestamp(str(ds)[:10]),
+                    'open':   float(raw.get('open',   0) or 0),
+                    'high':   float(raw.get('high',   0) or 0),
+                    'low':    float(raw.get('low',    0) or 0),
+                    'close':  float(raw.get('close',  raw.get('lastPrice', 0)) or 0),
+                    'volume': float(raw.get('volume', 0) or 0),
+                })
+            except (ValueError, TypeError):
+                continue
+        if not rows:
+            return pd.DataFrame()
+        return (pd.DataFrame(rows)
+                  .dropna(subset=['date'])
+                  .query('close > 0')
+                  .sort_values('date')
+                  .reset_index(drop=True))
+
+    try:
+        session = build_barchart_session(ticker)
+        headers = barchart_api_headers(session, ticker)
+        for extra in _attempts:
+            params = {
+                'symbol':    ticker,
+                'startDate': start_dt.strftime('%Y-%m-%d'),
+                'endDate':   end_dt.strftime('%Y-%m-%d'),
+                'fields':    'tradingDay,open,high,low,close,volume',
+                'meta':      'field.shortName',
+                'orderBy':   'tradingDay',
+                'orderDir':  'asc',
+                'limit':     300,
+                **extra,
+            }
+            try:
+                resp = session.get(BARCHART_HIST_URL, headers=headers,
+                                   params=params, timeout=15)
+                print(f'  [ohlc_daily/{ticker}] {extra} → HTTP {resp.status_code}')
+                if resp.status_code != 200:
+                    print(f'  [ohlc_daily] body: {resp.text[:150]}')
+                    continue
+                payload = resp.json()
+                items   = (payload.get('data') or payload.get('results')
+                           or (payload if isinstance(payload, list) else []))
+                print(f'  [ohlc_daily/{ticker}] items={len(items)}')
+                df = _parse(items)
+                if not df.empty:
+                    print(f'  [ohlc_daily/{ticker}] OK — {len(df)} sessions')
+                    return df
+                print(f'  [ohlc_daily/{ticker}] empty payload: {str(payload)[:200]}')
+            except Exception as e:
+                print(f'  [ohlc_daily/{ticker}] attempt {extra}: {type(e).__name__}: {e}')
+        print(f'  [ohlc_daily/{ticker}] all attempts failed')
+        return pd.DataFrame()
+    except Exception as exc:
+        print(f'  fetch_ohlc_history({ticker}) session error: {type(exc).__name__}: {exc}')
+        return pd.DataFrame()
+
+
+def fetch_vix_history(n_calendar_days: int = 210) -> pd.DataFrame:
+    """Fetch VIX daily history from Barchart.
+
+    Tries $VIX and ^VIX — Barchart uses $VIX for most index tickers.
+    Returns DataFrame(date, close) where close = VIX / 100 (decimal form).
+    """
+    for vix_ticker in ('$VIX', '^VIX', 'VIX'):
+        df = fetch_ohlc_history(vix_ticker, n_calendar_days)
+        if not df.empty:
+            df = df[['date', 'close']].copy()
+            df['close'] = df['close'] / 100.0   # VIX in % → decimal
+            df.rename(columns={'close': 'vix'}, inplace=True)
+            print(f'  fetch_vix_history: {len(df)} sessions via {vix_ticker}')
+            return df
+    print('  fetch_vix_history: all tickers failed')
+    return pd.DataFrame()
+
 
 
 def fetch_options_data(ticker: str, r: float = RISK_FREE_RATE,
@@ -1009,8 +1218,12 @@ def dex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10,
     """DEX by strike chart (call / put / net).
 
     Same approach as gex_bar_chart: all data rendered, xaxis.range for zoom.
+    Net DEX line is always yellow (#EAB308) for easy visual separation from
+    the green/red call-put bars and the blue/violet spot vline.
     """
     import plotly.graph_objects as go
+
+    _NET_DEX_CLR = '#EAB308'   # clear yellow — distinct from amber spot line
 
     lo = strike_lo if (strike_lo is not None and np.isfinite(strike_lo)) else spot * (1 - window_pct)
     hi = strike_hi if (strike_hi is not None and np.isfinite(strike_hi)) else spot * (1 + window_pct)
@@ -1020,18 +1233,25 @@ def dex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10,
     df = by_strike_df.copy()
     fig = go.Figure()
     fig.add_trace(go.Bar(x=df['strike'], y=df['call_dex'] / 1e6,
-                          name='Call DEX', marker_color=ACCENT_GRN))
+                          name='Call DEX', marker_color=ACCENT_GRN, opacity=0.80))
     fig.add_trace(go.Bar(x=df['strike'], y=df['put_dex'] / 1e6,
-                          name='Put DEX', marker_color=ACCENT_RED))
-    fig.add_trace(go.Scatter(x=df['strike'], y=df['net_dex'] / 1e6,
-                              mode='lines+markers', name='Net DEX',
-                              line=dict(color=ACCENT_YLW, width=2)))
+                          name='Put DEX', marker_color=ACCENT_RED, opacity=0.80))
+    fig.add_trace(go.Scatter(
+        x=df['strike'], y=df['net_dex'] / 1e6,
+        mode='lines+markers', name='Net DEX',
+        line=dict(color=_NET_DEX_CLR, width=2.5),
+        marker=dict(size=4, color=_NET_DEX_CLR,
+                    line=dict(color='white', width=1)),
+    ))
     fig.add_vline(x=spot, line_color=ACCENT_BLU, line_dash='dash',
                   annotation_text=f' Spot ${spot:.1f}',
                   annotation_font_color=ACCENT_BLU)
     layout = base_layout(f'DEX by Strike — {ticker}')
     layout['xaxis'].update(range=[lo, hi])
-    layout.update(barmode='relative', yaxis_title='DEX ($M)', xaxis_title='Strike')
+    layout.update(barmode='relative', yaxis_title='DEX ($M)', xaxis_title='Strike',
+                  legend=dict(orientation='h', y=1.08,
+                              font=dict(color=TEXT_COL, size=11),
+                              bgcolor='rgba(0,0,0,0)'))
     fig.update_layout(**layout)
     return fig
 
@@ -1579,41 +1799,40 @@ def put_monitor_chart(raw_df: pd.DataFrame, spot: float, ticker: str):
     return fig
 
 
-def price_vs_dex_chart(by_strike_df: pd.DataFrame, ohlc_df,
+def price_vs_dex_chart(by_strike_df: pd.DataFrame, intraday_df,
                        spot: float, ticker: str,
                        strike_lo=None, strike_hi=None):
     """Dual-panel chart with shared Y-axis (price / strike level).
 
-    Left panel  — DEX exposure as horizontal bars per strike.
-    Right panel — daily OHLC candlesticks for the last N sessions.
-
-    The shared Y-axis immediately shows which DEX support/resistance levels
-    the underlying has been trading through or approaching.
-    If OHLC data is unavailable, renders only the DEX panel.
+    Left  — DEX exposure as horizontal bars per strike.
+    Right — Today's intraday price (5-min bars as a line + fill) with
+            light volume bars on a secondary Y-axis.
+            Falls back to the spot price as a horizontal reference line
+            when intraday data is unavailable (market closed, weekend,
+            or Barchart endpoint restricted).
     """
     from plotly.subplots import make_subplots
     import plotly.graph_objects as go
+    from datetime import datetime as _dt
 
-    has_ohlc = ohlc_df is not None and isinstance(ohlc_df, pd.DataFrame) \
-               and not ohlc_df.empty
+    has_intra = (intraday_df is not None
+                 and isinstance(intraday_df, pd.DataFrame)
+                 and not intraday_df.empty
+                 and 'datetime' in intraday_df.columns)
 
-    # Y-range: use delta strike bounds, falling back to ±4% of spot if invalid
+    # Y-range: use delta bounds with ±4% fallback
     lo = strike_lo if (strike_lo is not None and np.isfinite(strike_lo)) else spot * 0.96
     hi = strike_hi if (strike_hi is not None and np.isfinite(strike_hi)) else spot * 1.04
     if lo >= hi:
         lo, hi = spot * 0.96, spot * 1.04
-    y_pad = (hi - lo) * 0.05
 
-    # If OHLC available, extend Y range to cover the price candles too
-    if has_ohlc:
-        price_lo = float(ohlc_df['low'].min())
-        price_hi = float(ohlc_df['high'].max())
-        lo = min(lo, price_lo)
-        hi = max(hi, price_hi)
+    # Extend to cover today's intraday range if available
+    if has_intra:
+        lo = min(lo, float(intraday_df['low'].min()))
+        hi = max(hi, float(intraday_df['high'].max()))
+    y_pad = (hi - lo) * 0.04
 
-    # Filter DEX df to the Y range (± small buffer so bars near edges are visible).
-    # If nothing survives the filter (very tight range or sparse data), use the
-    # full by_strike_df so the DEX panel is never empty.
+    # DEX panel data
     buf = (hi - lo) * 0.10
     dex = by_strike_df[
         (by_strike_df['strike'] >= lo - buf) &
@@ -1622,104 +1841,126 @@ def price_vs_dex_chart(by_strike_df: pd.DataFrame, ohlc_df,
     if dex.empty:
         dex = by_strike_df.copy()
 
-    # Build subplots
-    if has_ohlc:
-        fig = make_subplots(
-            rows=1, cols=2,
-            shared_yaxes=True,
-            column_widths=[0.28, 0.72],
-            horizontal_spacing=0.02,
-            subplot_titles=['DEX by Strike', f'{ticker}  ·  Last {len(ohlc_df)} Sessions'],
-        )
-        col_dex   = 1
-        col_price = 2
-    else:
-        fig = make_subplots(rows=1, cols=1)
-        col_dex   = 1
+    fig = make_subplots(
+        rows=1, cols=2,
+        shared_yaxes=True,
+        column_widths=[0.28, 0.72],
+        horizontal_spacing=0.02,
+        specs=[[{}, {'secondary_y': True}]],
+        subplot_titles=['DEX by Strike', f'{ticker}  ·  Intraday'],
+    )
 
     # ── DEX horizontal bars ──────────────────────────────────────────────
     colors_dex = [ACCENT_GRN if v >= 0 else ACCENT_RED for v in dex['net_dex']]
     fig.add_trace(go.Bar(
         y=dex['strike'], x=dex['net_dex'] / 1e6,
-        orientation='h',
-        marker_color=colors_dex,
-        marker_line_width=0,
-        name='Net DEX',
+        orientation='h', marker_color=colors_dex, marker_line_width=0,
+        name='Net DEX', opacity=0.85,
         hovertemplate='Strike %{y}<br>Net DEX: %{x:.1f}M<extra></extra>',
-    ), row=1, col=col_dex)
-
-    # Call / put breakdown (hidden by default, togglable in legend)
+    ), row=1, col=1)
     fig.add_trace(go.Bar(
         y=dex['strike'], x=dex['call_dex'] / 1e6,
-        orientation='h', marker_color=ACCENT_GRN, opacity=0.40,
+        orientation='h', marker_color=ACCENT_GRN, opacity=0.35,
         name='Call DEX', visible='legendonly',
-    ), row=1, col=col_dex)
+    ), row=1, col=1)
     fig.add_trace(go.Bar(
         y=dex['strike'], x=dex['put_dex'] / 1e6,
-        orientation='h', marker_color=ACCENT_RED, opacity=0.40,
+        orientation='h', marker_color=ACCENT_RED, opacity=0.35,
         name='Put DEX', visible='legendonly',
-    ), row=1, col=col_dex)
-
-    # Zero baseline
-    fig.add_vline(x=0, line_color=GRID_COL, line_width=1,
-                  row=1, col=col_dex)
-
-    # ── OHLC candlestick ────────────────────────────────────────────────
-    if has_ohlc:
-        fig.add_trace(go.Candlestick(
-            x=ohlc_df['date'],
-            open=ohlc_df['open'],
-            high=ohlc_df['high'],
-            low=ohlc_df['low'],
-            close=ohlc_df['close'],
-            name=ticker,
-            increasing_line_color=ACCENT_GRN,
-            decreasing_line_color=ACCENT_RED,
-            whiskerwidth=0.8,
-        ), row=1, col=col_price)
-
-        # Current spot line on price panel
-        fig.add_hline(y=spot, line_color=ACCENT_YLW, line_dash='dash',
-                      line_width=1.5, row=1, col=col_price,
-                      annotation_text=f'  Spot ${spot:.1f}',
-                      annotation_font_color=ACCENT_YLW,
-                      annotation_font_size=11)
-        fig.update_xaxes(rangeslider_visible=False, row=1, col=col_price)
-
-    # Spot line on DEX panel (horizontal, in Y-axis space)
+    ), row=1, col=1)
+    fig.add_vline(x=0, line_color=GRID_COL, line_width=1, row=1, col=1)
     fig.add_hline(y=spot, line_color=ACCENT_YLW, line_dash='dash',
-                  line_width=1.5, row=1, col=col_dex)
+                  line_width=1.5, row=1, col=1)
+
+    # ── Intraday price panel ─────────────────────────────────────────────
+    if has_intra:
+        x_times    = intraday_df['datetime']
+        close      = intraday_df['close']
+        volume     = intraday_df['volume']
+        day_hi     = float(intraday_df['high'].max())
+        day_lo     = float(intraday_df['low'].min())
+        last_close = float(close.iloc[-1])
+        last_time  = x_times.iloc[-1]
+
+        # Volume bars (secondary Y, very light)
+        fig.add_trace(go.Bar(
+            x=x_times, y=volume / 1e6,
+            name='Volume (M)', marker_color='rgba(108,99,255,0.10)',
+            marker_line_width=0, showlegend=False,
+        ), row=1, col=2, secondary_y=True)
+
+        # Price line + fill
+        fig.add_trace(go.Scatter(
+            x=x_times, y=close, mode='lines',
+            name=ticker, line=dict(color=ACCENT_BLU, width=2.5),
+            fill='tozeroy', fillcolor='rgba(108,99,255,0.07)',
+            hovertemplate='%{x|%H:%M}  $%{y:,.2f}<extra></extra>',
+        ), row=1, col=2, secondary_y=False)
+
+        # Current price marker
+        fig.add_trace(go.Scatter(
+            x=[last_time], y=[last_close],
+            mode='markers+text',
+            marker=dict(color=ACCENT_BLU, size=10,
+                        line=dict(color='white', width=2)),
+            text=[f'  ${last_close:,.2f}'],
+            textposition='middle right',
+            textfont=dict(color=TEXT_COL, size=11),
+            name='Last', showlegend=False,
+        ), row=1, col=2, secondary_y=False)
+
+        # Day high / low
+        fig.add_hline(y=day_hi, line_dash='dot', line_color=ACCENT_GRN,
+                      line_width=1, row=1, col=2,
+                      annotation_text=f' Hi ${day_hi:,.1f}',
+                      annotation_font_color=ACCENT_GRN, annotation_font_size=10)
+        fig.add_hline(y=day_lo, line_dash='dot', line_color=ACCENT_RED,
+                      line_width=1, row=1, col=2,
+                      annotation_text=f' Lo ${day_lo:,.1f}',
+                      annotation_font_color=ACCENT_RED, annotation_font_size=10)
+
+        fig.update_xaxes(title_text='Time (ET)', row=1, col=2,
+                         rangeslider_visible=False)
+        fig.update_yaxes(title_text='Volume (M)', secondary_y=True,
+                         showgrid=False, row=1, col=2)
+
+    else:
+        # ── Fallback: spot price as horizontal reference ───────────────
+        ts = _dt.now().strftime('%H:%M')
+        fig.add_hline(
+            y=spot, line_color=ACCENT_BLU, line_dash='dash', line_width=2,
+            row=1, col=2,
+            annotation_text=f'  Last  ${spot:,.2f}  ({ts})',
+            annotation_font_color=ACCENT_BLU, annotation_font_size=12,
+        )
+        fig.add_annotation(
+            x=0.65, y=0.38, xref='paper', yref='paper',
+            text='Intraday data unavailable<br>'
+                 '<span style="color:#9CA3AF; font-size:10px">'
+                 'Market closed or Barchart endpoint restricted</span>',
+            showarrow=False,
+            font=dict(size=11, color=TEXT_SEC, family='Inter, sans-serif'),
+            align='center',
+        )
 
     # ── Styling ──────────────────────────────────────────────────────────
     fig.update_layout(
-        paper_bgcolor=CARD_BG,
-        plot_bgcolor=CARD_BG,
-        font=dict(color=TEXT_COL, family='Courier New'),
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='#F9FAFB',
+        font=dict(color=TEXT_COL, family='Inter, system-ui, sans-serif'),
         height=520,
-        title=dict(
-            text=f'Price vs DEX Levels — {ticker}',
-            font=dict(color=TEXT_COL, size=14, family='Courier New'),
-        ),
-        barmode='overlay',
-        bargap=0.1,
+        title=dict(text=f'Price vs DEX  ·  {ticker}',
+                   font=dict(color=TEXT_COL, size=13,
+                             family='Inter, sans-serif')),
+        barmode='overlay', bargap=0.08,
         legend=dict(bgcolor='rgba(0,0,0,0)', font=dict(size=10, color=TEXT_COL),
-                    orientation='h', y=-0.10),
-        margin=dict(l=50, r=20, t=60, b=50),
+                    orientation='h', y=-0.12),
+        margin=dict(l=50, r=20, t=50, b=50),
     )
     fig.update_yaxes(range=[lo - y_pad, hi + y_pad],
                      gridcolor=GRID_COL, zerolinecolor=GRID_COL)
     fig.update_xaxes(gridcolor=GRID_COL, zerolinecolor=GRID_COL)
-    fig.update_xaxes(title_text='DEX ($M)', row=1, col=col_dex)
+    fig.update_xaxes(title_text='DEX ($M)', row=1, col=1)
     fig.update_yaxes(title_text=f'{ticker} Level', row=1, col=1)
-    if has_ohlc:
-        fig.update_xaxes(title_text='Data', row=1, col=col_price)
-
-    if not has_ohlc:
-        fig.add_annotation(
-            text='Storico prezzi non disponibile (Barchart history API)',
-            xref='paper', yref='paper', x=0.65, y=0.5,
-            showarrow=False, font=dict(color='#7a8399', size=12),
-        )
     return fig
 
 
@@ -1862,6 +2103,259 @@ def smile_0dte_chart(dte0_metrics: dict, spot: float, ticker: str):
     return fig
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Realized Volatility Models (pure numpy/pandas — no OpenBB required)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _rvol_ann(series: pd.Series, window: int, tp: int) -> pd.Series:
+    """Annualize a rolling variance series."""
+    return np.sqrt(series.rolling(window).mean() * tp)
+
+
+def rvol_std(ohlc: pd.DataFrame, window: int = 30,
+             trading_periods: int = 252) -> pd.Series:
+    """Standard Deviation model — annualized log-return std."""
+    log_ret = np.log(ohlc['close'] / ohlc['close'].shift(1))
+    return (log_ret.rolling(window).std() * np.sqrt(trading_periods)
+            ).rename('Std Dev')
+
+
+def rvol_parkinson(ohlc: pd.DataFrame, window: int = 30,
+                   trading_periods: int = 252) -> pd.Series:
+    """Parkinson (1980) — High-Low range estimator."""
+    hl2 = np.log(ohlc['high'] / ohlc['low']) ** 2
+    k   = 1.0 / (4.0 * np.log(2.0))
+    return (np.sqrt(trading_periods * k * hl2.rolling(window).mean())
+            ).rename('Parkinson')
+
+
+def rvol_garman_klass(ohlc: pd.DataFrame, window: int = 30,
+                      trading_periods: int = 252) -> pd.Series:
+    """Garman-Klass (1980) — OHLC estimator, ~8× more efficient than Std Dev."""
+    hl2 = 0.5 * np.log(ohlc['high'] / ohlc['low']) ** 2
+    co2 = (2.0 * np.log(2.0) - 1.0) * np.log(ohlc['close'] / ohlc['open']) ** 2
+    return (np.sqrt(trading_periods * (hl2 - co2).rolling(window).mean())
+            ).rename('Garman-Klass')
+
+
+def rvol_rogers_satchell(ohlc: pd.DataFrame, window: int = 30,
+                          trading_periods: int = 252) -> pd.Series:
+    """Rogers-Satchell (1991) — non-zero drift, no overnight gap."""
+    h_o = np.log(ohlc['high']  / ohlc['open'])
+    l_o = np.log(ohlc['low']   / ohlc['open'])
+    h_c = np.log(ohlc['high']  / ohlc['close'])
+    l_c = np.log(ohlc['low']   / ohlc['close'])
+    rs  = h_o * h_c + l_o * l_c
+    return (np.sqrt(trading_periods * rs.rolling(window).mean())
+            ).rename('Rogers-Satchell')
+
+
+def rvol_hodges_tompkins(ohlc: pd.DataFrame, window: int = 30,
+                          trading_periods: int = 252) -> pd.Series:
+    """Hodges-Tompkins (1992) — bias-corrected Std Dev for overlapping windows."""
+    σ_std = rvol_std(ohlc, window, trading_periods)
+    # Correction: sqrt(window / (window - 1))
+    corr  = np.sqrt(window / max(window - 1, 1))
+    return (σ_std * corr).rename('Hodges-Tompkins')
+
+
+def rvol_yang_zhang(ohlc: pd.DataFrame, window: int = 30,
+                    trading_periods: int = 252) -> pd.Series:
+    """Yang-Zhang (2000) — minimum-variance, handles drift and overnight gaps."""
+    log_oc  = np.log(ohlc['close'] / ohlc['open'])       # open-to-close
+    log_on  = np.log(ohlc['open']  / ohlc['close'].shift(1))  # overnight
+    h_o = np.log(ohlc['high']  / ohlc['open'])
+    l_o = np.log(ohlc['low']   / ohlc['open'])
+    h_c = np.log(ohlc['high']  / ohlc['close'])
+    l_c = np.log(ohlc['low']   / ohlc['close'])
+    σ_rs_sq  = (h_o * h_c + l_o * l_c).rolling(window).mean()
+    σ_on_sq  = log_on.rolling(window).var()
+    σ_oc_sq  = log_oc.rolling(window).var()
+    k = 0.34 / (1.34 + (window + 1) / max(window - 1, 1))
+    yz = np.sqrt(trading_periods * (σ_on_sq + k * σ_oc_sq + (1 - k) * σ_rs_sq))
+    return yz.rename('Yang-Zhang')
+
+
+def compute_rvol_all(ohlc: pd.DataFrame, window: int = 30,
+                     trading_periods: int = 252) -> pd.DataFrame:
+    """All 6 realized vol models in a single DataFrame, values in % (e.g. 15.2)."""
+    if ohlc is None or ohlc.empty or len(ohlc) < window + 5:
+        return pd.DataFrame()
+    funcs = [rvol_std, rvol_parkinson, rvol_garman_klass,
+             rvol_hodges_tompkins, rvol_rogers_satchell, rvol_yang_zhang]
+    return (pd.concat([f(ohlc, window, trading_periods) for f in funcs], axis=1)
+              .dropna()
+              .mul(100))
+
+
+def compute_rvol_cones(ohlc: pd.DataFrame,
+                       windows=None,
+                       trading_periods: int = 252) -> pd.DataFrame:
+    """Volatility cones: realized vol quantile distribution at each window.
+
+    Returns DataFrame indexed by window (days) with columns:
+    min, q10, q25, q50, q75, q90, max, current.  Values in %.
+    """
+    if windows is None:
+        windows = [3, 5, 10, 21, 30, 45, 63, 90]
+    records = []
+    for w in windows:
+        if ohlc is None or ohlc.empty or len(ohlc) < w + 5:
+            continue
+        roll = (rvol_yang_zhang(ohlc, w, trading_periods) * 100).dropna()
+        if roll.empty:
+            continue
+        records.append({
+            'window':  w,
+            'min':     float(roll.min()),
+            'q10':     float(roll.quantile(0.10)),
+            'q25':     float(roll.quantile(0.25)),
+            'q50':     float(roll.quantile(0.50)),
+            'q75':     float(roll.quantile(0.75)),
+            'q90':     float(roll.quantile(0.90)),
+            'max':     float(roll.max()),
+            'current': float(roll.iloc[-1]),
+        })
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records).set_index('window')
+
+
+def compute_intraday_rvol(intraday_df: pd.DataFrame,
+                           trading_periods: int = 252,
+                           bars_per_day: int = 78) -> float:
+    """Current-session realized vol from 5-min intraday bars, annualized.
+
+    bars_per_day = 78 (6.5 h × 12 bars/h).
+    Returns annualized float (e.g. 0.142 = 14.2%) or None.
+    """
+    if intraday_df is None or intraday_df.empty:
+        return None
+    closes = intraday_df['close'].dropna()
+    if len(closes) < 2:
+        return None
+    log_ret = np.log(closes / closes.shift(1)).dropna()
+    σ = float(log_ret.std() * np.sqrt(trading_periods * bars_per_day))
+    return σ if np.isfinite(σ) else None
+
+
+# ── Chart builders ─────────────────────────────────────────────────────────
+_RVOL_COLORS = {
+    'Std Dev':         '#6C63FF',
+    'Parkinson':       '#10B981',
+    'Garman-Klass':    '#3B82F6',
+    'Hodges-Tompkins': '#F59E0B',
+    'Rogers-Satchell': '#EC4899',
+    'Yang-Zhang':      '#EAB308',
+}
+
+
+def rvol_models_chart(rvol_df: pd.DataFrame, vix_df: pd.DataFrame,
+                      ticker: str = '$SPX'):
+    """All 6 RVol models (% annualized) vs VIX as IV proxy.
+
+    rvol_df: columns = model names, index = date, values in %.
+    vix_df:  columns = ['date', 'vix'] where vix is in decimal (0.14 = 14%).
+    """
+    import plotly.graph_objects as go
+    fig = go.Figure()
+
+    # Model lines
+    if rvol_df is not None and not rvol_df.empty:
+        for col in rvol_df.columns:
+            color = _RVOL_COLORS.get(col, ACCENT_BLU)
+            fig.add_trace(go.Scatter(
+                x=rvol_df.index, y=rvol_df[col],
+                mode='lines', name=col,
+                line=dict(color=color, width=1.6),
+                hovertemplate=f'{col}: %{{y:.1f}}%<extra></extra>',
+            ))
+
+    # VIX as implied vol benchmark
+    if vix_df is not None and not vix_df.empty:
+        vix_pct = vix_df.set_index('date')['vix'] * 100
+        fig.add_trace(go.Scatter(
+            x=vix_pct.index, y=vix_pct,
+            mode='lines', name='VIX (Implied)',
+            line=dict(color=ACCENT_RED, width=2.5, dash='dot'),
+            hovertemplate='VIX: %{y:.1f}%<extra></extra>',
+        ))
+
+    layout = base_layout(f'Realized Volatility vs VIX — {ticker}', height=400)
+    layout.update(
+        yaxis_title='Annualized Vol (%)',
+        xaxis_title='',
+        legend=dict(orientation='h', y=-0.18, font=dict(size=10, color=TEXT_COL),
+                    bgcolor='rgba(0,0,0,0)'),
+    )
+    fig.update_layout(**layout)
+    return fig
+
+
+def rvol_cones_chart(cones_df: pd.DataFrame,
+                      ticker: str = '$SPX'):
+    """Volatility cones: Yang-Zhang RVol quantile bands at each window length."""
+    import plotly.graph_objects as go
+    if cones_df is None or cones_df.empty:
+        fig = go.Figure()
+        fig.update_layout(**base_layout(f'Vol Cones — {ticker} (no data)'))
+        return fig
+
+    windows = cones_df.index.tolist()
+    fig = go.Figure()
+
+    # Outer band: q10 → q90
+    fig.add_trace(go.Scatter(
+        x=windows + windows[::-1],
+        y=cones_df['q90'].tolist() + cones_df['q10'].tolist()[::-1],
+        fill='toself', fillcolor='rgba(108,99,255,0.08)',
+        line=dict(color='rgba(0,0,0,0)'),
+        name='10–90th pct', hoverinfo='skip',
+    ))
+
+    # Inner band: q25 → q75
+    fig.add_trace(go.Scatter(
+        x=windows + windows[::-1],
+        y=cones_df['q75'].tolist() + cones_df['q25'].tolist()[::-1],
+        fill='toself', fillcolor='rgba(108,99,255,0.18)',
+        line=dict(color='rgba(0,0,0,0)'),
+        name='25–75th pct', hoverinfo='skip',
+    ))
+
+    # Median line
+    fig.add_trace(go.Scatter(
+        x=windows, y=cones_df['q50'],
+        mode='lines', name='Median',
+        line=dict(color=ACCENT_BLU, width=2, dash='dash'),
+        hovertemplate='Window %{x}d — Median: %{y:.1f}%<extra></extra>',
+    ))
+
+    # Current value markers
+    fig.add_trace(go.Scatter(
+        x=windows, y=cones_df['current'],
+        mode='lines+markers', name='Current',
+        line=dict(color=ACCENT_RED, width=2),
+        marker=dict(size=9, color=ACCENT_RED,
+                    line=dict(color='white', width=2)),
+        hovertemplate='Window %{x}d — Current: %{y:.1f}%<extra></extra>',
+    ))
+
+    layout = base_layout(f'Volatility Cones (Yang-Zhang) — {ticker}', height=380)
+    layout.update(
+        xaxis_title='Rolling Window (trading days)',
+        yaxis_title='Annualized RVol (%)',
+        legend=dict(orientation='h', y=-0.20, font=dict(size=10, color=TEXT_COL),
+                    bgcolor='rgba(0,0,0,0)'),
+        xaxis=dict(tickmode='array', tickvals=windows,
+                   ticktext=[f'{w}d' for w in windows],
+                   gridcolor=GRID_COL, zerolinecolor=GRID_COL),
+        yaxis=dict(gridcolor=GRID_COL, zerolinecolor=GRID_COL),
+    )
+    fig.update_layout(**layout)
+    return fig
+
+
 print('Chart builders ready.')
 
 
@@ -1884,7 +2378,8 @@ if __name__ == '__main__':
         'spot':      None,
         'ticker':    DEFAULT_TICKER,
         'updated_at': None,
-        'ohlc':      None,   # last N sessions of OHLC — fetched alongside the chain
+        'ohlc':      None,   # kept for compatibility
+        'intraday':  None,   # today's 5-min bars — fetched alongside the chain
     }
     store_lock = threading.Lock()
     loader_lock = threading.Lock()
@@ -2046,11 +2541,11 @@ if __name__ == '__main__':
             )
             report_progress(request_id, 97, f'Finalizing {ticker} dashboard feed ...')
 
-            # Fetch last 5 sessions of OHLC — lightweight call, non-fatal if unavailable
+            # Fetch today's intraday 5-min bars — lightweight, non-fatal
             try:
-                ohlc = fetch_price_history(resolved_barchart_ticker, n_days=5)
+                intraday = fetch_intraday_history(resolved_barchart_ticker, interval_min=5)
             except Exception:
-                ohlc = pd.DataFrame()
+                intraday = pd.DataFrame()
 
             with store_lock:
                 store['raw'] = raw_df
@@ -2059,7 +2554,7 @@ if __name__ == '__main__':
                 store['spot'] = spot
                 store['ticker'] = resolved_barchart_ticker
                 store['updated_at'] = datetime.now()
-                store['ohlc'] = ohlc
+                store['intraday'] = intraday
 
             set_loader_state(
                 status='ready',
@@ -2503,7 +2998,7 @@ if __name__ == '__main__':
 
         bs_df = aggregate_by_strike(filtered_df)
         be_df = aggregate_by_expiry(filtered_df)
-        ohlc  = current_store.get('ohlc')
+        ohlc     = current_store.get('intraday')   # today's intraday bars
 
         lo, hi = delta_strike_bounds(raw_df, delta_lo, delta_hi)
         stats        = build_stats(filtered_df, bs_df, spot)

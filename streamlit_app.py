@@ -435,7 +435,9 @@ st.markdown("---")
 # ── Alert Flags Panel ─────────────────────────────────────────────────────────
 if "data" in st.session_state and st.session_state["data"].get("raw") is not None:
     _d      = st.session_state["data"]
-    _raw_f  = _d.get("raw_full") or _d.get("raw")
+    _raw_f  = _d.get("raw_full")
+    if _raw_f is None:
+        _raw_f = _d.get("raw")
     _spot_a = _d.get("spot", 0)
     _dte0_m = compute_0dte_metrics(_raw_f, _spot_a) if _raw_f is not None else {}
     _rvdf   = compute_rvol_all(_d.get("ohlc_spx", pd.DataFrame()), window=126) \

@@ -32,44 +32,114 @@ from datetime import datetime, date
 # ── Dashboard config ──────────────────────────────────────────────────────────
 DEFAULT_TICKER    = '$SPX'  # Use $ prefix for indices (SPY, QQQ, AAPL work without)
 RISK_FREE_RATE    = 0.053221  # Update to current Fed funds rate
+SPX_DIV_YIELD     = 0.014     # SPX continuous dividend yield ≈ 1.4%
+                              # Used in Merton (1973) extension of BS for index options.
+                              # Forward: F = S·e^{(r-q)T}  →  adjusts delta, gamma,
+                              # charm, vanna systematically.  Without q, delta is
+                              # overstated for ITM calls and understated for ITM puts.
 OI_THRESHOLD      = 100     # Minimum open interest to keep a strike
 FETCH_EXPIRY_DAYS = 270     # Max DTE when downloading the chain.
-                            # 270d (9 months) gives a full IV term structure while
-                            # staying clear of LEAP expirations (>9m) where Barchart's
-                            # API becomes unreliable for $SPX (slow response, partial
-                            # JSON, or server-side hangs that bypass read timeouts).
 MAX_EXPIRY_DAYS   = 90      # Default display window (sidebar DTE filter, post-fetch)
 PORT              = 8051    # Browser port (safe default)
 
 print(f'Config loaded. Default ticker: {DEFAULT_TICKER}')
 
-# ── Black-Scholes helpers ─────────────────────────────────────────────
+# ── Black-Scholes helpers (Merton 1973 — continuous dividend yield q) ─────────
 
-def bs_delta(S, K, T, r, sigma, flag):
-    """Black-Scholes delta. flag='c' for call, 'p' for put."""
+def _bs_d1d2(S, K, T, r, sigma, q=SPX_DIV_YIELD):
+    """Internal helper: compute d1, d2 with dividend yield q."""
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    return d1, d1 - sigma * np.sqrt(T)
+
+
+def bs_delta(S, K, T, r, sigma, flag, q=SPX_DIV_YIELD):
+    """Black-Scholes-Merton delta with continuous dividend yield q."""
     if T <= 0 or sigma <= 0:
         return 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d1, _ = _bs_d1d2(S, K, T, r, sigma, q)
+    disc  = np.exp(-q * T)
     if flag == 'c':
-        return norm.cdf(d1)
+        return float(disc * norm.cdf(d1))
     else:
-        return norm.cdf(d1) - 1
+        return float(disc * (norm.cdf(d1) - 1.0))
 
 
-def bs_gamma(S, K, T, r, sigma):
-    """Black-Scholes gamma (same for calls & puts)."""
+def bs_gamma(S, K, T, r, sigma, q=SPX_DIV_YIELD):
+    """Black-Scholes-Merton gamma with continuous dividend yield q."""
     if T <= 0 or sigma <= 0:
         return 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    return norm.pdf(d1) / (S * sigma * np.sqrt(T))
+    d1, _ = _bs_d1d2(S, K, T, r, sigma, q)
+    return float(np.exp(-q * T) * norm.pdf(d1) / (S * sigma * np.sqrt(T)))
 
 
-def bs_greeks_vectorized(S, K, T, r, sigma, flag):
-    """Vectorized Black-Scholes delta and gamma."""
-    K = np.asarray(K, dtype=float)
-    T = np.asarray(T, dtype=float)
+def bs_charm(S, K, T, r, sigma, flag, q=SPX_DIV_YIELD):
+    """Charm = dDelta/dTime (delta decay per calendar day, annualised basis).
+
+    Key for 0DTE: charm drives the delta-hedge the dealer must execute simply
+    from the passage of time, independent of price movement.  Expressed as
+    delta-units per year — divide by 252 to get daily delta drift.
+    """
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1, d2 = _bs_d1d2(S, K, T, r, sigma, q)
+    nd1    = norm.pdf(d1)
+    sqrtT  = np.sqrt(T)
+    disc   = np.exp(-q * T)
+    # Common term
+    inner  = 2.0 * (r - q) * T - d2 * sigma * sqrtT
+    term   = disc * nd1 * inner / (2.0 * T * sigma * sqrtT)
+    if flag == 'c':
+        return float(-term + q * disc * norm.cdf(d1))
+    else:
+        return float(-term - q * disc * norm.cdf(-d1))
+
+
+def bs_vanna(S, K, T, r, sigma, q=SPX_DIV_YIELD):
+    """Vanna = dDelta/dVol = d2Vega/dS.
+
+    Measures how much delta changes when implied vol moves.  When the market
+    sells off and IV spikes simultaneously, dealers with short vanna must
+    buy futures — amplifying the move.  Critical for understanding vol→spot
+    correlation flows.
+    """
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1, d2 = _bs_d1d2(S, K, T, r, sigma, q)
+    return float(-np.exp(-q * T) * norm.pdf(d1) * d2 / sigma)
+
+
+def bs_vomma(S, K, T, r, sigma, q=SPX_DIV_YIELD):
+    """Vomma (Volga) = dVega/dVol.  Convexity of vega wrt implied vol."""
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1, d2 = _bs_d1d2(S, K, T, r, sigma, q)
+    vega   = S * np.exp(-q * T) * norm.pdf(d1) * np.sqrt(T)
+    return float(vega * d1 * d2 / sigma)
+
+
+
+def bs_rho(S, K, T, r, sigma, flag, q=SPX_DIV_YIELD):
+    """Rho = dV/dr per 1 basis point (0.01% rate change).
+
+    Material for positions held >60d with rates at 5%.
+    Call rho positive (higher rates → higher call value via forward).
+    Put rho negative.  Expressed as $ change per 1bp.
+    """
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    _, d2 = _bs_d1d2(S, K, T, r, sigma, q)
+    if flag == 'c':
+        return float(K * T * np.exp(-r * T) * norm.cdf(d2)  / 100.0)
+    else:
+        return float(-K * T * np.exp(-r * T) * norm.cdf(-d2) / 100.0)
+
+
+def bs_greeks_vectorized(S, K, T, r, sigma, flag, q=SPX_DIV_YIELD):
+    """Vectorized BSM delta and gamma with continuous dividend yield."""
+    K     = np.asarray(K,     dtype=float)
+    T     = np.asarray(T,     dtype=float)
     sigma = np.asarray(sigma, dtype=float)
-    flag = np.asarray(flag)
+    flag  = np.asarray(flag)
 
     delta = np.zeros_like(K, dtype=float)
     gamma = np.zeros_like(K, dtype=float)
@@ -78,15 +148,13 @@ def bs_greeks_vectorized(S, K, T, r, sigma, flag):
     if not np.any(valid):
         return delta, gamma
 
-    sqrt_T = np.sqrt(T[valid])
-    d1 = (np.log(S / K[valid]) + (r + 0.5 * sigma[valid] ** 2) * T[valid]) / (sigma[valid] * sqrt_T)
-    cdf_d1 = norm.cdf(d1)
+    sqT   = np.sqrt(T[valid])
+    d1    = (np.log(S / K[valid]) + (r - q + 0.5 * sigma[valid]**2) * T[valid]) / (sigma[valid] * sqT)
+    disc  = np.exp(-q * T[valid])
+    cdfD1 = norm.cdf(d1)
 
-    delta_valid = np.where(flag[valid] == 'c', cdf_d1, cdf_d1 - 1.0)
-    gamma_valid = norm.pdf(d1) / (S * sigma[valid] * sqrt_T)
-
-    delta[valid] = delta_valid
-    gamma[valid] = gamma_valid
+    delta[valid] = np.where(flag[valid] == 'c', disc * cdfD1, disc * (cdfD1 - 1.0))
+    gamma[valid] = disc * norm.pdf(d1) / (S * sigma[valid] * sqT)
     return delta, gamma
 
 
@@ -359,6 +427,70 @@ def fetch_barchart_spot(session: requests.Session, ticker: str) -> float:
 _FETCH_ATTEMPTS   = 3
 _FETCH_DELAY      = 0.1   # seconds between expiration requests
 _FETCH_TIMEOUT    = 15    # seconds per request
+
+
+
+def compute_implied_div_yield(data: pd.DataFrame, S: float,
+                               r: float = RISK_FREE_RATE) -> dict:
+    """Implied dividend yield per expiry via put-call parity on the ATM pair.
+
+    C - P = S·e^{-qT} - K·e^{-rT}   →   q = -ln((C-P + K·e^{-rT}) / S) / T
+
+    Uses the strike closest to spot for each expiry.  Falls back to the
+    constant SPX_DIV_YIELD on any numerical failure.
+    """
+    q_map = {}
+    for exp, grp in data.groupby('expiry'):
+        T = float(grp['T_years'].iloc[0]) if 'T_years' in grp.columns else 0.0
+        if T <= 0:
+            q_map[exp] = SPX_DIV_YIELD
+            continue
+        calls = grp[grp['flag'] == 'c']
+        puts  = grp[grp['flag'] == 'p']
+        if calls.empty or puts.empty:
+            q_map[exp] = SPX_DIV_YIELD
+            continue
+        # ATM strike
+        K = float(calls.iloc[(calls['strike'] - S).abs().argsort().iloc[0]]['strike'])
+        c_rows = calls[calls['strike'] == K]
+        p_rows = puts[puts['strike'] == K]
+        if c_rows.empty or p_rows.empty:
+            q_map[exp] = SPX_DIV_YIELD
+            continue
+        C = float(c_rows['mid'].iloc[0])
+        P = float(p_rows['mid'].iloc[0])
+        if C <= 0 or P <= 0:
+            q_map[exp] = SPX_DIV_YIELD
+            continue
+        try:
+            rhs = C - P + K * np.exp(-r * T)
+            if rhs <= 0 or rhs >= S * 2:
+                q_map[exp] = SPX_DIV_YIELD
+                continue
+            q_impl = -np.log(rhs / S) / T
+            q_map[exp] = float(np.clip(q_impl, -0.01, 0.06))
+        except Exception:
+            q_map[exp] = SPX_DIV_YIELD
+    return q_map
+
+
+def validate_iv(data: pd.DataFrame) -> pd.DataFrame:
+    """IV sanity filter: remove contracts with clearly erroneous volatility.
+
+    Hard bounds: IV < 0.5% or IV > 500%.
+    Soft outlier: per-expiry IV > median + 5×IQR (fat-tailed upper bound).
+    Removes ~0.5-2% of contracts from typical SPX chains.
+    """
+    data = data[(data['iv'] >= 0.005) & (data['iv'] <= 5.0)].copy()
+    cleaned = []
+    for _, grp in data.groupby('expiry', sort=False):
+        iv_med = grp['iv'].median()
+        iv_iqr = max(grp['iv'].quantile(0.75) - grp['iv'].quantile(0.25), 0.01)
+        upper  = iv_med + 5.0 * iv_iqr
+        cleaned.append(grp[grp['iv'] <= upper])
+    if not cleaned:
+        return data
+    return pd.concat(cleaned).reset_index(drop=True)
 
 
 def fetch_intraday_history(ticker: str, interval_min: int = 5) -> pd.DataFrame:
@@ -815,21 +947,86 @@ def fetch_options_data(ticker: str, r: float = RISK_FREE_RATE,
     data.dropna(subset=['iv'], inplace=True)
     data = data[data['iv'] > 0].copy()
 
+    # ── IV consistency check (removes stale/erroneous quotes) ─────────────
+    n_before = len(data)
+    data = validate_iv(data)
+    n_dropped = n_before - len(data)
+    if n_dropped > 0:
+        print(f'  IV filter: removed {n_dropped} anomalous contracts '
+              f'({n_dropped/n_before*100:.1f}%)')
+
+    # ── Dynamic dividend yield via put-call parity (per expiry) ───────────
+    # Compute q for each expiry from ATM call-put pair before running BS.
+    # Falls back to SPX_DIV_YIELD constant if parity fails.
+    data['mid']  = data[['bid', 'ask']].mean(axis=1, skipna=True)   # ensure mid exists
+    q_by_expiry  = compute_implied_div_yield(data, S, r)
+    data['q_impl'] = data['expiry'].map(q_by_expiry).fillna(SPX_DIV_YIELD)
+    q_implied_mean = data['q_impl'].mean()
+    print(f'  Implied div yield: mean q = {q_implied_mean*100:.2f}% '
+          f'(vs constant {SPX_DIV_YIELD*100:.1f}%)')
+
     notify(93, f'Computing Greeks for {ticker} ...')
-    delta_calc, gamma_calc = bs_greeks_vectorized(
-        S,
-        data['strike'].to_numpy(),
-        data['T_years'].to_numpy(),
-        r,
-        data['iv'].to_numpy(),
-        data['flag'].to_numpy(),
-    )
+    # Use per-contract implied dividend yield (fallback = SPX_DIV_YIELD)
+    q_arr = data['q_impl'].to_numpy(dtype=float)
+
+    delta_calc = np.zeros(len(data))
+    gamma_calc = np.zeros(len(data))
+    Kv  = data['strike'].to_numpy(dtype=float)
+    Tv  = data['T_years'].to_numpy(dtype=float)
+    sv  = data['iv'].to_numpy(dtype=float)
+    flv = data['flag'].to_numpy()
+    valid_bs = (Tv > 0) & (sv > 0) & np.isfinite(Kv) & np.isfinite(sv)
+    if np.any(valid_bs):
+        sqT_v  = np.sqrt(Tv[valid_bs])
+        d1_v   = (np.log(S / Kv[valid_bs])
+                  + (r - q_arr[valid_bs] + 0.5*sv[valid_bs]**2)*Tv[valid_bs]
+                  ) / (sv[valid_bs] * sqT_v)
+        disc_v = np.exp(-q_arr[valid_bs] * Tv[valid_bs])
+        cdf_d1 = norm.cdf(d1_v)
+        delta_calc[valid_bs] = np.where(
+            flv[valid_bs] == 'c', disc_v * cdf_d1, disc_v * (cdf_d1 - 1.0))
+        gamma_calc[valid_bs] = disc_v * norm.pdf(d1_v) / (S * sv[valid_bs] * sqT_v)
+
     delta_available = data['delta_barchart'].notna()
     data['delta'] = np.where(delta_available, data['delta_barchart'], delta_calc)
     data['gamma'] = gamma_calc
     data['dex']   = data['delta'] * data['openInterest'] * 100
     sign          = data['flag'].map({'c': 1, 'p': -1})
     data['gex']   = sign * data['gamma'] * data['openInterest'] * 100 * S
+
+    # ── Charm, Vanna, Rho per contract ────────────────────────────────────
+    charm_arr = np.zeros(len(data))
+    vanna_arr = np.zeros(len(data))
+    rho_arr   = np.zeros(len(data))
+    if np.any(valid_bs):
+        sqT   = np.sqrt(Tv[valid_bs])
+        qv    = q_arr[valid_bs]
+        d1v   = (np.log(S / Kv[valid_bs]) + (r - qv + 0.5*sv[valid_bs]**2)*Tv[valid_bs]) / (sv[valid_bs]*sqT)
+        d2v   = d1v - sv[valid_bs] * sqT
+        nd1   = norm.pdf(d1v)
+        disc  = np.exp(-qv * Tv[valid_bs])
+        # Charm
+        inner = 2.0*(r - qv)*Tv[valid_bs] - d2v*sv[valid_bs]*sqT
+        term  = disc * nd1 * inner / (2.0*Tv[valid_bs]*sv[valid_bs]*sqT)
+        call_m = flv[valid_bs] == 'c'
+        charm_arr[valid_bs] = np.where(call_m,
+            -term + qv*disc*norm.cdf(d1v),
+            -term - qv*disc*norm.cdf(-d1v))
+        # Vanna
+        vanna_arr[valid_bs] = -disc * nd1 * d2v / sv[valid_bs]
+        # Rho (per 1bp)
+        disc_r = np.exp(-r * Tv[valid_bs])
+        rho_arr[valid_bs] = np.where(call_m,
+            Kv[valid_bs]*Tv[valid_bs]*disc_r*norm.cdf(d2v)  / 100.0,
+            -Kv[valid_bs]*Tv[valid_bs]*disc_r*norm.cdf(-d2v) / 100.0)
+
+    data['charm']     = charm_arr
+    data['vanna']     = vanna_arr
+    data['rho']       = rho_arr
+    data['charm_exp'] = data['charm'] * data['openInterest'] * 100 * S
+    data['vanna_exp'] = data['vanna'] * data['openInterest'] * 100 * S
+    data['rho_exp']   = data['rho']   * data['openInterest'] * 100   # $ per 1bp rate move
+    data['gross_gex'] = data['gamma'] * data['openInterest'] * 100 * S
 
     notify(96, f'Computed Greeks — {len(data):,} contracts across {data["expiry"].nunique()} expiries')
     print(f'  Loaded {len(data):,} contracts across {data["expiry"].nunique()} expiries.')
@@ -847,23 +1044,21 @@ def fetch_options_data(ticker: str, r: float = RISK_FREE_RATE,
 
 
 def aggregate_by_strike(data: pd.DataFrame):
-    """Roll up DEX and GEX to per-strike totals — fully vectorised.
-
-    The previous implementation used per-group lambdas that re-indexed into
-    the full DataFrame on every group (O(n × n_groups)).  With 16 k contracts
-    across ~200 strikes that ran millions of index lookups on every 1.5-second
-    interval tick.  This version uses three plain groupby-sum calls and a join,
-    which is O(n) total and completes in single-digit milliseconds.
-    """
+    """Roll up DEX, GEX, charm, vanna, gross_gex to per-strike totals (vectorised)."""
     calls  = (data[data['flag'] == 'c']
                .groupby('strike', sort=True)
                .agg(call_dex=('dex', 'sum'), call_gex=('gex', 'sum')))
     puts   = (data[data['flag'] == 'p']
                .groupby('strike', sort=True)
                .agg(put_dex=('dex', 'sum'), put_gex=('gex', 'sum')))
-    totals = (data.groupby('strike', sort=True)
-               .agg(net_dex=('dex', 'sum'), net_gex=('gex', 'sum'),
-                    total_oi=('openInterest', 'sum')))
+    # Extra greek exposures — guard if columns absent (old cached CSVs)
+    agg_dict = dict(net_dex=('dex','sum'), net_gex=('gex','sum'),
+                    total_oi=('openInterest','sum'))
+    for col, alias in [('charm_exp','charm_exp'), ('vanna_exp','vanna_exp'),
+                       ('gross_gex','gross_gex')]:
+        if col in data.columns:
+            agg_dict[alias] = (col, 'sum')
+    totals = data.groupby('strike', sort=True).agg(**agg_dict)
     return (totals.join(calls, how='left')
                   .join(puts,  how='left')
                   .fillna(0)
@@ -1020,6 +1215,239 @@ def get_put_monitor(raw_df: pd.DataFrame, spot: float,
               .reset_index(drop=True))
 
 
+
+
+def backtest_har_oos(ohlc: pd.DataFrame,
+                     train_frac: float = 0.60,
+                     trading_periods: int = 252) -> dict:
+    """HAR-RV expanding-window out-of-sample validation.
+
+    Fits HAR on the first train_frac of data, then forecasts one-step-ahead
+    on the remaining (1 - train_frac) observations.  Returns RMSE, MAE,
+    directional accuracy, and R² oos.
+    """
+    if ohlc is None or ohlc.empty or len(ohlc) < 60:
+        return {}
+    work = ohlc.set_index('date') if 'date' in ohlc.columns else ohlc
+    rv   = rvol_yang_zhang(work, window=5, trading_periods=trading_periods).dropna() * 100
+    rv_d = rv
+    rv_w = rv.rolling(5).mean()
+    rv_m = rv.rolling(22).mean()
+    df   = pd.DataFrame({'rv': rv, 'd': rv_d, 'w': rv_w, 'm': rv_m}).dropna()
+    if len(df) < 40:
+        return {}
+
+    n_train = max(30, int(len(df) * train_frac))
+    actuals, forecasts = [], []
+    for i in range(n_train, len(df) - 1):
+        sub = df.iloc[:i]
+        X   = np.column_stack([np.ones(len(sub)-1),
+                                sub['d'].values[:-1],
+                                sub['w'].values[:-1],
+                                sub['m'].values[:-1]])
+        y   = sub['rv'].values[1:]
+        try:
+            beta = np.linalg.lstsq(X, y, rcond=None)[0]
+            last = df.iloc[i]
+            fct  = float(np.clip(beta[0] + beta[1]*last['d']
+                                  + beta[2]*last['w'] + beta[3]*last['m'], 1.0, 150.0))
+            actuals.append(float(df.iloc[i+1]['rv']))
+            forecasts.append(fct)
+        except Exception:
+            continue
+
+    if len(actuals) < 10:
+        return {}
+    actuals   = np.array(actuals)
+    forecasts = np.array(forecasts)
+    errors    = actuals - forecasts
+    rmse      = float(np.sqrt(np.mean(errors**2)))
+    mae       = float(np.mean(np.abs(errors)))
+    dir_acc   = float(np.mean(np.sign(np.diff(actuals))
+                               == np.sign(np.diff(forecasts))))
+    ss_res    = float(np.sum(errors**2))
+    ss_tot    = float(np.sum((actuals - actuals.mean())**2))
+    r2_oos    = float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+    bench_rmse = float(np.sqrt(np.mean((actuals - actuals.mean())**2)))
+    return {
+        'n_oos':      len(actuals),
+        'rmse':       rmse,
+        'mae':        mae,
+        'dir_acc':    dir_acc,
+        'r2_oos':     r2_oos,
+        'vs_mean':    rmse < bench_rmse,
+        'bench_rmse': bench_rmse,
+    }
+
+
+def backtest_vol_premium(rvol_df: pd.DataFrame,
+                          vix_df: pd.DataFrame,
+                          threshold: float = 5.0,
+                          horizons: list = None) -> dict:
+    """Vol premium capture analysis.
+
+    For each historical day where VIX - RVol_Yang_Zhang > threshold (%),
+    compute the average forward RVol over the next N trading days.
+    Tests whether elevated vol premium predicts subsequent mean-reversion.
+
+    Returns dict with results per horizon.
+    """
+    if horizons is None:
+        horizons = [5, 10, 22]
+    if rvol_df is None or rvol_df.empty or vix_df is None or vix_df.empty:
+        return {}
+
+    # Align on common dates
+    yz   = rvol_df['Yang-Zhang'] if 'Yang-Zhang' in rvol_df.columns else pd.Series(dtype=float)
+    if yz.empty:
+        return {}
+    vix_s = vix_df.set_index('date')['vix'] * 100
+    combined = pd.DataFrame({'rv': yz, 'vix': vix_s}).dropna()
+    if len(combined) < 30:
+        return {}
+    combined['premium'] = combined['vix'] - combined['rv']
+    signal_days = combined.index[combined['premium'] >= threshold]
+    if len(signal_days) < 5:
+        return {'signal_days': 0}
+
+    results = {'signal_days': len(signal_days), 'threshold_pct': threshold}
+    for h in horizons:
+        forward_rv, forward_vix = [], []
+        for d in signal_days:
+            future = combined.loc[d:].iloc[1:h+1]
+            if len(future) >= h // 2:
+                forward_rv.append(float(future['rv'].mean()))
+                forward_vix.append(float(future['vix'].mean()))
+        if forward_rv:
+            avg_rv  = float(np.mean(forward_rv))
+            avg_vix = float(np.mean(forward_vix))
+            results[f'h{h}_avg_rv']      = avg_rv
+            results[f'h{h}_avg_vix']     = avg_vix
+            results[f'h{h}_rv_gt_start'] = float(np.mean(
+                [r > float(combined.loc[d, 'rv']) for r, d in zip(forward_rv, signal_days)
+                 if d in combined.index]))
+    return results
+
+
+def compute_max_pain(raw_df: pd.DataFrame, expiry: str = None) -> dict:
+    """Max Pain per scadenza: strike che minimizza il totale payout agli option buyer.
+
+    Per ogni candidato strike K, somma:
+      Σ_{K' < K} (K-K') * call_OI[K']   (ITM call payout)
+    + Σ_{K' > K} (K'-K) * put_OI[K']    (ITM put payout)
+    Restituisce il K con payout minimo = Max Pain (i dealer "vincono" di più lì).
+    """
+    df = raw_df[raw_df['expiry'] == expiry].copy() if expiry else raw_df.copy()
+    if df.empty:
+        return {}
+    results = {}
+    for exp in df['expiry'].unique():
+        sub   = df[df['expiry'] == exp]
+        calls = sub[sub['flag']=='c'].groupby('strike')['openInterest'].sum()
+        puts  = sub[sub['flag']=='p'].groupby('strike')['openInterest'].sum()
+        strikes = sorted(set(calls.index) | set(puts.index))
+        if len(strikes) < 3:
+            continue
+        pain = {}
+        for K in strikes:
+            c_pain = sum(max(K - k, 0) * oi for k, oi in calls.items())
+            p_pain = sum(max(k - K, 0) * oi for k, oi in puts.items())
+            pain[K] = c_pain + p_pain
+        results[exp] = float(min(pain, key=pain.get))
+    return results
+
+
+def compute_pc_ratio(raw_df: pd.DataFrame, expiry: str = None) -> dict:
+    """Put/Call OI ratio — proxy del sentiment.
+
+    > 1.0  →  più put aperte (lean ribassista)
+    < 1.0  →  più call aperte (lean rialzista)
+    ~1.0   →  posizionamento neutro
+    """
+    df = raw_df[raw_df['expiry'] == expiry].copy() if expiry else raw_df.copy()
+    if df.empty:
+        return {'ratio': None, 'put_oi': 0, 'call_oi': 0}
+    call_oi = float(df[df['flag']=='c']['openInterest'].sum())
+    put_oi  = float(df[df['flag']=='p']['openInterest'].sum())
+    ratio   = (put_oi / call_oi) if call_oi > 0 else None
+    return {'ratio': ratio, 'put_oi': put_oi, 'call_oi': call_oi}
+
+
+def compute_har_rv(ohlc: pd.DataFrame,
+                   trading_periods: int = 252) -> dict:
+    """HAR-RV (Corsi 2009) — 1-day ahead realized vol forecast.
+
+    RV_{t+1} = α + β_d·RV_d + β_w·RV_w + β_m·RV_m
+    RV_d = daily Yang-Zhang RVol (window=1 proxy: abs log-return × √252)
+    RV_w = 5-day mean of RV_d
+    RV_m = 22-day mean of RV_d
+
+    Returns dict with forecast (%), R², and coefficients.
+    """
+    if ohlc is None or ohlc.empty or len(ohlc) < 30:
+        return {}
+    # Use 1-day rolling Yang-Zhang as the base RV series
+    rv = rvol_yang_zhang(ohlc, window=5, trading_periods=trading_periods).dropna() * 100
+    if len(rv) < 30:
+        return {}
+    rv_d = rv
+    rv_w = rv.rolling(5).mean()
+    rv_m = rv.rolling(22).mean()
+    data = pd.DataFrame({'rv': rv, 'rv_d': rv_d, 'rv_w': rv_w, 'rv_m': rv_m}).dropna()
+    if len(data) < 25:
+        return {}
+    X = np.column_stack([np.ones(len(data)-1),
+                          data['rv_d'].values[:-1],
+                          data['rv_w'].values[:-1],
+                          data['rv_m'].values[:-1]])
+    y = data['rv'].values[1:]
+    try:
+        beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        alpha, b_d, b_w, b_m = beta
+        last        = data.iloc[-1]
+        forecast    = float(np.clip(alpha + b_d*last['rv_d']
+                                    + b_w*last['rv_w'] + b_m*last['rv_m'], 1.0, 150.0))
+        y_hat       = X @ beta
+        residuals   = y - y_hat
+        sigma_resid = float(np.std(residuals, ddof=4))  # ddof=4 for 4 params
+        ss_res      = float(np.sum(residuals**2))
+        ss_tot      = float(np.sum((y - y.mean())**2))
+        r2          = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+        return {
+            'forecast':  forecast,
+            'ci_68_lo':  float(np.clip(forecast - sigma_resid,   1.0, 150.0)),
+            'ci_68_hi':  float(np.clip(forecast + sigma_resid,   1.0, 150.0)),
+            'ci_95_lo':  float(np.clip(forecast - 2*sigma_resid, 1.0, 150.0)),
+            'ci_95_hi':  float(np.clip(forecast + 2*sigma_resid, 1.0, 150.0)),
+            'sigma_resid': sigma_resid,
+            'r2':        r2,
+            'alpha':     float(alpha), 'b_d': float(b_d),
+            'b_w':       float(b_w),  'b_m': float(b_m),
+        }
+    except Exception:
+        return {}
+
+
+def detect_vol_regime(rvol_series: pd.Series,
+                       lookback: int = 252) -> tuple:
+    """Volatility regime via rolling z-score of Yang-Zhang RVol.
+
+    Returns (regime_str, z_score) where regime_str ∈ {'HIGH', 'NORMAL', 'LOW'}.
+    Thresholds: |z| > 1.5  →  HIGH / LOW;  else NORMAL.
+    """
+    if rvol_series is None or len(rvol_series) < 10:
+        return 'NORMAL', 0.0
+    hist    = rvol_series.tail(lookback).dropna()
+    current = float(hist.iloc[-1])
+    mean    = float(hist.mean())
+    std     = float(hist.std())
+    if std == 0:
+        return 'NORMAL', 0.0
+    z = (current - mean) / std
+    regime = 'HIGH' if z > 1.5 else ('LOW' if z < -1.5 else 'NORMAL')
+    return regime, float(z)
+
+
 def compute_0dte_metrics(raw_df: pd.DataFrame, spot: float) -> dict:
     """Compute key metrics for the 0DTE (today's expiry) chain.
 
@@ -1072,6 +1500,15 @@ def compute_0dte_metrics(raw_df: pd.DataFrame, spot: float) -> dict:
         exp_move_pts = spot * atm_iv * np.sqrt(1 / 252)
         exp_move_pct = atm_iv / np.sqrt(252) * 100
 
+    max_pain_map = compute_max_pain(dte0)
+    max_pain_0dte = max_pain_map.get(dte0['expiry'].iloc[0]) if not dte0.empty else None
+    pc_0dte = compute_pc_ratio(dte0)
+
+    # Charm and Vanna exposure (requires charm_exp / vanna_exp columns from fetch)
+    charm_total = float(dte0['charm_exp'].sum()) if 'charm_exp' in dte0.columns else None
+    vanna_total = float(dte0['vanna_exp'].sum()) if 'vanna_exp' in dte0.columns else None
+    gross_gex_0 = float(dte0['gross_gex'].sum()) if 'gross_gex' in dte0.columns else None
+
     return {
         'atm_iv':         atm_iv,
         'exp_move_pts':   exp_move_pts,
@@ -1080,6 +1517,13 @@ def compute_0dte_metrics(raw_df: pd.DataFrame, spot: float) -> dict:
         'max_gex_strike': max_gex_strike,
         'total_gex':      float(dte0['gex'].sum()),
         'total_dex':      float(dte0['dex'].sum()),
+        'gross_gex':      gross_gex_0,
+        'charm_exp':      charm_total,       # $·yr⁻¹ — daily delta bleed if /252
+        'vanna_exp':      vanna_total,       # $ per 1pt vol move
+        'max_pain':       max_pain_0dte,
+        'pc_ratio':       pc_0dte.get('ratio'),
+        'put_oi':         pc_0dte.get('put_oi', 0),
+        'call_oi':        pc_0dte.get('call_oi', 0),
         'n_contracts':    len(dte0),
         'by_strike':      bs_0dte,
         'raw':            dte0,
@@ -1175,6 +1619,328 @@ def base_layout(title='', height=420):
         legend=dict(bgcolor='rgba(0,0,0,0)',
                     font=dict(size=11, color=TEXT_COL)),
     )
+
+
+
+# ── Alert flag levels ──────────────────────────────────────────────────────────
+_AL_RED   = 'RED'
+_AL_AMBER = 'AMBER'
+_AL_GREEN = 'GREEN'
+_AL_GREY  = 'GREY'
+
+def build_alert_flags(raw_df, spot, dte0_metrics=None,
+                      rvol_df=None, vix_hist=None) -> list:
+    """Build a structured list of alert flags for the dashboard alert panel.
+
+    Each alert is a dict:
+      name, status (RED|AMBER|GREEN|GREY), value, threshold, detail
+    """
+    flags = []
+
+    # 1. Gamma Regime — spot vs 0DTE GEX Flip
+    flip = (dte0_metrics or {}).get('gex_flip')
+    if flip and spot:
+        dist_pct = (spot - flip) / spot * 100
+        if spot < flip:
+            flags.append(dict(name='Gamma Regime', status=_AL_RED,
+                value=f'SHORT', threshold=f'Flip ${flip:,.0f}',
+                detail=f'Spot {dist_pct:+.2f}% dal flip → amplificante'))
+        elif abs(dist_pct) < 0.5:
+            flags.append(dict(name='Gamma Regime', status=_AL_AMBER,
+                value='NEAR FLIP', threshold=f'Flip ${flip:,.0f}',
+                detail=f'Zona transizione (Δ={abs(spot-flip):.0f}pt)'))
+        else:
+            flags.append(dict(name='Gamma Regime', status=_AL_GREEN,
+                value='LONG γ', threshold=f'Flip ${flip:,.0f}',
+                detail=f'Spot {dist_pct:+.2f}% sopra flip → stabilizzante'))
+    else:
+        flags.append(dict(name='Gamma Regime', status=_AL_GREY,
+            value='N/D', threshold='—', detail='Carica 0DTE'))
+
+    # 2. P/C Ratio
+    pc = (dte0_metrics or {}).get('pc_ratio')
+    if pc is not None:
+        if pc > 1.3:
+            st_pc = _AL_RED
+        elif pc > 1.1 or pc < 0.8:
+            st_pc = _AL_AMBER
+        else:
+            st_pc = _AL_GREEN
+        lean = 'PUT-heavy' if pc > 1.1 else ('CALL-heavy' if pc < 0.9 else 'Neutro')
+        flags.append(dict(name='P/C OI Ratio', status=st_pc,
+            value=f'{pc:.2f}', threshold='1.0 = neutro',
+            detail=lean))
+    else:
+        flags.append(dict(name='P/C OI Ratio', status=_AL_GREY,
+            value='N/D', threshold='—', detail='Carica 0DTE'))
+
+    # 3. Vol Premium (VIX − RVol)
+    last_vix = None
+    last_rv  = None
+    if vix_hist is not None and isinstance(vix_hist, pd.DataFrame) and not vix_hist.empty:
+        last_vix = float(vix_hist['vix'].iloc[-1] * 100)
+    if rvol_df is not None and isinstance(rvol_df, pd.DataFrame) and not rvol_df.empty:
+        col = 'Yang-Zhang' if 'Yang-Zhang' in rvol_df.columns else rvol_df.columns[0]
+        last_rv = float(rvol_df[col].iloc[-1])
+    if last_vix and last_rv:
+        prem = last_vix - last_rv
+        if prem > 8:
+            st_vp = _AL_GREEN   # verde = buono per vol seller
+        elif prem > 3:
+            st_vp = _AL_AMBER
+        elif prem < -3:
+            st_vp = _AL_RED     # vol selling in perdita
+        else:
+            st_vp = _AL_AMBER
+        flags.append(dict(name='Vol Premium', status=st_vp,
+            value=f'{prem:+.1f}%',
+            threshold='VIX − RVol(126d)',
+            detail=f'VIX {last_vix:.1f}% / RVol {last_rv:.1f}%'))
+    else:
+        flags.append(dict(name='Vol Premium', status=_AL_GREY,
+            value='N/D', threshold='—', detail='Carica RVol'))
+
+    # 4. ATM IV 0DTE
+    atm_iv = (dte0_metrics or {}).get('atm_iv')
+    if atm_iv:
+        iv_pct = atm_iv * 100
+        if iv_pct > 30:
+            st_iv = _AL_RED
+        elif iv_pct > 20:
+            st_iv = _AL_AMBER
+        else:
+            st_iv = _AL_GREEN
+        flags.append(dict(name='0DTE ATM IV', status=st_iv,
+            value=f'{iv_pct:.1f}%',
+            threshold='<20% normale',
+            detail='IV implicita scadenza odierna'))
+    else:
+        flags.append(dict(name='0DTE ATM IV', status=_AL_GREY,
+            value='N/D', threshold='—', detail='Nessuna 0DTE'))
+
+    # 5. Expected Move vs 0DTE IV
+    em = (dte0_metrics or {}).get('exp_move_pct')
+    if em:
+        if em > 2.0:
+            st_em = _AL_RED
+        elif em > 1.2:
+            st_em = _AL_AMBER
+        else:
+            st_em = _AL_GREEN
+        flags.append(dict(name='Expected Move', status=st_em,
+            value=f'±{em:.2f}%',
+            threshold='<1.2% bassa', detail='Movimento giornaliero atteso'))
+    else:
+        flags.append(dict(name='Expected Move', status=_AL_GREY,
+            value='N/D', threshold='—', detail='Nessuna 0DTE'))
+
+    # 6. Vanna Exposure (systemic vol→spot risk)
+    vanna_exp = (dte0_metrics or {}).get('vanna_exp')
+    if vanna_exp is not None:
+        vanna_m = vanna_exp / 1e9
+        if abs(vanna_m) > 5:
+            st_va = _AL_RED
+        elif abs(vanna_m) > 2:
+            st_va = _AL_AMBER
+        else:
+            st_va = _AL_GREEN
+        direction = 'Dealer COMPRA su spike vol' if vanna_m < 0 else 'Dealer VENDE su spike vol'
+        flags.append(dict(name='Vanna Exp (0DTE)', status=st_va,
+            value=f'${vanna_m:+.1f}B',
+            threshold='|>$2B| = rilevante',
+            detail=direction))
+    else:
+        flags.append(dict(name='Vanna Exp (0DTE)', status=_AL_GREY,
+            value='N/D', threshold='—', detail='Nessuna 0DTE'))
+
+    return flags
+
+
+
+def bs_speed(S, K, T, r, sigma, q=SPX_DIV_YIELD):
+    """Speed = dGamma/dSpot = third derivative of option value.
+
+    Measures how quickly gamma changes as the underlying moves.
+    High speed near a strike = GEX profile will shift rapidly with spot.
+    Units: gamma per unit of spot movement.
+    """
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1, _ = _bs_d1d2(S, K, T, r, sigma, q)
+    gamma  = bs_gamma(S, K, T, r, sigma, q)
+    return float(-gamma / S * (d1 / (sigma * np.sqrt(T)) + 1.0))
+
+
+def compute_gex_profile(raw_df: pd.DataFrame,
+                         spot: float,
+                         shifts: list = None,
+                         r: float = RISK_FREE_RATE) -> pd.DataFrame:
+    """Conditional GEX at different spot levels (keeping IV and OI fixed).
+
+    Shows how the net GEX regime changes as the underlying moves.
+    Essential for knowing where the next flip will occur if market moves.
+
+    Parameters
+    ----------
+    raw_df  : full options chain DataFrame
+    spot    : current spot price
+    shifts  : list of fractional spot shifts, e.g. [-0.03, -0.02, ..., 0.03]
+    r       : risk-free rate
+
+    Returns
+    -------
+    DataFrame with columns: spot_level, net_gex, gross_gex, regime
+    """
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+    if shifts is None:
+        shifts = [-0.05, -0.04, -0.03, -0.02, -0.01, 0.0,
+                   0.01,  0.02,  0.03,  0.04,  0.05]
+
+    Kv   = raw_df['strike'].to_numpy(dtype=float)
+    Tv   = raw_df['T_years'].to_numpy(dtype=float)
+    sv   = raw_df['iv'].to_numpy(dtype=float)
+    flv  = raw_df['flag'].to_numpy()
+    oiv  = raw_df['openInterest'].to_numpy(dtype=float)
+    qv   = raw_df.get('q_impl', pd.Series(SPX_DIV_YIELD, index=raw_df.index)
+                       ).to_numpy(dtype=float)
+    sign = np.where(flv == 'c', 1.0, -1.0)
+
+    valid = (Tv > 0) & (sv > 0) & np.isfinite(Kv) & np.isfinite(sv)
+    rows  = []
+    for sh in shifts:
+        S_new  = spot * (1.0 + sh)
+        gamma_arr = np.zeros(len(raw_df))
+        if np.any(valid):
+            sqT  = np.sqrt(Tv[valid])
+            d1   = (np.log(S_new / Kv[valid])
+                    + (r - qv[valid] + 0.5*sv[valid]**2)*Tv[valid]
+                    ) / (sv[valid]*sqT)
+            disc = np.exp(-qv[valid]*Tv[valid])
+            gamma_arr[valid] = disc * norm.pdf(d1) / (S_new * sv[valid] * sqT)
+
+        gex_arr   = sign * gamma_arr * oiv * 100 * S_new
+        net_gex   = float(gex_arr.sum())
+        gross_gex = float(np.abs(gex_arr).sum())
+        rows.append({
+            'shift_pct':  sh * 100,
+            'spot_level': S_new,
+            'net_gex':    net_gex,
+            'gross_gex':  gross_gex,
+            'regime':     'LONG γ' if net_gex >= 0 else 'SHORT γ',
+        })
+    return pd.DataFrame(rows)
+
+
+def compute_gex_analytics(raw_df: pd.DataFrame,
+                            by_strike_df: pd.DataFrame,
+                            spot: float) -> dict:
+    """Advanced GEX metrics beyond net/gross totals.
+
+    Returns
+    -------
+    dict with:
+      center_of_mass   : strike where |GEX| is gravitationally centred ($ weighted)
+      hhi              : Herfindahl-Hirschman Index of GEX concentration [0,1]
+                         0 = perfectly distributed, 1 = all GEX at one strike
+      flip_zone_lo     : lower bound of the flip uncertainty zone (±sigma of zero-crossing)
+      flip_zone_hi     : upper bound
+      impact_1pct      : $ delta hedging required for a 1% spot move
+      impact_5pct      : $ delta hedging required for a 5% spot move
+      top3_strikes     : the three strikes with highest |GEX| (pinning candidates)
+    """
+    if by_strike_df is None or by_strike_df.empty:
+        return {}
+
+    bs = by_strike_df.copy()
+    total_gross = float(bs['gross_gex'].sum()) if 'gross_gex' in bs.columns                   else float(bs['net_gex'].abs().sum())
+    if total_gross == 0:
+        return {}
+
+    # ── Centre of mass (GEX-weighted average strike) ──────────────────────
+    weights = bs['net_gex'].abs()
+    com     = float((bs['strike'] * weights).sum() / weights.sum()) if weights.sum() > 0 else spot
+
+    # ── HHI — concentration index ─────────────────────────────────────────
+    shares = (bs['net_gex'].abs() / total_gross) ** 2
+    hhi    = float(shares.sum())    # 0 = distributed, 1 = concentrated
+
+    # ── Flip zone — strikes where |net_gex| < 10% of peak (ambiguous zone) ─
+    peak   = float(bs['net_gex'].abs().max())
+    fuzzy  = bs[bs['net_gex'].abs() < 0.10 * peak]['strike']
+    flip_zone_lo = float(fuzzy.min()) if not fuzzy.empty else spot
+    flip_zone_hi = float(fuzzy.max()) if not fuzzy.empty else spot
+
+    # ── Dollar impact per move ────────────────────────────────────────────
+    net_gex_total = float(bs['net_gex'].sum())
+    impact_1pct   = abs(net_gex_total * 0.01)   # $ of delta to hedge per 1%
+    impact_5pct   = abs(net_gex_total * 0.05)   # $ of delta to hedge per 5%
+
+    # ── Top 3 pinning candidates ──────────────────────────────────────────
+    top3 = (bs.nlargest(3, 'net_gex', keep='all')['strike']
+              .tolist() if len(bs) >= 3 else bs['strike'].tolist())
+
+    return {
+        'center_of_mass': com,
+        'hhi':            hhi,
+        'flip_zone_lo':   flip_zone_lo,
+        'flip_zone_hi':   flip_zone_hi,
+        'impact_1pct':    impact_1pct,
+        'impact_5pct':    impact_5pct,
+        'top3_strikes':   top3,
+        'net_gex_total':  net_gex_total,
+    }
+
+
+def compute_0dte_gamma_schedule(dte0_raw: pd.DataFrame,
+                                 spot: float,
+                                 r: float = RISK_FREE_RATE,
+                                 session_hours: float = 6.5) -> pd.DataFrame:
+    """Intraday gamma decay schedule for 0DTE options.
+
+    Computes the net GEX at each hour of the trading session, showing how
+    0DTE gamma accelerates toward expiration (the "gamma burn" curve).
+    The gamma explosion in the last 1-2 hours is the core mechanic of
+    0DTE intraday squeezes and pinning.
+
+    Returns DataFrame with columns: time_label, T_hours, net_gex, gross_gex
+    """
+    if dte0_raw is None or dte0_raw.empty:
+        return pd.DataFrame()
+
+    Kv  = dte0_raw['strike'].to_numpy(dtype=float)
+    sv  = dte0_raw['iv'].to_numpy(dtype=float)
+    oiv = dte0_raw['openInterest'].to_numpy(dtype=float)
+    flv = dte0_raw['flag'].to_numpy()
+    qv  = dte0_raw.get('q_impl',
+            pd.Series(SPX_DIV_YIELD, index=dte0_raw.index)).to_numpy(dtype=float)
+    sign = np.where(flv == 'c', 1.0, -1.0)
+
+    # Hours remaining in session from 09:30 to 16:00
+    checkpoints = np.arange(session_hours, 0.0, -1.0).tolist() + [0.25]
+    labels      = [f'{int(9.5 + session_hours - h):02d}:00'
+                    if h >= 1 else '15:45' for h in checkpoints]
+
+    rows = []
+    for h, lbl in zip(checkpoints, labels):
+        T_yr   = max(h / 8760.0, 1e-6)   # hours → years
+        valid  = (sv > 0) & np.isfinite(Kv) & np.isfinite(sv)
+        g_arr  = np.zeros(len(dte0_raw))
+        if np.any(valid):
+            sqT   = np.sqrt(T_yr)
+            d1    = (np.log(spot / Kv[valid])
+                     + (r - qv[valid] + 0.5*sv[valid]**2)*T_yr
+                     ) / (sv[valid]*sqT)
+            disc  = np.exp(-qv[valid]*T_yr)
+            g_arr[valid] = disc * norm.pdf(d1) / (spot * sv[valid] * sqT)
+        gex_arr = sign * g_arr * oiv * 100 * spot
+        rows.append({
+            'time':      lbl,
+            'T_hours':   h,
+            'net_gex':   float(gex_arr.sum()),
+            'gross_gex': float(np.abs(gex_arr).sum()),
+        })
+    return pd.DataFrame(rows)
 
 
 def gex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10,
@@ -2179,12 +2945,19 @@ def rvol_yang_zhang(ohlc: pd.DataFrame, window: int = 30,
 
 def compute_rvol_all(ohlc: pd.DataFrame, window: int = 30,
                      trading_periods: int = 252) -> pd.DataFrame:
-    """All 6 realized vol models in a single DataFrame, values in % (e.g. 15.2)."""
+    """All 6 realized vol models in a single DataFrame, values in % (e.g. 15.2).
+
+    Output index is DatetimeIndex (from ohlc['date'] column if present).
+    """
     if ohlc is None or ohlc.empty or len(ohlc) < window + 5:
         return pd.DataFrame()
+    # Propagate dates as index so output is directly alignable with VIX
+    work = (ohlc.set_index('date')
+            if 'date' in ohlc.columns
+            else ohlc)
     funcs = [rvol_std, rvol_parkinson, rvol_garman_klass,
              rvol_hodges_tompkins, rvol_rogers_satchell, rvol_yang_zhang]
-    return (pd.concat([f(ohlc, window, trading_periods) for f in funcs], axis=1)
+    return (pd.concat([f(work, window, trading_periods) for f in funcs], axis=1)
               .dropna()
               .mul(100))
 

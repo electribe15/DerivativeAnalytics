@@ -8,6 +8,8 @@ warnings.filterwarnings("ignore")
 import os
 import time
 
+import pandas as pd
+import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 
@@ -440,8 +442,9 @@ if "data" in st.session_state and st.session_state["data"].get("raw") is not Non
         _raw_f = _d.get("raw")
     _spot_a = _d.get("spot", 0)
     _dte0_m = compute_0dte_metrics(_raw_f, _spot_a) if _raw_f is not None else {}
-    _rvdf   = compute_rvol_all(_d.get("ohlc_spx", pd.DataFrame()), window=126) \
-              if _d.get("ohlc_spx") is not None else pd.DataFrame()
+    _ohlc_s = _d.get("ohlc_spx")
+    _rvdf   = compute_rvol_all(_ohlc_s, window=126) \
+              if _ohlc_s is not None else None
     _flags  = build_alert_flags(_raw_f, _spot_a, _dte0_m, _rvdf, _d.get("vix_hist"))
 
     _icon   = {'RED':'🔴','AMBER':'🟡','GREEN':'🟢','GREY':'⚪'}
@@ -755,12 +758,26 @@ with tab3:
                             "strike","mid","iv_pct","mid_pct_spot","delta_actual"]].copy()
                 disp.columns = ["Expiry","Tipo","DTE","Δ Target",
                                 "Strike","Mid (pts)","IV %","Mid % Spot","Δ Eff."]
+
+                def _color_mid(col):
+                    """Yellow→Red gradient without matplotlib."""
+                    vals = col.to_numpy(dtype=float)
+                    mn, mx = vals.min(), vals.max()
+                    norm = (vals - mn) / (mx - mn + 1e-9)
+                    colors = []
+                    for v in norm:
+                        r = int(255)
+                        g = int(255 * (1 - v * 0.75))
+                        b = int(max(0, 255 * (1 - v * 1.5)))
+                        colors.append(f'background-color: rgb({r},{g},{b})')
+                    return colors
+
                 st.dataframe(
                     disp.style
                         .format({"Mid (pts)":"{:.2f}", "IV %":"{:.1f}",
                                  "Mid % Spot":"{:.3f}%", "Δ Eff.":"{:.3f}",
                                  "Δ Target":"{:.2f}"})
-                        .background_gradient(subset=["Mid % Spot"], cmap="YlOrRd"),
+                        .apply(_color_mid, subset=["Mid % Spot"]),
                     use_container_width=True,
                     hide_index=True,
                 )

@@ -383,21 +383,76 @@ intraday  = d.get("intraday")
 ohlc_spx  = d.get("ohlc_spx")
 vix_hist  = d.get("vix_hist")
 
-# ── Refresh Intraday (lightweight — no chain re-download) ─────────────────────
+# ── Auto-refresh every 20 minutes (intraday only) ────────────────────────────
+_REFRESH_SEC = 20 * 60   # 20 minutes
+
+try:
+    from streamlit_autorefresh import st_autorefresh as _st_autorefresh
+    _HAS_AUTOREFRESH = True
+except ImportError:
+    _HAS_AUTOREFRESH = False
+
+# Toggle in sidebar — persisted in session_state
 with st.sidebar:
     st.markdown("---")
-    refresh_intra_btn = st.button("🔄 Aggiorna Intraday", use_container_width=True)
-    if intraday is not None and not (intraday.empty if hasattr(intraday,'empty') else True):
-        last_bar = intraday['datetime'].iloc[-1]
-        ts_str   = last_bar.strftime('%H:%M') if hasattr(last_bar, 'strftime') else str(last_bar)
+    _ar_on = st.toggle(
+        "🔄 Auto-refresh intraday (20 min)",
+        value=st.session_state.get("_ar_enabled", False),
+        key="_ar_toggle",
+        help="Aggiorna le barre intraday e il prezzo automaticamente ogni 20 minuti, "
+             "senza ri-scaricare il chain delle opzioni.",
+    )
+    st.session_state["_ar_enabled"] = _ar_on
+
+    # Status row
+    _lar = st.session_state.get("_last_auto_refresh")
+    if _ar_on and _lar:
+        _elapsed   = int((datetime.now() - _lar).total_seconds())
+        _remaining = max(0, _REFRESH_SEC - _elapsed)
+        _mm, _ss   = divmod(_remaining, 60)
+        st.markdown(
+            f"<p style='font-size:10px;color:#818CF8;text-align:center;margin:-6px 0 4px;'>"
+            f"Ultimo: {_lar.strftime('%H:%M:%S')} &nbsp;|&nbsp; "
+            f"Prossimo: {_mm:02d}:{_ss:02d}</p>",
+            unsafe_allow_html=True,
+        )
+    elif _ar_on and not _HAS_AUTOREFRESH:
+        st.warning("streamlit-autorefresh non installato — aggiungi al requirements.txt",
+                   icon="⚠️")
+
+    refresh_intra_btn = st.button("🔄 Aggiorna Intraday ora",
+                                  use_container_width=True,
+                                  disabled="data" not in st.session_state)
+    if intraday is not None and isinstance(intraday, pd.DataFrame) and not intraday.empty:
+        _last_bar = intraday['datetime'].iloc[-1]
+        _ts = _last_bar.strftime('%H:%M') if hasattr(_last_bar, 'strftime') else str(_last_bar)
         st.markdown(f"<p style='font-size:10px;color:#818CF8;text-align:center;"
-                    f"margin-top:-8px;'>intraday last bar: {ts_str}</p>",
+                    f"margin-top:-4px;'>Last bar: {_ts}</p>",
                     unsafe_allow_html=True)
 
+# ── Auto-refresh trigger ──────────────────────────────────────────────────────
+_did_auto_refresh = False
+if _ar_on and _HAS_AUTOREFRESH and "data" in st.session_state:
+    _count = _st_autorefresh(
+        interval=_REFRESH_SEC * 1000,
+        key="ar_intraday_ticker",
+        debounce=False,
+    )
+    if _count > 0:
+        _tick_ar = st.session_state["data"].get("ticker", "$SPX")
+        _new     = fetch_intraday_history(_tick_ar, interval_min=5)
+        if not _new.empty:
+            st.session_state["data"]["intraday"] = _new
+            intraday = _new
+        st.session_state["_last_auto_refresh"] = datetime.now()
+        _did_auto_refresh = True
+
+# ── Manual refresh button ─────────────────────────────────────────────────────
 if refresh_intra_btn and "data" in st.session_state:
     with st.spinner("⏳ Aggiornamento intraday…"):
         new_intra = fetch_intraday_history(cur_tick, interval_min=5)
     st.session_state["data"]["intraday"] = new_intra
+    st.session_state["_last_auto_refresh"] = datetime.now()
     intraday = new_intra
     if not new_intra.empty:
         st.success(f"Intraday aggiornato — {len(new_intra)} barre  |  "

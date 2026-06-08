@@ -3072,23 +3072,53 @@ def rvol_yang_zhang(ohlc: pd.DataFrame, window: int = 30,
     return yz.rename('Yang-Zhang')
 
 
-def compute_rvol_all(ohlc: pd.DataFrame, window: int = 30,
+def rvol_ewma(ohlc: pd.DataFrame,
+              lambda_: float = 0.94,
+              trading_periods: int = 252) -> pd.Series:
+    """EWMA Realized Volatility — RiskMetrics model (J.P. Morgan, 1994).
+
+    σ²_t = λ·σ²_{t-1} + (1−λ)·r²_t
+
+    λ = 0.94 is the daily RiskMetrics standard.  Compared to rolling
+    windows, EWMA weights recent observations exponentially more, making
+    it the most reactive purely-returns-based estimator.  Half-life:
+    ln(0.5)/ln(λ) ≈ 11 days for λ=0.94.
+
+    Useful as the realized-vol counterpart to VIX: when the market
+    spikes, EWMA jumps within 1-3 days vs 2-4 weeks for a 30-day window.
+    """
+    log_ret  = np.log(ohlc['close'] / ohlc['close'].shift(1)).dropna()
+    r2       = log_ret ** 2
+    ewma_var = r2.ewm(alpha=1 - lambda_, adjust=False).mean()
+    return (np.sqrt(ewma_var * trading_periods)).rename(f'EWMA λ={lambda_}')
+
+
+def compute_rvol_all(ohlc: pd.DataFrame, window: int = 126,
                      trading_periods: int = 252) -> pd.DataFrame:
-    """All 6 realized vol models in a single DataFrame, values in % (e.g. 15.2).
+    """All realized vol models in a single DataFrame, values in %.
+
+    Includes the 6 OHLC models at the specified window PLUS reactive estimators:
+    - EWMA (λ=0.94): RiskMetrics — most reactive, half-life ~11 days
+    - Yang-Zhang 5d: short-window, tracks weekly realized vol
+    - Yang-Zhang 21d: one-month, fair comparison to VIX 30d IV
 
     Output index is DatetimeIndex (from ohlc['date'] column if present).
     """
-    if ohlc is None or ohlc.empty or len(ohlc) < window + 5:
+    if ohlc is None or ohlc.empty or len(ohlc) < max(window, 21) + 5:
         return pd.DataFrame()
-    # Propagate dates as index so output is directly alignable with VIX
-    work = (ohlc.set_index('date')
-            if 'date' in ohlc.columns
-            else ohlc)
-    funcs = [rvol_std, rvol_parkinson, rvol_garman_klass,
-             rvol_hodges_tompkins, rvol_rogers_satchell, rvol_yang_zhang]
-    return (pd.concat([f(work, window, trading_periods) for f in funcs], axis=1)
-              .dropna()
-              .mul(100))
+    work = ohlc.set_index('date') if 'date' in ohlc.columns else ohlc
+    parts = [f(work, window, trading_periods)
+             for f in [rvol_std, rvol_parkinson, rvol_garman_klass,
+                       rvol_hodges_tompkins, rvol_rogers_satchell, rvol_yang_zhang]]
+    # Reactive estimators — always computed regardless of main window
+    parts += [
+        rvol_ewma(work, lambda_=0.94,  trading_periods=trading_periods),
+        rvol_yang_zhang(work, window=5,  trading_periods=trading_periods
+                        ).rename('Yang-Zhang 5d'),
+        rvol_yang_zhang(work, window=21, trading_periods=trading_periods
+                        ).rename('Yang-Zhang 21d'),
+    ]
+    return pd.concat(parts, axis=1).dropna().mul(100)
 
 
 def compute_rvol_cones(ohlc: pd.DataFrame,
@@ -3144,51 +3174,81 @@ def compute_intraday_rvol(intraday_df: pd.DataFrame,
 
 # ── Chart builders ─────────────────────────────────────────────────────────
 _RVOL_COLORS = {
-    'Std Dev':         '#6C63FF',
-    'Parkinson':       '#10B981',
-    'Garman-Klass':    '#3B82F6',
-    'Hodges-Tompkins': '#F59E0B',
-    'Rogers-Satchell': '#EC4899',
-    'Yang-Zhang':      '#EAB308',
+    # 6 standard models (muted — background reference)
+    'Std Dev':           '#6C63FF',
+    'Parkinson':         '#10B981',
+    'Garman-Klass':      '#3B82F6',
+    'Hodges-Tompkins':   '#F59E0B',
+    'Rogers-Satchell':   '#EC4899',
+    'Yang-Zhang':        '#EAB308',
+    # Reactive estimators (bold — foreground, key comparison vs VIX)
+    'EWMA λ=0.94':       '#FF6B35',   # vivid orange — most reactive
+    'Yang-Zhang 5d':     '#00C9A7',   # teal — short-window
+    'Yang-Zhang 21d':    '#C77DFF',   # violet — VIX-comparable window
+}
+
+_RVOL_DASH = {
+    'EWMA λ=0.94':     'solid',
+    'Yang-Zhang 5d':   'solid',
+    'Yang-Zhang 21d':  'solid',
+}
+_RVOL_WIDTH = {
+    'EWMA λ=0.94':    2.8,
+    'Yang-Zhang 5d':  1.8,
+    'Yang-Zhang 21d': 2.2,
 }
 
 
 def rvol_models_chart(rvol_df: pd.DataFrame, vix_df: pd.DataFrame,
                       ticker: str = '$SPX'):
-    """All 6 RVol models (% annualized) vs VIX as IV proxy.
-
-    rvol_df: columns = model names, index = date, values in %.
-    vix_df:  columns = ['date', 'vix'] where vix is in decimal (0.14 = 14%).
+    """RVol models vs VIX.  Reactive estimators (EWMA, short-window YZ) are
+    drawn bold in the foreground; the 6 standard models are muted background lines.
     """
     import plotly.graph_objects as go
     fig = go.Figure()
 
-    # Model lines
+    _reactive = {'EWMA λ=0.94', 'Yang-Zhang 5d', 'Yang-Zhang 21d'}
+
     if rvol_df is not None and not rvol_df.empty:
-        for col in rvol_df.columns:
+        # Draw standard models first (muted, thin)
+        for col in [c for c in rvol_df.columns if c not in _reactive]:
             color = _RVOL_COLORS.get(col, ACCENT_BLU)
             fig.add_trace(go.Scatter(
                 x=rvol_df.index, y=rvol_df[col],
                 mode='lines', name=col,
-                line=dict(color=color, width=1.6),
+                line=dict(color=color, width=1.2),
+                opacity=0.45,
+                hovertemplate=f'{col}: %{{y:.1f}}%<extra></extra>',
+            ))
+        # Draw reactive estimators bold on top
+        for col in [c for c in rvol_df.columns if c in _reactive]:
+            color = _RVOL_COLORS.get(col, ACCENT_BLU)
+            fig.add_trace(go.Scatter(
+                x=rvol_df.index, y=rvol_df[col],
+                mode='lines', name=col,
+                line=dict(color=color,
+                          width=_RVOL_WIDTH.get(col, 2.0),
+                          dash=_RVOL_DASH.get(col, 'solid')),
                 hovertemplate=f'{col}: %{{y:.1f}}%<extra></extra>',
             ))
 
-    # VIX as implied vol benchmark
+    # VIX — thickest, most prominent (the benchmark)
     if vix_df is not None and not vix_df.empty:
         vix_pct = vix_df.set_index('date')['vix'] * 100
         fig.add_trace(go.Scatter(
             x=vix_pct.index, y=vix_pct,
             mode='lines', name='VIX (Implied)',
-            line=dict(color=ACCENT_RED, width=2.5, dash='dot'),
+            line=dict(color=ACCENT_RED, width=3.0, dash='dot'),
             hovertemplate='VIX: %{y:.1f}%<extra></extra>',
         ))
 
-    layout = base_layout(f'Realized Volatility vs VIX — {ticker}', height=400)
+    layout = base_layout(
+        f'Realized Vol vs VIX — {ticker}  '
+        f'(bold = reactive: EWMA / YZ-5d / YZ-21d)', height=420)
     layout.update(
         yaxis_title='Annualized Vol (%)',
         xaxis_title='',
-        legend=dict(orientation='h', y=-0.18, font=dict(size=10, color=TEXT_COL),
+        legend=dict(orientation='h', y=-0.22, font=dict(size=10, color=TEXT_COL),
                     bgcolor='rgba(0,0,0,0)'),
     )
     fig.update_layout(**layout)

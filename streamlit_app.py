@@ -7,6 +7,7 @@ warnings.filterwarnings("ignore")
 
 import os
 import time
+from datetime import datetime
 
 import pandas as pd
 import numpy as np
@@ -467,7 +468,6 @@ if refresh_intra_btn and "data" in st.session_state:
 strike_lo, strike_hi = delta_strike_bounds(raw_full, delta_range[0], delta_range[1])
 
 # ── Status bar ────────────────────────────────────────────────────────────────
-from datetime import datetime
 ts = datetime.now().strftime("%H:%M:%S")
 st.markdown(
     f"<div class='status-bar'>Last updated: {ts} &nbsp;|&nbsp; "
@@ -933,33 +933,55 @@ with tab6:
 
         # ── Metric cards ──────────────────────────────────────────────────
         mc = st.columns(6)
-        last_yz  = float(rvol_df['Yang-Zhang'].iloc[-1]) if not rvol_df.empty else None
+        last_yz  = float(rvol_df['Yang-Zhang'].iloc[-1])    if not rvol_df.empty and 'Yang-Zhang'    in rvol_df.columns else None
+        last_yz21= float(rvol_df['Yang-Zhang 21d'].iloc[-1]) if not rvol_df.empty and 'Yang-Zhang 21d' in rvol_df.columns else None
+        last_ewma= float(rvol_df['EWMA λ=0.94'].iloc[-1])   if not rvol_df.empty and 'EWMA λ=0.94'   in rvol_df.columns else None
+        last_yz5 = float(rvol_df['Yang-Zhang 5d'].iloc[-1])  if not rvol_df.empty and 'Yang-Zhang 5d'  in rvol_df.columns else None
         last_vix = float(vix_hist['vix'].iloc[-1] * 100) if has_vix else None
-        vol_premium = (last_vix - last_yz) if (last_vix and last_yz) else None
+        vol_premium     = (last_vix - last_yz)   if (last_vix and last_yz)   else None
+        vol_premium_ewma= (last_vix - last_ewma) if (last_vix and last_ewma) else None
 
         mc[0].metric("Intraday RVol",
                      f"{intra_rv*100:.1f}%" if intra_rv else "—",
                      help="RVol annualizzata sessione corrente (barre 5-min)")
-        mc[1].metric("126d RVol  (Yang-Zhang)",
+        mc[1].metric("EWMA λ=0.94  ★ più reattivo",
+                     f"{last_ewma:.1f}%" if last_ewma else "—",
+                     delta=(f"vs VIX {vol_premium_ewma:+.1f}%" if vol_premium_ewma else None),
+                     help="RiskMetrics EWMA: half-life ~11 giorni. "
+                          "Il più reattivo agli spike — segue il VIX entro 1-3 giorni")
+        mc[2].metric("Yang-Zhang 21d  (≈ VIX window)",
+                     f"{last_yz21:.1f}%" if last_yz21 else "—",
+                     help="Finestra 21 giorni (1 mese di trading) — confronto più corretto con il VIX 30d")
+        mc[3].metric("Yang-Zhang 126d",
                      f"{last_yz:.1f}%" if last_yz else "—",
-                     help="Finestra 6 mesi — modello minima varianza")
-        mc[2].metric("VIX",
+                     help="Finestra 6 mesi — stima lenta, utile come livello strutturale")
+        mc[4].metric("VIX",
                      f"{last_vix:.1f}%" if last_vix else "—")
-        mc[3].metric("Vol Premium  (VIX−RVol)",
-                     (f"+{vol_premium:.1f}%" if vol_premium > 0 else f"{vol_premium:.1f}%")
-                     if vol_premium is not None else "—",
-                     delta=f"{vol_premium:.1f}%" if vol_premium else None)
-        mc[4].metric("HAR-RV Forecast (1d)",
-                     f"{har_forecast:.1f}%" if har_forecast else "—",
-                     help=(f"HAR-RV (Corsi 2009) — previsione RVol 1g. "
-                           + (f"68% CI [{har_result.get('ci_68_lo',0):.1f}–{har_result.get('ci_68_hi',0):.1f}%]  "
-                              f"R²={har_r2:.2f}" if har_r2 else "")),
-                     delta=(f"vs RVol {(har_forecast-last_yz):+.1f}%" if har_forecast and last_yz else None))
-        mc[5].metric(f"{regime_icon} Vol Regime",
-                     vol_regime,
-                     delta=f"z = {vol_z:+.2f}",
-                     help="Regime via z-score rolling 1Y della RVol Yang-Zhang. "
-                          "|z|>1.5 = HIGH/LOW; else NORMAL.")
+        mc[5].metric("Vol Premium  (VIX−EWMA)",
+                     (f"+{vol_premium_ewma:.1f}%" if vol_premium_ewma > 0
+                      else f"{vol_premium_ewma:.1f}%") if vol_premium_ewma is not None else "—",
+                     delta=f"{vol_premium_ewma:.1f}%" if vol_premium_ewma else None,
+                     help="VIX vs EWMA: il confronto più reattivo e corretto per "
+                          "valutare se il mercato sta pagando premium o discount sulla vol")
+
+        st.markdown("---")
+
+        # Row 2: HAR forecast + regime + YZ-5d
+        mc2 = st.columns(3)
+        mc2[0].metric("HAR-RV Forecast (1d)",
+                      f"{har_forecast:.1f}%" if har_forecast else "—",
+                      help=(f"HAR-RV Corsi 2009. "
+                            + (f"68% CI [{har_result.get('ci_68_lo',0):.1f}–"
+                               f"{har_result.get('ci_68_hi',0):.1f}%]  R²={har_r2:.2f}"
+                               if har_r2 else "")),
+                      delta=(f"vs EWMA {(har_forecast-last_ewma):+.1f}%"
+                             if har_forecast and last_ewma else None))
+        mc2[1].metric(f"{regime_icon} Vol Regime",
+                      vol_regime, delta=f"z = {vol_z:+.2f}",
+                      help="Z-score rolling 1Y RVol YZ-126d. |z|>1.5 = HIGH/LOW")
+        mc2[2].metric("Yang-Zhang 5d",
+                      f"{last_yz5:.1f}%" if last_yz5 else "—",
+                      help="Finestra 5 giorni — vol settimanale corrente")
 
         st.markdown("---")
 

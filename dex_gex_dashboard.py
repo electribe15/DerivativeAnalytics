@@ -494,107 +494,139 @@ def validate_iv(data: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_intraday_history(ticker: str, interval_min: int = 5) -> pd.DataFrame:
-    """Fetch today's intraday price bars for ticker from Barchart.
+    """Fetch today's intraday OHLC bars.
 
-    Tries the historical endpoint with type=minutes, then interval=minutes.
-    Returns a DataFrame(datetime, open, high, low, close, volume) with intraday
-    bars sorted ascending, or an empty DataFrame if unavailable (market closed,
-    weekend, endpoint not accessible).  In that case the caller should fall back
-    to displaying the spot price fetched from the options page.
+    Primary source: yfinance (free, no auth, up to 60 days of 5-min history).
+    Fallback: Barchart historical endpoint (requires premium subscription).
+
+    Returns DataFrame(datetime, open, high, low, close, volume) sorted
+    ascending for today's session, or an empty DataFrame if unavailable
+    (market closed, weekend). The caller falls back to showing the spot
+    price as a horizontal line when this returns empty.
     """
-    from datetime import date as _date, datetime as _dt
-    today = _date.today()
-    today_str = today.strftime('%Y-%m-%d')
+    from datetime import date as _date, datetime as _dt, timezone as _tz
+    import pytz
 
+    interval_str = f'{interval_min}m'
+
+    # ── 1. yfinance (primary) ─────────────────────────────────────────────────
+    yf_sym = _yf_ticker(ticker)
+    try:
+        import yfinance as yf
+
+        def _parse_yf_intraday(raw) -> pd.DataFrame:
+            """Normalise a yfinance download result to (datetime, ohlcv)."""
+            if raw is None or raw.empty:
+                return pd.DataFrame()
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = [c[0] for c in raw.columns]
+            raw.columns = [str(c).lower() for c in raw.columns]
+            raw = raw.reset_index()
+            dt_col = next((c for c in raw.columns
+                           if 'datetime' in c.lower() or c.lower() == 'date'), None)
+            if not dt_col:
+                return pd.DataFrame()
+            raw = raw.rename(columns={dt_col: 'datetime'})
+            raw['datetime'] = pd.to_datetime(raw['datetime'])
+            if raw['datetime'].dt.tz is not None:
+                et = pytz.timezone('America/New_York')
+                raw['datetime'] = (raw['datetime']
+                                   .dt.tz_convert(et)
+                                   .dt.tz_localize(None))
+            keep = [c for c in
+                    ['datetime', 'open', 'high', 'low', 'close', 'volume']
+                    if c in raw.columns]
+            return (raw[keep]
+                      .dropna(subset=['datetime', 'close'])
+                      .query('close > 0')
+                      .sort_values('datetime')
+                      .reset_index(drop=True))
+
+        # Try today's session first
+        raw_today = yf.download(yf_sym, period='1d', interval=interval_str,
+                                auto_adjust=True, progress=False)
+        df = _parse_yf_intraday(raw_today)
+        if not df.empty:
+            print(f'  [intraday/yf] {yf_sym}: {len(df)} bars today '
+                  f'({df["datetime"].iloc[0].strftime("%H:%M")}–'
+                  f'{df["datetime"].iloc[-1].strftime("%H:%M")} ET)')
+            return df
+
+        # Market closed or pre-open: fall back to last available session
+        print(f'  [intraday/yf] today empty → fetching last available session')
+        raw_5d = yf.download(yf_sym, period='5d', interval=interval_str,
+                             auto_adjust=True, progress=False)
+        df5 = _parse_yf_intraday(raw_5d)
+        if not df5.empty:
+            last_date = df5['datetime'].dt.normalize().max()
+            df_last   = df5[df5['datetime'].dt.normalize() == last_date].copy()
+            if not df_last.empty:
+                print(f'  [intraday/yf] {yf_sym}: {len(df_last)} bars '
+                      f'from last session {last_date.date()}')
+                return df_last.reset_index(drop=True)
+
+    except Exception as e:
+        print(f'  [intraday/yf] {yf_sym}: {type(e).__name__}: {e}')
+
+    # ── 2. Barchart fallback ──────────────────────────────────────────────────
+    today_str = _date.today().strftime('%Y-%m-%d')
     _attempts = [
-        dict(type='minutes',   interval=str(interval_min)),
-        dict(type='minute',    interval=str(interval_min)),
-        dict(interval='minutes', period=str(interval_min)),
+        dict(type='minutes', interval=str(interval_min)),
+        dict(type='minute',  interval=str(interval_min)),
     ]
-
-    def _parse_intraday(items: list) -> pd.DataFrame:
-        rows = []
-        for item in items:
-            raw = item.get('raw', item)
-            try:
-                day_s  = (raw.get('tradingDay') or raw.get('date') or today_str)
-                time_s = (raw.get('time') or raw.get('tradeTime') or '00:00:00')
-                # Combine date + time; Barchart uses HH:MM:SS or HH:MM format
-                if len(str(time_s)) <= 8:
-                    dt = _dt.strptime(f'{day_s} {time_s}', '%Y-%m-%d %H:%M:%S')
-                else:
-                    dt = pd.Timestamp(time_s)
-                rows.append({
-                    'datetime': dt,
-                    'open':  float(raw.get('open',  0) or 0),
-                    'high':  float(raw.get('high',  0) or 0),
-                    'low':   float(raw.get('low',   0) or 0),
-                    'close': float(raw.get('close', raw.get('lastPrice', 0)) or 0),
-                    'volume': float(raw.get('volume', 0) or 0),
-                })
-            except (ValueError, TypeError):
-                continue
-        if not rows:
-            return pd.DataFrame()
-        df = (pd.DataFrame(rows)
-                .dropna(subset=['datetime'])
-                .query('close > 0')
-                .sort_values('datetime')
-                .reset_index(drop=True))
-        return df
-
     try:
         session = build_barchart_session(ticker)
         headers = barchart_api_headers(session, ticker)
-
         for extra in _attempts:
             params = {
-                'symbol':    ticker,
-                'startDate': today_str,
-                'endDate':   today_str,
-                'fields':    'tradingDay,time,open,high,low,close,volume',
-                'meta':      'field.shortName',
-                'orderBy':   'tradingDay',
-                'orderDir':  'asc',
-                'limit':     500,
-                **extra,
+                'symbol': ticker, 'startDate': today_str, 'endDate': today_str,
+                'fields': 'tradingDay,time,open,high,low,close,volume',
+                'limit': 500, **extra,
             }
             try:
                 resp = session.get(BARCHART_HIST_URL, headers=headers,
                                    params=params, timeout=12)
-                print(f'  [intraday] {extra} → HTTP {resp.status_code}')
                 if resp.status_code != 200:
-                    print(f'  [intraday] body: {resp.text[:150]}')
                     continue
-                payload = resp.json()
-                items = (payload.get('data')
-                         or payload.get('results')
-                         or (payload if isinstance(payload, list) else []))
-                print(f'  [intraday] items={len(items)}  '
-                      f'keys={list(payload.keys()) if isinstance(payload, dict) else "list"}')
-                if not items:
-                    print(f'  [intraday] empty: {str(payload)[:200]}')
-                    continue
-                df = _parse_intraday(items)
-                if not df.empty:
-                    print(f'  [intraday] OK: {len(df)} bars for {ticker}')
+                items = (resp.json().get('data')
+                         or resp.json().get('results') or [])
+                rows = []
+                for item in items:
+                    raw = item.get('raw', item)
+                    try:
+                        day_s  = raw.get('tradingDay') or raw.get('date') or today_str
+                        time_s = raw.get('time') or raw.get('tradeTime') or '00:00:00'
+                        dt     = _dt.strptime(f'{day_s} {str(time_s)[:8]}',
+                                              '%Y-%m-%d %H:%M:%S')
+                        rows.append({
+                            'datetime': dt,
+                            'open':    float(raw.get('open',  0) or 0),
+                            'high':    float(raw.get('high',  0) or 0),
+                            'low':     float(raw.get('low',   0) or 0),
+                            'close':   float(raw.get('close', 0) or 0),
+                            'volume':  float(raw.get('volume', 0) or 0),
+                        })
+                    except (ValueError, TypeError):
+                        continue
+                if rows:
+                    df = (pd.DataFrame(rows)
+                            .query('close > 0')
+                            .sort_values('datetime')
+                            .reset_index(drop=True))
+                    print(f'  [intraday/bc] {ticker}: {len(df)} bars')
                     return df
-                print(f'  [intraday] items found but not parsed — sample: {items[0]}')
             except Exception as e:
-                print(f'  [intraday] attempt {extra} error: {type(e).__name__}: {e}')
-                continue
-
-        print(f'  [intraday] all attempts exhausted — will use spot fallback')
-        return pd.DataFrame()
-
+                print(f'  [intraday/bc] {extra}: {e}')
     except Exception as exc:
-        print(f'  fetch_intraday_history({ticker}) session error: {type(exc).__name__}: {exc}')
-        return pd.DataFrame()
+        print(f'  [intraday] Barchart session error: {exc}')
+
+    print(f'  [intraday] all sources failed — spot fallback will be used')
+    return pd.DataFrame()
 
 
-# Keep old alias for backward compatibility
+# Backward-compatibility alias
 def fetch_price_history(ticker: str, n_days: int = 5) -> pd.DataFrame:
-    """Deprecated alias — use fetch_intraday_history for intraday data."""
+    """Deprecated alias — use fetch_intraday_history."""
     return fetch_intraday_history(ticker)
 
 
@@ -703,106 +735,194 @@ def fetch_price_history(ticker: str, n_days: int = 5) -> pd.DataFrame:
 
 
 
+# ── Ticker mapping ─────────────────────────────────────────────────────────────
+_YF_MAP = {
+    '$SPX': '^GSPC', '$SPY': 'SPY', '$NDX': '^NDX',
+    '$VIX': '^VIX',  '^VIX': '^VIX', 'VIX':  '^VIX',
+    'SPY': 'SPY', 'QQQ': 'QQQ', 'IWM': 'IWM',
+}
+
+def _yf_ticker(bc: str) -> str:
+    return _YF_MAP.get(bc.upper(), bc)
+
+
+def _yf_download(yf_ticker: str, n_calendar_days: int) -> pd.DataFrame:
+    """Download daily OHLC from Yahoo Finance via yfinance.
+
+    Handles both flat and MultiIndex column layouts across yfinance versions.
+    Returns DataFrame(date, open, high, low, close, volume) or empty.
+    """
+    from datetime import date as _d, timedelta as _td
+    try:
+        import yfinance as yf
+    except ImportError:
+        print(f'  [yfinance] not installed — add yfinance to requirements.txt')
+        return pd.DataFrame()
+
+    end_s   = _d.today().strftime('%Y-%m-%d')
+    start_s = (_d.today() - _td(days=n_calendar_days)).strftime('%Y-%m-%d')
+
+    try:
+        raw = yf.download(
+            yf_ticker, start=start_s, end=end_s,
+            auto_adjust=True, progress=False,
+        )
+    except Exception as e:
+        print(f'  [yfinance] {yf_ticker} download error: {e}')
+        return pd.DataFrame()
+
+    if raw is None or raw.empty:
+        print(f'  [yfinance] {yf_ticker}: empty response')
+        return pd.DataFrame()
+
+    # Flatten MultiIndex columns (yfinance >= 0.2.54 multi-ticker mode)
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = [c[0] for c in raw.columns]
+    raw.columns = [str(c).lower() for c in raw.columns]
+
+    raw = raw.reset_index()
+    date_col = next((c for c in raw.columns if 'date' in c.lower()), None)
+    if not date_col:
+        print(f'  [yfinance] {yf_ticker}: no date column found')
+        return pd.DataFrame()
+
+    raw = raw.rename(columns={date_col: 'date'})
+    raw['date'] = pd.to_datetime(raw['date']).dt.normalize()
+
+    keep = [c for c in ['date', 'open', 'high', 'low', 'close', 'volume']
+            if c in raw.columns]
+    df = (raw[keep]
+            .dropna(subset=['date', 'close'])
+            .query('close > 0')
+            .sort_values('date')
+            .reset_index(drop=True))
+    print(f'  [yfinance] {yf_ticker}: {len(df)} sessions '
+          f'({df["date"].iloc[0].date()} → {df["date"].iloc[-1].date()})')
+    return df
+
+
 def fetch_ohlc_history(ticker: str = '$SPX',
                        n_calendar_days: int = 210) -> pd.DataFrame:
-    """Fetch n_calendar_days of daily OHLC from Barchart.
+    """Fetch daily OHLC for the last n_calendar_days.
 
-    210 calendar days ≈ 6 months of trading history (~126 trading days).
-    Returns DataFrame(date, open, high, low, close, volume) sorted ascending,
-    or an empty DataFrame if the endpoint is unavailable.
+    Primary source: yfinance (free, no auth required).
+    Fallback: Barchart historical endpoint (requires premium subscription).
+    Returns DataFrame(date, open, high, low, close, volume).
     """
     from datetime import date as _date, timedelta as _td
+
+    # ── 1. yfinance (primary — always free) ──────────────────────────────────
+    yf_sym = _yf_ticker(ticker)
+    df = _yf_download(yf_sym, n_calendar_days)
+    if not df.empty:
+        return df
+
+    # ── 2. Barchart fallback (premium accounts only) ──────────────────────────
+    print(f'  [ohlc] yfinance failed for {yf_sym} → trying Barchart')
     end_dt   = _date.today()
     start_dt = end_dt - _td(days=n_calendar_days)
-
-    _attempts = [
-        dict(type='daily'),
-        dict(type='eod'),
-        dict(interval='daily'),
-    ]
-
-    def _parse(items):
-        rows = []
-        for item in items:
-            raw = item.get('raw', item)
-            ds  = raw.get('tradingDay') or raw.get('date') or ''
-            if not ds:
-                continue
-            try:
-                rows.append({
-                    'date':   pd.Timestamp(str(ds)[:10]),
-                    'open':   float(raw.get('open',   0) or 0),
-                    'high':   float(raw.get('high',   0) or 0),
-                    'low':    float(raw.get('low',    0) or 0),
-                    'close':  float(raw.get('close',  raw.get('lastPrice', 0)) or 0),
-                    'volume': float(raw.get('volume', 0) or 0),
-                })
-            except (ValueError, TypeError):
-                continue
-        if not rows:
-            return pd.DataFrame()
-        return (pd.DataFrame(rows)
-                  .dropna(subset=['date'])
-                  .query('close > 0')
-                  .sort_values('date')
-                  .reset_index(drop=True))
-
     try:
         session = build_barchart_session(ticker)
         headers = barchart_api_headers(session, ticker)
-        for extra in _attempts:
+        for extra in [dict(type='daily'), dict(interval='daily'), dict(type='eod')]:
             params = {
-                'symbol':    ticker,
+                'symbol': ticker,
                 'startDate': start_dt.strftime('%Y-%m-%d'),
                 'endDate':   end_dt.strftime('%Y-%m-%d'),
                 'fields':    'tradingDay,open,high,low,close,volume',
-                'meta':      'field.shortName',
-                'orderBy':   'tradingDay',
-                'orderDir':  'asc',
                 'limit':     300,
                 **extra,
             }
             try:
                 resp = session.get(BARCHART_HIST_URL, headers=headers,
                                    params=params, timeout=15)
-                print(f'  [ohlc_daily/{ticker}] {extra} → HTTP {resp.status_code}')
                 if resp.status_code != 200:
-                    print(f'  [ohlc_daily] body: {resp.text[:150]}')
                     continue
-                payload = resp.json()
-                items   = (payload.get('data') or payload.get('results')
-                           or (payload if isinstance(payload, list) else []))
-                print(f'  [ohlc_daily/{ticker}] items={len(items)}')
-                df = _parse(items)
-                if not df.empty:
-                    print(f'  [ohlc_daily/{ticker}] OK — {len(df)} sessions')
+                items = (resp.json().get('data')
+                         or resp.json().get('results') or [])
+                rows = []
+                for item in items:
+                    raw = item.get('raw', item)
+                    ds  = raw.get('tradingDay') or raw.get('date') or ''
+                    if not ds:
+                        continue
+                    try:
+                        rows.append({
+                            'date':   pd.Timestamp(str(ds)[:10]),
+                            'open':   float(raw.get('open',  0) or 0),
+                            'high':   float(raw.get('high',  0) or 0),
+                            'low':    float(raw.get('low',   0) or 0),
+                            'close':  float(raw.get('close', 0) or 0),
+                            'volume': float(raw.get('volume', 0) or 0),
+                        })
+                    except (ValueError, TypeError):
+                        continue
+                if rows:
+                    df = (pd.DataFrame(rows)
+                            .query('close > 0')
+                            .sort_values('date')
+                            .reset_index(drop=True))
+                    print(f'  [ohlc] Barchart OK: {len(df)} sessions for {ticker}')
                     return df
-                print(f'  [ohlc_daily/{ticker}] empty payload: {str(payload)[:200]}')
             except Exception as e:
-                print(f'  [ohlc_daily/{ticker}] attempt {extra}: {type(e).__name__}: {e}')
-        print(f'  [ohlc_daily/{ticker}] all attempts failed')
-        return pd.DataFrame()
+                print(f'  [ohlc] Barchart attempt {extra}: {e}')
     except Exception as exc:
-        print(f'  fetch_ohlc_history({ticker}) session error: {type(exc).__name__}: {exc}')
-        return pd.DataFrame()
+        print(f'  [ohlc] Barchart session error: {exc}')
+
+    print(f'  [ohlc] all sources failed for {ticker}')
+    return pd.DataFrame()
 
 
 def fetch_vix_history(n_calendar_days: int = 210) -> pd.DataFrame:
-    """Fetch VIX daily history from Barchart.
+    """Fetch VIX daily history.
 
-    Tries $VIX and ^VIX — Barchart uses $VIX for most index tickers.
-    Returns DataFrame(date, close) where close = VIX / 100 (decimal form).
+    Primary: yfinance ^VIX.
+    Returns DataFrame(date, vix) where vix is decimal (0.18 = 18%).
     """
-    for vix_ticker in ('$VIX', '^VIX', 'VIX'):
-        df = fetch_ohlc_history(vix_ticker, n_calendar_days)
-        if not df.empty:
-            df = df[['date', 'close']].copy()
-            df['close'] = df['close'] / 100.0   # VIX in % → decimal
-            df.rename(columns={'close': 'vix'}, inplace=True)
-            print(f'  fetch_vix_history: {len(df)} sessions via {vix_ticker}')
-            return df
-    print('  fetch_vix_history: all tickers failed')
+    df = _yf_download('^VIX', n_calendar_days)
+    if not df.empty:
+        result = df[['date', 'close']].copy()
+        result['vix'] = result['close'] / 100.0
+        return result[['date', 'vix']]
+
+    # Barchart fallback
+    from datetime import date as _d, timedelta as _td
+    end_dt   = _d.today()
+    start_dt = end_dt - _td(days=n_calendar_days)
+    for vix_sym in ('$VIX', '^VIX'):
+        try:
+            session = build_barchart_session(vix_sym)
+            headers = barchart_api_headers(session, vix_sym)
+            for extra in [dict(type='daily'), dict(interval='daily')]:
+                params = {'symbol': vix_sym,
+                          'startDate': start_dt.strftime('%Y-%m-%d'),
+                          'endDate':   end_dt.strftime('%Y-%m-%d'),
+                          'fields': 'tradingDay,close', 'limit': 300, **extra}
+                resp = session.get(BARCHART_HIST_URL, headers=headers,
+                                   params=params, timeout=12)
+                if resp.status_code != 200:
+                    continue
+                items = resp.json().get('data') or resp.json().get('results') or []
+                rows = [{'date': pd.Timestamp(str(
+                            (i.get('raw', i).get('tradingDay') or
+                             i.get('raw', i).get('date') or ''))[:10]),
+                          'vix': float(
+                            i.get('raw', i).get('close') or
+                            i.get('raw', i).get('lastPrice') or 0) / 100.0}
+                        for i in items
+                        if (i.get('raw', i).get('tradingDay') or i.get('raw', i).get('date'))
+                        and float(i.get('raw', i).get('close') or
+                                  i.get('raw', i).get('lastPrice') or 0) > 0]
+                if rows:
+                    return (pd.DataFrame(rows)
+                              .sort_values('date')
+                              .reset_index(drop=True))
+        except Exception:
+            continue
+
+    print('  fetch_vix_history: all sources failed')
     return pd.DataFrame()
+
 
 
 
@@ -2607,13 +2727,22 @@ def price_vs_dex_chart(by_strike_df: pd.DataFrame, intraday_df,
     if dex.empty:
         dex = by_strike_df.copy()
 
+    if has_intra:
+        # Detect if data is from today or a previous session
+        _last_dt   = intraday_df['datetime'].iloc[-1]
+        _first_dt  = intraday_df['datetime'].iloc[0]
+        _is_today  = pd.Timestamp(_last_dt).date() == pd.Timestamp.now().date()
+        _date_lbl  = 'Intraday' if _is_today else f'Last session {pd.Timestamp(_first_dt).strftime("%d %b")}'
+        _n_bars    = len(intraday_df)
+
     fig = make_subplots(
         rows=1, cols=2,
         shared_yaxes=True,
         column_widths=[0.28, 0.72],
         horizontal_spacing=0.02,
         specs=[[{}, {'secondary_y': True}]],
-        subplot_titles=['DEX by Strike', f'{ticker}  ·  Intraday'],
+        subplot_titles=['DEX by Strike',
+                        f'{ticker}  ·  {_date_lbl if has_intra else "Intraday"}'],
     )
 
     # ── DEX horizontal bars ──────────────────────────────────────────────

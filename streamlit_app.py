@@ -14,6 +14,9 @@ import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 
+APP_VERSION = "2.1.0"
+APP_BUILD   = "2026-06-08"
+
 st.set_page_config(
     page_title="DEX / GEX Dashboard",
     page_icon="⚡",
@@ -140,6 +143,11 @@ try:
         compute_gex_analytics,
         compute_gex_profile,
         compute_0dte_gamma_schedule,
+        save_daily_snapshot,
+        compute_dod_changes,
+        compute_gex_percentile,
+        compute_flip_by_expiry,
+        generate_morning_brief,
         fetch_price_history,
         fetch_intraday_history,
         fetch_ohlc_history,
@@ -320,6 +328,12 @@ if fetch_btn:
                                          intraday=intraday,
                                          ohlc_spx=ohlc_spx,
                                          vix_hist=vix_hist)
+
+        # Persist a compact daily snapshot (enables DoD deltas + GEX percentile)
+        try:
+            save_daily_snapshot(raw_full, spot, ticker)
+        except Exception:
+            pass
 
         # CSV cache confirmation
         try:
@@ -502,6 +516,29 @@ if "data" in st.session_state and st.session_state["data"].get("raw") is not Non
               if _ohlc_s is not None else None
     _flags  = build_alert_flags(_raw_f, _spot_a, _dte0_m, _rvdf, _d.get("vix_hist"))
 
+    # ── Alert journal: persist status transitions ──
+    try:
+        import csv as _csv
+        _prev_states = st.session_state.get("_alert_states", {})
+        _journal_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapshots")
+        os.makedirs(_journal_dir, exist_ok=True)
+        _journal = os.path.join(_journal_dir, "alert_journal.csv")
+        _changes = [(f["name"], _prev_states.get(f["name"]), f["status"], f["value"])
+                    for f in _flags
+                    if _prev_states.get(f["name"]) not in (None, f["status"])]
+        if _changes:
+            _new_file = not os.path.exists(_journal)
+            with open(_journal, "a", newline="") as _jf:
+                _w = _csv.writer(_jf)
+                if _new_file:
+                    _w.writerow(["timestamp", "alert", "from", "to", "value"])
+                for _nm, _fr, _to, _vl in _changes:
+                    _w.writerow([datetime.now().isoformat(timespec="seconds"),
+                                 _nm, _fr, _to, _vl])
+        st.session_state["_alert_states"] = {f["name"]: f["status"] for f in _flags}
+    except Exception:
+        pass
+
     _icon   = {'RED':'🔴','AMBER':'🟡','GREEN':'🟢','GREY':'⚪'}
     _bg     = {'RED':'#FEF2F2','AMBER':'#FFFBEB','GREEN':'#F0FDF4','GREY':'#F9FAFB'}
     _border = {'RED':'#EF4444','AMBER':'#F59E0B','GREEN':'#10B981','GREY':'#D1D5DB'}
@@ -622,6 +659,23 @@ with tab0:
         except Exception as e:
             st.plotly_chart(empty_fig(str(e)), use_container_width=True)
 
+        # ── Morning Brief PDF ──
+        try:
+            _ga_brief = compute_gex_analytics(raw_full,
+                                              aggregate_by_strike(raw_full), spot)
+            _dod_b    = compute_dod_changes(raw_full, spot, cur_tick)
+            _flags_brief = build_alert_flags(
+                raw_full, spot, m,
+                None, st.session_state["data"].get("vix_hist"))
+            _pdf = generate_morning_brief(m, _ga_brief, _flags_brief,
+                                          spot, cur_tick, _dod_b)
+            st.download_button("📄 Scarica Morning Brief (PDF)", _pdf,
+                               file_name=f"morning_brief_{cur_tick.replace('$','')}_"
+                                         f"{datetime.now().strftime('%Y%m%d')}.pdf",
+                               mime="application/pdf", key="dl_brief")
+        except Exception as _e:
+            st.caption(f"Brief non disponibile: {_e}")
+
         # ── Gamma decay schedule ──────────────────────────────────────────
         with st.expander("⏱ Gamma Burn Schedule — Decadimento intraday del GEX 0DTE"):
             sched = compute_0dte_gamma_schedule(m['raw'], spot)
@@ -702,6 +756,48 @@ with tab1:
             "Flip Zone",
             f"[{ga['flip_zone_lo']:,.0f} – {ga['flip_zone_hi']:,.0f}]",
             help="Zona di ambiguità del regime: strikes dove il GEX è < 10% del picco. All'interno di questa banda il regime è instabile")
+
+        # ── Day-over-day changes + GEX percentile ──
+        dod = compute_dod_changes(raw_full, spot, cur_tick)
+        pct = compute_gex_percentile(raw_full, cur_tick)
+        if dod or pct.get('percentile') is not None:
+            dd = st.columns(5)
+            if dod:
+                dd[0].metric("Δ Net GEX vs " + dod['prev_date'][5:],
+                             f"{dod['d_net_gex']/1e9:+.2f}B",
+                             delta=f"{dod['d_gex_pct']:+.1f}%" if dod.get('d_gex_pct') else None)
+                dd[1].metric("Δ Total OI",
+                             f"{dod['d_total_oi']/1e3:+.0f}k",
+                             delta=f"{dod['d_oi_pct']:+.1f}%" if dod.get('d_oi_pct') else None)
+                dd[2].metric("Δ Spot", f"{dod['d_spot']:+.1f} pts")
+            if pct.get('percentile') is not None:
+                dd[3].metric("GEX Percentile (storico)",
+                             f"{pct['percentile']:.0f}°",
+                             help=f"Net GEX corrente vs {pct['n_history']} snapshot storici")
+            elif pct.get('n_history') is not None:
+                dd[3].metric("GEX Percentile", "—",
+                             help=f"Servono ≥5 snapshot (attuali: {pct['n_history']})")
+            st.markdown("---")
+
+        # ── GEX Flip per scadenza (term structure) ──
+        with st.expander("🧱 GEX Flip per Scadenza — Term structure dei muri gamma"):
+            flip_ts = compute_flip_by_expiry(raw_full, spot)
+            if not flip_ts.empty:
+                ft = flip_ts.copy()
+                ft['flip'] = ft['flip'].map(lambda x: f"${x:,.0f}" if x else "—")
+                ft['net_gex'] = (ft['net_gex']/1e9).round(2)
+                ft['spot_vs_flip'] = ft['spot_vs_flip'].map(
+                    lambda x: f"{x:+.0f} pts" if x is not None else "—")
+                ft = ft.rename(columns={
+                    'expiry':'Scadenza','T_days':'DTE','flip':'GEX Flip',
+                    'net_gex':'Net GEX ($B)','regime':'Regime',
+                    'spot_vs_flip':'Spot − Flip'})
+                st.caption("Il flip aggregato può nascondere muri diversi per scadenza: "
+                           "il muro 0DTE e quello monthly possono essere a livelli distinti.")
+                st.dataframe(ft.reset_index(drop=True),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.info("Dati insufficienti per il calcolo per scadenza")
 
         # GEX Conditional Profile
         with st.expander("📐 Profilo GEX Condizionale — Come cambia il regime con il prezzo"):
@@ -880,10 +976,11 @@ with tab5:
         cols_to_show = ["strike","net_gex","net_dex","call_gex","put_gex",
                         "call_dex","put_dex","total_oi"]
         available = [c for c in cols_to_show if c in by_strike.columns]
-        st.dataframe(
-            by_strike[available].sort_values("net_gex", ascending=False).reset_index(drop=True),
-            use_container_width=True,
-        )
+        _oi_tbl = by_strike[available].sort_values("net_gex", ascending=False).reset_index(drop=True)
+        st.dataframe(_oi_tbl, use_container_width=True)
+        st.download_button("⬇ Esporta CSV", _oi_tbl.to_csv(index=False).encode(),
+                           file_name=f"by_strike_{cur_tick.replace('$','')}.csv",
+                           mime="text/csv", key="dl_by_strike")
 
 # ── Tab 6: Realized Vol ───────────────────────────────────────────────────────
 with tab6:
@@ -1132,3 +1229,13 @@ di opzioni.
 </ul>
 </div>
 """, unsafe_allow_html=True)
+
+# ── Footer ────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.markdown(
+    f"<div style='text-align:center;font-size:10px;color:#9CA3AF;padding:8px 0;'>"
+    f"DEX/GEX Analytics v{APP_VERSION} · build {APP_BUILD} · "
+    f"Dati: Barchart (chain) + Yahoo Finance (storico/intraday) · "
+    f"Modello: Black-Scholes-Merton con q implicita</div>",
+    unsafe_allow_html=True,
+)

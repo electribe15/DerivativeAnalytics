@@ -17,6 +17,7 @@ import re
 import time
 import tempfile
 import threading
+import os
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
@@ -1447,6 +1448,298 @@ def backtest_vol_premium(rvol_df: pd.DataFrame,
                 [r > float(combined.loc[d, 'rv']) for r, d in zip(forward_rv, signal_days)
                  if d in combined.index]))
     return results
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Snapshot persistence & day-over-day analytics
+# ══════════════════════════════════════════════════════════════════════════════
+
+SNAPSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'snapshots')
+
+
+def save_daily_snapshot(raw_df: pd.DataFrame, spot: float,
+                         ticker: str = 'SPX') -> str:
+    """Persist a compact per-strike snapshot of today's chain.
+
+    Saves aggregated per-strike data (not the full chain) to keep files small
+    (~50 KB vs ~5 MB).  One file per ticker per day:
+        snapshots/SPX_2026-06-08.csv
+    If GitHub Actions commits the snapshots/ folder, history accumulates in
+    the repo and survives Streamlit Cloud restarts.
+    Returns the path written, or '' on failure.
+    """
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        from datetime import date as _d
+        bs   = aggregate_by_strike(raw_df)
+        meta = pd.DataFrame([{
+            'strike': -1,                       # sentinel row for metadata
+            'net_gex': float(raw_df['gex'].sum()),
+            'net_dex': float(raw_df['dex'].sum()),
+            'total_oi': float(raw_df['openInterest'].sum()),
+            'call_gex': spot,                   # reuse column: spot price
+            'put_gex': len(raw_df),             # reuse column: n contracts
+        }])
+        out  = pd.concat([meta, bs], ignore_index=True)
+        path = os.path.join(SNAPSHOT_DIR,
+                            f'{ticker.replace("$","")}_{_d.today().isoformat()}.csv')
+        out.to_csv(path, index=False)
+        print(f'  [snapshot] saved {path} ({len(bs)} strikes)')
+        return path
+    except Exception as e:
+        print(f'  [snapshot] save failed: {e}')
+        return ''
+
+
+def load_previous_snapshot(ticker: str = 'SPX') -> tuple:
+    """Load the most recent snapshot older than today.
+
+    Returns (by_strike_df, meta_dict, snapshot_date_str) or (None, {}, '').
+    """
+    try:
+        from datetime import date as _d
+        clean = ticker.replace('$', '')
+        if not os.path.isdir(SNAPSHOT_DIR):
+            return None, {}, ''
+        files = sorted(f for f in os.listdir(SNAPSHOT_DIR)
+                       if f.startswith(clean + '_') and f.endswith('.csv'))
+        today_name = f'{clean}_{_d.today().isoformat()}.csv'
+        prior = [f for f in files if f < today_name]
+        if not prior:
+            return None, {}, ''
+        path = os.path.join(SNAPSHOT_DIR, prior[-1])
+        df   = pd.read_csv(path)
+        meta_row = df[df['strike'] == -1]
+        meta = {}
+        if not meta_row.empty:
+            meta = {
+                'net_gex':     float(meta_row['net_gex'].iloc[0]),
+                'net_dex':     float(meta_row['net_dex'].iloc[0]),
+                'total_oi':    float(meta_row['total_oi'].iloc[0]),
+                'spot':        float(meta_row['call_gex'].iloc[0]),
+                'n_contracts': int(meta_row['put_gex'].iloc[0]),
+            }
+        bs = df[df['strike'] != -1].reset_index(drop=True)
+        snap_date = prior[-1].replace(clean + '_', '').replace('.csv', '')
+        return bs, meta, snap_date
+    except Exception as e:
+        print(f'  [snapshot] load failed: {e}')
+        return None, {}, ''
+
+
+def compute_dod_changes(raw_df: pd.DataFrame, spot: float,
+                         ticker: str = 'SPX') -> dict:
+    """Day-over-day changes vs the last saved snapshot.
+
+    Returns dict with prev_date, d_net_gex, d_net_dex, d_total_oi, d_spot
+    (absolute and %), or {} if no prior snapshot exists.
+    """
+    prev_bs, prev_meta, prev_date = load_previous_snapshot(ticker)
+    if prev_bs is None or not prev_meta:
+        return {}
+    cur_gex = float(raw_df['gex'].sum())
+    cur_dex = float(raw_df['dex'].sum())
+    cur_oi  = float(raw_df['openInterest'].sum())
+    out = {
+        'prev_date':  prev_date,
+        'd_net_gex':  cur_gex - prev_meta['net_gex'],
+        'd_net_dex':  cur_dex - prev_meta['net_dex'],
+        'd_total_oi': cur_oi  - prev_meta['total_oi'],
+        'd_spot':     spot    - prev_meta['spot'],
+        'prev_gex':   prev_meta['net_gex'],
+        'prev_spot':  prev_meta['spot'],
+    }
+    out['d_gex_pct'] = (out['d_net_gex'] / abs(prev_meta['net_gex']) * 100
+                         if prev_meta['net_gex'] else None)
+    out['d_oi_pct']  = (out['d_total_oi'] / prev_meta['total_oi'] * 100
+                         if prev_meta['total_oi'] else None)
+    return out
+
+
+def compute_gex_percentile(raw_df: pd.DataFrame, ticker: str = 'SPX') -> dict:
+    """Current net GEX vs its own snapshot history.
+
+    Returns {'percentile': 0-100, 'n_history': N} or {} if < 5 snapshots.
+    """
+    try:
+        clean = ticker.replace('$', '')
+        if not os.path.isdir(SNAPSHOT_DIR):
+            return {}
+        hist = []
+        for f in sorted(os.listdir(SNAPSHOT_DIR)):
+            if f.startswith(clean + '_') and f.endswith('.csv'):
+                df = pd.read_csv(os.path.join(SNAPSHOT_DIR, f), nrows=2)
+                m  = df[df['strike'] == -1]
+                if not m.empty:
+                    hist.append(float(m['net_gex'].iloc[0]))
+        if len(hist) < 5:
+            return {'n_history': len(hist)}
+        cur  = float(raw_df['gex'].sum())
+        pct  = float(np.mean([h <= cur for h in hist]) * 100)
+        return {'percentile': pct, 'n_history': len(hist)}
+    except Exception:
+        return {}
+
+
+def compute_flip_by_expiry(raw_df: pd.DataFrame, spot: float,
+                            max_expiries: int = 6) -> pd.DataFrame:
+    """GEX Flip level computed separately for each of the nearest expiries.
+
+    The aggregate flip can hide the fact that the 0DTE wall and the monthly
+    wall sit at different levels.  Returns DataFrame(expiry, T_days, flip,
+    net_gex, regime) sorted by T_days.
+    """
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+    rows = []
+    expiries = (raw_df.groupby('expiry')['T_days'].first()
+                       .sort_values().head(max_expiries))
+    for exp, tdays in expiries.items():
+        sub = raw_df[raw_df['expiry'] == exp]
+        bs  = aggregate_by_strike(sub)
+        if bs.empty or len(bs) < 3:
+            continue
+        srt  = bs.sort_values('strike').reset_index(drop=True)
+        sgn  = np.sign(srt['net_gex'].values)
+        flips = np.where(np.diff(sgn) != 0)[0]
+        flip = None
+        if len(flips):
+            i = flips[0]
+            s1, g1 = float(srt['strike'].iloc[i]),   float(srt['net_gex'].iloc[i])
+            s2, g2 = float(srt['strike'].iloc[i+1]), float(srt['net_gex'].iloc[i+1])
+            flip = s1 - g1*(s2-s1)/(g2-g1) if g2 != g1 else (s1+s2)/2
+        net = float(sub['gex'].sum())
+        rows.append({
+            'expiry':  exp,
+            'T_days':  int(tdays),
+            'flip':    flip,
+            'net_gex': net,
+            'regime':  'LONG γ' if net >= 0 else 'SHORT γ',
+            'spot_vs_flip': (spot - flip) if flip else None,
+        })
+    return pd.DataFrame(rows)
+
+
+
+def generate_morning_brief(dte0_metrics: dict, gex_analytics: dict,
+                            alert_flags: list, spot: float,
+                            ticker: str = '$SPX',
+                            dod: dict = None) -> bytes:
+    """One-page PDF morning brief: alert flags, key 0DTE metrics, day levels.
+
+    Returns the PDF as bytes (for st.download_button).
+    """
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import cm
+    from reportlab.lib.colors import HexColor, white
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                     Table, TableStyle, HRFlowable)
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from datetime import datetime as _dt
+
+    VIOLET   = HexColor('#6C63FF'); VIOLET_D = HexColor('#1E1B4B')
+    GRAY_D   = HexColor('#374151'); GRAY_L   = HexColor('#E5E7EB')
+    GRAY_BG  = HexColor('#F8F9FD')
+    STATUS_C = {'RED': HexColor('#EF4444'), 'AMBER': HexColor('#F59E0B'),
+                'GREEN': HexColor('#10B981'), 'GREY': HexColor('#9CA3AF')}
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=1.8*cm, rightMargin=1.8*cm,
+                            topMargin=1.5*cm, bottomMargin=1.2*cm)
+    W = A4[0] - 3.6*cm
+    sT  = ParagraphStyle('t', fontName='Helvetica-Bold', fontSize=18,
+                          textColor=VIOLET_D, alignment=TA_LEFT, spaceAfter=2)
+    sS  = ParagraphStyle('s', fontName='Helvetica', fontSize=9,
+                          textColor=HexColor('#6B7280'), spaceAfter=10)
+    sH  = ParagraphStyle('h', fontName='Helvetica-Bold', fontSize=11,
+                          textColor=VIOLET, spaceBefore=10, spaceAfter=4)
+    sB  = ParagraphStyle('b', fontName='Helvetica', fontSize=9,
+                          textColor=GRAY_D, leading=13)
+    sC  = ParagraphStyle('c', fontName='Helvetica-Bold', fontSize=9,
+                          textColor=white, alignment=TA_CENTER)
+
+    story = [
+        Paragraph(f'Morning Brief — {ticker}', sT),
+        Paragraph(_dt.now().strftime('%A %d %B %Y · %H:%M'), sS),
+        HRFlowable(width='100%', thickness=1.5, color=VIOLET, spaceAfter=8),
+    ]
+
+    # ── Alert flags ──
+    story.append(Paragraph('Alert Flags', sH))
+    cells, colors_row = [], []
+    for fl in (alert_flags or []):
+        cells.append(Paragraph(
+            f"<b>{fl['name']}</b><br/>{fl['value']}", ParagraphStyle(
+                'fc', fontName='Helvetica', fontSize=8, textColor=white,
+                alignment=TA_CENTER, leading=11)))
+        colors_row.append(STATUS_C.get(fl['status'], GRAY_L))
+    if cells:
+        t = Table([cells], colWidths=[W/len(cells)]*len(cells))
+        style = [('TOPPADDING',(0,0),(-1,-1),6), ('BOTTOMPADDING',(0,0),(-1,-1),6),
+                 ('LEFTPADDING',(0,0),(-1,-1),4), ('RIGHTPADDING',(0,0),(-1,-1),4)]
+        for i, c in enumerate(colors_row):
+            style.append(('BACKGROUND', (i,0), (i,0), c))
+        t.setStyle(TableStyle(style))
+        story.append(t)
+
+    # ── Key levels ──
+    story.append(Paragraph('Livelli del giorno', sH))
+    m  = dte0_metrics or {}
+    ga = gex_analytics or {}
+    rows = [
+        ['Spot', f"${spot:,.1f}", 'GEX Flip (0DTE)',
+         f"${m['gex_flip']:,.0f}" if m.get('gex_flip') else '—'],
+        ['Max Pain', f"${m['max_pain']:,.0f}" if m.get('max_pain') else '—',
+         'Max Gamma Strike',
+         f"${m['max_gex_strike']:,.0f}" if m.get('max_gex_strike') else '—'],
+        ['Expected Move',
+         f"±{m['exp_move_pts']:.0f} pts ({m['exp_move_pct']:.2f}%)"
+         if m.get('exp_move_pts') else '—',
+         'GEX Center of Mass',
+         f"${ga['center_of_mass']:,.0f}" if ga.get('center_of_mass') else '—'],
+        ['ATM IV 0DTE',
+         f"{m['atm_iv']*100:.1f}%" if m.get('atm_iv') else '—',
+         'P/C OI Ratio',
+         f"{m['pc_ratio']:.2f}" if m.get('pc_ratio') else '—'],
+        ['Total 0DTE GEX',
+         f"{m['total_gex']/1e9:+.2f}B" if m.get('total_gex') is not None else '—',
+         'HHI Concentrazione',
+         f"{ga['hhi']:.4f}" if ga.get('hhi') else '—'],
+    ]
+    body_rows = [[Paragraph(f'<b>{a}</b>', sB), Paragraph(b, sB),
+                   Paragraph(f'<b>{c}</b>', sB), Paragraph(d, sB)]
+                  for a,b,c,d in rows]
+    lt = Table(body_rows, colWidths=[W*0.27, W*0.23, W*0.27, W*0.23])
+    lt.setStyle(TableStyle([
+        ('BOX',(0,0),(-1,-1),0.5,GRAY_L), ('INNERGRID',(0,0),(-1,-1),0.3,GRAY_L),
+        ('ROWBACKGROUNDS',(0,0),(-1,-1),[GRAY_BG, white]),
+        ('TOPPADDING',(0,0),(-1,-1),5), ('BOTTOMPADDING',(0,0),(-1,-1),5),
+        ('LEFTPADDING',(0,0),(-1,-1),6),
+    ]))
+    story.append(lt)
+
+    # ── Day-over-day ──
+    if dod:
+        story.append(Paragraph('Variazioni vs ' + dod.get('prev_date',''), sH))
+        story.append(Paragraph(
+            f"Δ Net GEX: <b>{dod['d_net_gex']/1e9:+.2f}B</b>"
+            + (f" ({dod['d_gex_pct']:+.1f}%)" if dod.get('d_gex_pct') else '')
+            + f" &nbsp;·&nbsp; Δ OI: <b>{dod['d_total_oi']/1e3:+.0f}k</b>"
+            + f" &nbsp;·&nbsp; Δ Spot: <b>{dod['d_spot']:+.1f} pts</b>", sB))
+
+    story.append(Spacer(1, 0.5*cm))
+    story.append(HRFlowable(width='100%', thickness=0.5, color=GRAY_L))
+    story.append(Paragraph(
+        'Generato da DEX/GEX Analytics — uso interno', ParagraphStyle(
+            'f', fontName='Helvetica-Oblique', fontSize=7,
+            textColor=HexColor('#9CA3AF'), alignment=TA_CENTER, spaceBefore=4)))
+
+    doc.build(story)
+    return buf.getvalue()
 
 
 def compute_max_pain(raw_df: pd.DataFrame, expiry: str = None) -> dict:

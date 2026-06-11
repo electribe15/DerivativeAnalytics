@@ -1,0 +1,57 @@
+# Daily chain snapshot — runs Mon-Fri at 13:40 UTC (09:40 ET)
+# Saves a compact per-strike snapshot of the SPX chain into snapshots/
+# and commits it to the repo so history survives Streamlit Cloud restarts.
+#
+# Setup (one-time):
+#   1. Copy this file to .github/workflows/snapshot.yml in the repo
+#   2. Repo Settings → Actions → General → Workflow permissions →
+#      select "Read and write permissions"
+name: daily-snapshot
+
+on:
+  schedule:
+    - cron: '40 13 * * 1-5'   # 13:40 UTC = 09:40 ET (EDT)
+  workflow_dispatch:            # manual trigger from the Actions tab
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pandas numpy scipy requests yfinance
+
+      - name: Fetch chain and save snapshot
+        run: |
+          python - << 'EOF'
+          import sys
+          sys.path.insert(0, '.')
+          import dex_gex_dashboard as dg
+
+          ticker = '$SPX'
+          try:
+              raw, spot = dg.fetch_options_data(ticker, force_refresh=True)
+              if raw is not None and not raw.empty:
+                  path = dg.save_daily_snapshot(raw, spot, ticker)
+                  print(f'Snapshot saved: {path}')
+              else:
+                  print('Chain fetch returned empty — no snapshot saved')
+          except Exception as e:
+              print(f'Snapshot failed: {e}')
+              # Do not fail the workflow — Barchart can be flaky
+          EOF
+
+      - name: Commit snapshot
+        run: |
+          git config user.name  "snapshot-bot"
+          git config user.email "actions@github.com"
+          git add snapshots/ || true
+          git diff --cached --quiet || git commit -m "snapshot: $(date -u +%F)"
+          git push || true

@@ -1,0 +1,43 @@
+# Daily automatic paper-trading engine — long-vol simulation.
+# Runs Mon-Fri after the US close, evaluates the signal, updates simulated
+# positions, and commits paper_trades/ + snapshots/ to the repo so history
+# accumulates automatically and survives Streamlit Cloud restarts.
+#
+# Setup (one-time):
+#   1. Copy this file to .github/workflows/paper_engine.yml in the repo
+#   2. Repo Settings → Actions → General → Workflow permissions →
+#      select "Read and write permissions"
+#
+# Pure simulation: no broker, no orders, no external connections.
+name: paper-engine
+
+on:
+  schedule:
+    - cron: '15 21 * * 1-5'   # 21:15 UTC = 17:15 ET, ~1h after the close
+  workflow_dispatch:            # manual trigger from the Actions tab
+
+jobs:
+  paper-engine:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pandas numpy scipy requests yfinance
+
+      - name: Run paper engine
+        run: python paper_engine_run.py
+
+      - name: Commit paper trades and snapshot
+        run: |
+          git config user.name  "paper-engine-bot"
+          git config user.email "actions@github.com"
+          git add paper_trades/ snapshots/ || true
+          git diff --cached --quiet || git commit -m "paper-engine: $(date -u +%F)"
+          git push || true

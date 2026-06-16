@@ -14,8 +14,8 @@ import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
 
-APP_VERSION = "2.1.0"
-APP_BUILD   = "2026-06-08"
+APP_VERSION = "2.2.0"
+APP_BUILD   = "2026-06-16"
 
 st.set_page_config(
     page_title="DEX / GEX Dashboard",
@@ -131,6 +131,7 @@ try:
         aggregate_by_expiry,
         apply_dashboard_filters,
         _csv_paths,
+        SNAPSHOT_DIR,
         delta_strike_bounds,
         compute_0dte_metrics,
         compute_max_pain,
@@ -566,7 +567,7 @@ dte0_metrics = compute_0dte_metrics(raw_full, spot)
 has_0dte     = bool(dte0_metrics)
 
 # ── Tabs — 0DTE is always first and shown by default ─────────────────────────
-tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "⚡ 0DTE",
     "📊 GEX / DEX",
     "📐 Range & Skew",
@@ -574,6 +575,7 @@ tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📈 Volatilità",
     "🔥 Open Interest",
     "📉 Realized Vol",
+    "🤖 Paper Trading",
 ])
 
 # ── Tab 0: 0DTE ───────────────────────────────────────────────────────────────
@@ -1229,6 +1231,162 @@ di opzioni.
 </ul>
 </div>
 """, unsafe_allow_html=True)
+
+# ── Tab 7: Paper Trading (visualizzazione — engine automatico) ────────────────
+with tab7:
+    st.markdown("### 🤖 Paper Trading — Long Volatility (automatico)")
+    st.caption(
+        "Il motore di simulazione gira automaticamente ogni giorno feriale dopo la "
+        "chiusura USA tramite GitHub Actions: valuta il segnale long-vol, apre/chiude "
+        "le posizioni simulate e committa lo storico nel repo. Questa tab mostra lo "
+        "stato — non serve premere nulla. Segnale da SPX, conto paper da 5.000 $ su XSP.")
+
+    try:
+        import trading_lite as tl
+
+        _pos = tl.load_positions()
+        _cs  = tl.capital_status()
+
+        # ── Live unrealized P&L for open positions (read-only) ────────────────
+        _unreal = {'by_id': {}, 'total_unrealized': 0.0, 'n_open': 0}
+        _has_data = ("data" in st.session_state and
+                     st.session_state["data"].get("raw_full") is not None)
+        if _has_data and _cs['n_open'] > 0:
+            _dd0 = st.session_state["data"]
+            _spot0 = _dd0.get("spot", 0)
+            _m00 = compute_0dte_metrics(_dd0.get("raw_full"), _spot0) or {}
+            _iv0 = (_m00.get('atm_iv') or 0.15)
+            _iv0 = _iv0 * 100 if _iv0 < 1 else _iv0
+            try:
+                _unreal = tl.compute_unrealized(_spot0, _iv0)
+            except Exception:
+                pass
+
+        # ── Capital status ────────────────────────────────────────────────────
+        _cap_color = ('#10B981' if _cs['is_safe'] and not _cs['danger_zone']
+                      else '#F59E0B' if _cs['is_safe'] else '#EF4444')
+        _total_equity = _cs['account_value'] + _unreal['total_unrealized']
+        _cc = st.columns(5)
+        _cc[0].metric("Capitale paper", f"${_cs['account_value']:,.0f}",
+                      help="5.000 $ iniziali + P&L realizzato dei trade chiusi")
+        _cc[1].metric("P&L realizzato", f"${_cs['cumulative_pnl']:+,.0f}",
+                      help="Somma dei trade chiusi")
+        _cc[2].metric("P&L latente (aperte)",
+                      f"${_unreal['total_unrealized']:+,.0f}" if _has_data else "—",
+                      help="Valore attuale delle posizioni aperte (richiede chain caricata)")
+        _cc[3].metric("Equity totale",
+                      f"${_total_equity:,.0f}" if _has_data else f"${_cs['account_value']:,.0f}",
+                      help="Capitale + P&L latente")
+        _cc[4].metric("Posizioni", f"{_cs['n_open']} aperte / {_cs['n_closed']} chiuse")
+
+        if not _cs['is_safe']:
+            st.error(f"🚨 Hard stop: drawdown {_cs['drawdown_pct']:.0f}% ha superato il 50%.")
+        elif _cs['danger_zone']:
+            st.warning(f"⚠️ Zona di pericolo: drawdown {_cs['drawdown_pct']:.0f}%.")
+        if not _has_data and _cs['n_open'] > 0:
+            st.caption("💡 Carica la chain (CARICA FULL CHAIN) per vedere il P&L latente "
+                       "in tempo reale delle posizioni aperte.")
+
+        # ── Live signal preview (informational — engine decides at close) ─────
+        _has_data = ("data" in st.session_state and
+                     st.session_state["data"].get("raw_full") is not None)
+        if _has_data:
+            _dd = st.session_state["data"]
+            _spot = _dd.get("spot", 0)
+            _ga = compute_gex_analytics(_dd.get("raw_full"), _dd.get("by_strike"), _spot) or {}
+            _m0 = compute_0dte_metrics(_dd.get("raw_full"), _spot) or {}
+            _regime = 'LONG' if _ga.get('net_gex_total', 0) >= 0 else 'SHORT'
+            _hhi = _ga.get('hhi', 0.0)
+            _atm_iv = _m0.get('atm_iv')
+            _vp = None
+            _vix_h = _dd.get("vix_hist"); _ohlc = _dd.get("ohlc_spx")
+            if _vix_h is not None and not _vix_h.empty and _ohlc is not None and not _ohlc.empty:
+                try:
+                    _rv = compute_rvol_all(_ohlc, window=126)
+                    _vixv = float(_vix_h["vix"].iloc[-1] * 100)
+                    if "EWMA λ=0.94" in _rv.columns:
+                        _vp = _vixv - float(_rv["EWMA λ=0.94"].iloc[-1])
+                except Exception:
+                    pass
+            _dec = tl.evaluate_signal(_spot, _regime, _hhi, _vp, _atm_iv,
+                                      _m0.get('exp_move_pts'))
+            st.markdown("---")
+            st.markdown("**🔍 Anteprima segnale corrente** "
+                        "<span style='font-size:11px;color:#9CA3AF;'>(indicativa — "
+                        "il motore decide alla chiusura)</span>", unsafe_allow_html=True)
+            _sc = st.columns(4)
+            _sc[0].metric("Regime GEX", _regime)
+            _sc[1].metric("HHI", f"{_hhi:.4f}")
+            _sc[2].metric("Vol Premium", f"{_vp:+.1f}%" if _vp is not None else "—")
+            _sc[3].metric("ATM IV",
+                          f"{(_atm_iv*100 if _atm_iv and _atm_iv<1 else _atm_iv):.1f}%"
+                          if _atm_iv else "—")
+            st.markdown(_dec.summary_html, unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # ── Positions history ─────────────────────────────────────────────────
+        if not _pos.empty:
+            st.markdown("**📋 Storico posizioni simulate** "
+                        "<span style='font-size:11px;color:#9CA3AF;'>(generato "
+                        "automaticamente dal motore)</span>", unsafe_allow_html=True)
+            _show = _pos[['id','open_date','strategy','xsp_strike','entry_premium',
+                          'confidence','status','close_date','pnl_usd','exit_reason']].copy()
+            # Add live unrealized P&L column for open positions
+            def _live_pnl(row):
+                if str(row['status']) == 'OPEN':
+                    info = _unreal['by_id'].get(int(row['id']))
+                    if info:
+                        return f"${info['unrealized']:+.0f} ({info['ratio']:.1f}×)"
+                    return "—"
+                return ""
+            _show['P&L latente'] = _pos.apply(_live_pnl, axis=1)
+            st.dataframe(_show, use_container_width=True, hide_index=True)
+
+            # Equity curve from closed trades
+            _closed = _pos[_pos['status'] == 'CLOSED'].copy()
+            if not _closed.empty:
+                _closed['pnl_num'] = pd.to_numeric(_closed['pnl_usd'], errors='coerce').fillna(0)
+                _eq = _closed['pnl_num'].cumsum().tolist()
+                _efig = go.Figure()
+                _efig.add_scatter(y=_eq, mode='lines+markers',
+                                  line=dict(color='#6C63FF', width=2.5),
+                                  fill='tozeroy', fillcolor='rgba(108,99,255,0.08)')
+                _efig.add_hline(y=0, line_color='#E5E7EB', line_width=1)
+                _efig.update_layout(height=240, paper_bgcolor='rgba(0,0,0,0)',
+                                    plot_bgcolor='#F9FAFB',
+                                    yaxis_title='P&L cumulativo ($)', xaxis_title='Trade #',
+                                    margin=dict(t=10,b=30,l=50,r=10), showlegend=False)
+                st.plotly_chart(_efig, use_container_width=True)
+
+            st.download_button("⬇ Esporta CSV", _pos.to_csv(index=False).encode(),
+                               file_name="paper_trades.csv", mime="text/csv", key="dl_paper")
+        else:
+            st.info("Nessuna posizione ancora. Il motore automatico registrerà il primo "
+                    "trade quando il segnale sarà favorevole (la maggior parte dei giorni "
+                    "è SKIP — comportamento corretto per il long-vol).")
+
+        # ── Process metrics ───────────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("**📊 Metriche di processo (fase di validazione)**")
+        _pm = tl.process_metrics(SNAPSHOT_DIR)
+        _pc = st.columns(4)
+        _pc[0].metric("Snapshot raccolti", f"{_pm['snapshots']}")
+        _pc[1].metric("Trade chiusi", f"{_pm['n_closed']}/{_pm['sample_target']}",
+                      delta=f"{_pm['sample_pct']:.0f}%")
+        _pc[2].metric("Win rate",
+                      f"{_pm['win_rate']*100:.0f}%" if _pm['win_rate'] is not None else "—")
+        _pc[3].metric("Posizioni aperte", f"{_pm['n_open']}")
+        st.caption("Obiettivo Fase 1: ≥ 20 trade chiusi, processo coerente. "
+                   "Il profitto è secondario — conta validare che la logica funzioni in automatico.")
+
+    except ImportError:
+        st.error("Modulo trading_lite.py non trovato nella root del progetto.")
+    except Exception as _te:
+        st.error(f"Errore: {_te}")
+        import traceback as _tb
+        st.code(_tb.format_exc())
+
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown("---")

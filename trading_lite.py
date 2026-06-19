@@ -30,6 +30,7 @@ All state is CSV-based. No database, no IB, no background process.
 from __future__ import annotations
 import os
 import math
+import json
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date
 from typing import Optional
@@ -104,6 +105,9 @@ class LiteDecision:
     xsp_strike:  float = 0.0          # execution-space (XSP) strike
     est_premium: float = 0.0          # estimated premium in points (XSP)
     factors:     list = field(default_factory=list)
+    conditions:  list = field(default_factory=list)   # per-condition verdicts
+    legs:        list = field(default_factory=list)    # explicit option legs
+    explanation: str = ''             # human-readable why TRADE / why SKIP
     skip_reason: str = ''
 
     @property
@@ -131,10 +135,22 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
     iv = (atm_iv or 0.18) * 100 if (atm_iv and atm_iv < 1) else (atm_iv or 18.0)
     vp = vol_premium if vol_premium is not None else 5.0
     factors = []
+    conditions = []   # (label, met:bool, detail)
+
+    def cond(label, met, detail):
+        conditions.append({'label': label, 'met': bool(met), 'detail': detail})
 
     # Hard skip: vol too expensive to buy
     if iv > IV_SKIP_ABOVE:
+        cond("Vol acquistabile", False,
+             f"IV {iv:.1f}% > {IV_SKIP_ABOVE}% (soglia max) — vol troppo cara")
         d.skip_reason = f"IV {iv:.1f}% > {IV_SKIP_ABOVE}% — vol troppo cara da comprare"
+        d.conditions = conditions
+        d.explanation = (
+            f"❌ NESSUN TRADE. La volatilità implicita ({iv:.1f}%) è sopra la soglia "
+            f"massima di acquisto ({IV_SKIP_ABOVE}%). Comprare vol così cara elimina il "
+            f"vantaggio della strategia long-vol: si paga troppo premio. Il sistema "
+            f"aspetta che l'IV scenda prima di considerare un acquisto.")
         return d
 
     score = 0.0
@@ -142,57 +158,139 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
     if iv < IV_CHEAP_BELOW:
         score += min((IV_CHEAP_BELOW - iv) / IV_CHEAP_BELOW, 1.0) * 0.35
         factors.append(f"IV {iv:.1f}% &lt; {IV_CHEAP_BELOW}% — vol economica")
+        cond("IV economica", True,
+             f"IV {iv:.1f}% < {IV_CHEAP_BELOW}% — vol a buon mercato (+0.35 max)")
     elif iv < 20:
         score += 0.10
         factors.append(f"IV {iv:.1f}% — moderata")
+        cond("IV economica", False,
+             f"IV {iv:.1f}% moderata (tra {IV_CHEAP_BELOW}% e 20%) — solo +0.10")
+    else:
+        cond("IV economica", False,
+             f"IV {iv:.1f}% non economica (≥ 20%) — nessun bonus")
+
     # 2. Low/negative vol premium (0-0.25)
     if vp < VP_BUY_BELOW:
         score += 0.25
         factors.append(f"Vol Premium {vp:+.1f}% basso — IV sottovalutata vs RVol")
+        cond("Vol Premium basso", True,
+             f"VP {vp:+.1f}% < {VP_BUY_BELOW}% — IV sottovalutata vs realizzata (+0.25)")
     elif vp < 4:
         score += 0.10
+        cond("Vol Premium basso", False,
+             f"VP {vp:+.1f}% intermedio (tra {VP_BUY_BELOW}% e 4%) — solo +0.10")
+    else:
+        cond("Vol Premium basso", False,
+             f"VP {vp:+.1f}% alto (≥ 4%) — l'IV è cara vs la realizzata, sfavorevole")
+
     # 3. SHORT gamma regime (0-0.25)
     if regime == 'SHORT':
         score += 0.25
         factors.append("Regime SHORT γ — i dealer amplificano i movimenti")
-    elif regime == 'LONG':
+        cond("Regime SHORT gamma", True,
+             "Dealer SHORT gamma — amplificano i movimenti, favorevole per long-vol (+0.25)")
+    else:
+        cond("Regime SHORT gamma", False,
+             "Regime LONG γ — i dealer stabilizzano il mercato, sfavorevole per long-vol")
         factors.append("Regime LONG γ — i dealer stabilizzano (sfavorevole)")
+
     # 4. Low HHI bonus / high HHI penalty (pinning is bad for long vol)
     if hhi >= 0.06:
         score -= 0.12
         factors.append(f"HHI {hhi:.3f} alto — pinning, il prezzo resta fermo (sfavorevole)")
+        cond("Niente pinning forte", False,
+             f"HHI {hhi:.3f} ≥ 0.06 — GEX concentrato, il prezzo tende a restare fermo (−0.12)")
     elif hhi < 0.02:
         score += 0.08
         factors.append(f"HHI {hhi:.3f} basso — niente pinning forte")
+        cond("Niente pinning forte", True,
+             f"HHI {hhi:.3f} < 0.02 — GEX distribuito, il prezzo può muoversi (+0.08)")
+    else:
+        cond("Niente pinning forte", False,
+             f"HHI {hhi:.3f} intermedio (tra 0.02 e 0.06) — nessun bonus né penalità")
 
     score = max(0.0, min(1.0, score))
+    d.confidence = round(score, 3)
+    d.conditions = conditions
+
+    _met = [c for c in conditions if c['met']]
+    _unmet = [c for c in conditions if not c['met']]
 
     if score < MIN_CONFIDENCE:
         d.skip_reason = (f"Conviction {score:.2f} &lt; {MIN_CONFIDENCE} — "
                          "condizioni non abbastanza favorevoli per comprare vol")
-        d.confidence = score
+        # Build explanation of what was missing
+        missing = "; ".join(c['label'] for c in _unmet) or "nessuna condizione chiave"
+        present = "; ".join(c['label'] for c in _met) or "nessuna"
+        d.explanation = (
+            f"❌ NESSUN TRADE. Punteggio di convinzione {score:.2f}, sotto la soglia "
+            f"minima di {MIN_CONFIDENCE}. Per comprare volatilità servono abbastanza "
+            f"condizioni favorevoli allineate.\n\n"
+            f"✓ Condizioni soddisfatte: {present}.\n"
+            f"✗ Condizioni mancanti: {missing}.\n\n"
+            f"Questo è il comportamento corretto: il long-vol entra solo quando "
+            f"l'occasione è chiara (vol economica + regime favorevole + niente pinning). "
+            f"La maggior parte dei giorni il sistema resta in attesa.")
         return d
 
     # TRADE — choose strategy
     strategy = 'long_straddle' if (iv < IV_CHEAP_BELOW and score > 0.6) else 'long_strangle'
-    em_mult  = 0.0 if strategy == 'long_straddle' else 1.0
 
-    # Strike in signal (SPX) space
-    em   = expected_move or (spot * (iv / 100) / math.sqrt(252) * math.sqrt(DTE_TARGET))
-    strike_spx = round((spot + em_mult * em) / 5) * 5
-
-    # Translate to XSP execution space
-    xsp_strike = round((strike_spx / SPX_XSP_RATIO) / 5) * 5
     xsp_spot   = spot / SPX_XSP_RATIO
     T          = DTE_TARGET / 365.0
-    est_prem   = straddle_price(xsp_spot, xsp_strike, T, iv / 100)
+    iv_dec     = iv / 100
+    em_xsp     = (expected_move / SPX_XSP_RATIO if expected_move
+                  else xsp_spot * iv_dec / math.sqrt(252) * math.sqrt(DTE_TARGET))
+
+    # Build explicit legs (each: side, type, strike, premium per contract in $)
+    legs = []
+    if strategy == 'long_straddle':
+        # Buy ATM call + ATM put at the same strike
+        k = round(xsp_spot / 5) * 5
+        cp = bs_price(xsp_spot, k, T, R_FREE, iv_dec, 'c')
+        pp = bs_price(xsp_spot, k, T, R_FREE, iv_dec, 'p')
+        legs.append({'side': 'BUY', 'type': 'CALL', 'strike': k,
+                     'premium_pts': round(cp, 2), 'premium_usd': round(cp * 100, 0)})
+        legs.append({'side': 'BUY', 'type': 'PUT', 'strike': k,
+                     'premium_pts': round(pp, 2), 'premium_usd': round(pp * 100, 0)})
+        xsp_strike = k
+    else:
+        # Long strangle: buy OTM call (above) + OTM put (below), ~1 EM apart
+        kc = round((xsp_spot + em_xsp) / 5) * 5
+        kp = round((xsp_spot - em_xsp) / 5) * 5
+        cp = bs_price(xsp_spot, kc, T, R_FREE, iv_dec, 'c')
+        pp = bs_price(xsp_spot, kp, T, R_FREE, iv_dec, 'p')
+        legs.append({'side': 'BUY', 'type': 'CALL', 'strike': kc,
+                     'premium_pts': round(cp, 2), 'premium_usd': round(cp * 100, 0)})
+        legs.append({'side': 'BUY', 'type': 'PUT', 'strike': kp,
+                     'premium_pts': round(pp, 2), 'premium_usd': round(pp * 100, 0)})
+        xsp_strike = kc  # reference strike for display (call side)
+
+    est_prem   = sum(l['premium_pts'] for l in legs)
+    strike_spx = round(xsp_strike * SPX_XSP_RATIO / 5) * 5
+
+    _strat_name = {'long_straddle': 'Long Straddle (ATM)',
+                   'long_strangle': 'Long Strangle (OTM)'}.get(strategy, strategy)
+    _legs_txt = "  |  ".join(
+        f"{l['side']} {l['type']} {l['strike']:.0f} @ {l['premium_pts']:.2f} "
+        f"(~${l['premium_usd']:.0f})" for l in legs)
+    present = "; ".join(c['label'] for c in _met) or "nessuna"
+    d.explanation = (
+        f"✅ TRADE: {_strat_name}. Punteggio di convinzione {score:.2f}, sopra la "
+        f"soglia minima di {MIN_CONFIDENCE}. Le condizioni favorevoli si sono allineate.\n\n"
+        f"✓ Condizioni che hanno guidato la decisione: {present}.\n\n"
+        f"Gambe dell'operazione (su XSP):\n{_legs_txt}\n\n"
+        f"Strategia {'straddle ATM' if strategy=='long_straddle' else 'strangle OTM'} "
+        f"perché {'IV molto economica e convinzione alta — si compra al denaro per la massima sensibilità al movimento' if strategy=='long_straddle' else 'convinzione moderata — strangle OTM più economico, serve un movimento più ampio'}. "
+        f"Scadenza {DTE_TARGET} giorni, premio totale {est_prem:.2f} punti "
+        f"(~${est_prem*100:.0f}). Perdita massima limitata al premio pagato.")
 
     d.action      = 'TRADE'
     d.strategy    = strategy
-    d.confidence  = round(score, 3)
     d.strike      = strike_spx
     d.xsp_strike  = xsp_strike
     d.est_premium = round(est_prem, 2)
+    d.legs        = legs
     d.factors     = factors
     return d
 
@@ -204,7 +302,7 @@ _POS_COLS = ['id', 'open_date', 'mode', 'strategy', 'signal_spot', 'xsp_spot',
              'xsp_strike', 'dte_target', 'entry_iv', 'entry_premium',
              'n_contracts', 'confidence', 'status', 'close_date',
              'exit_premium', 'pnl_usd', 'exit_reason',
-             'regime', 'vol_premium', 'hhi']
+             'regime', 'vol_premium', 'hhi', 'decision_note', 'legs_json']
 
 
 def _ensure_dir():
@@ -301,6 +399,95 @@ def import_positions(uploaded_df: pd.DataFrame, mode: str = 'merge') -> dict:
     return summary
 
 
+def reconstruct_legs_for_row(row) -> Optional[list]:
+    """Approximate the option legs for a PAST trade that has no legs_json.
+
+    WARNING: this is a RECONSTRUCTION, not the original data. It re-derives
+    the legs from the saved xsp_spot, xsp_strike, entry_iv, strategy and DTE.
+    The strikes may differ slightly from what was actually chosen at the time
+    because rounding and the expected-move estimate are recomputed now.
+    Use only for display of historical trades; treat the numbers as estimates.
+
+    Returns a list of leg dicts (same shape as decision.legs) or None.
+    """
+    try:
+        strat   = str(row.get('strategy', ''))
+        xsp_spot = float(row.get('xsp_spot') or 0)
+        xsp_k    = float(row.get('xsp_strike') or 0)
+        iv       = float(row.get('entry_iv') or 0)
+        dte      = int(float(row.get('dte_target') or DTE_TARGET))
+    except Exception:
+        return None
+
+    if xsp_spot <= 0 or iv <= 0:
+        return None
+
+    iv_dec = iv / 100 if iv > 1 else iv
+    T      = max(dte / 365.0, 1e-4)
+
+    legs = []
+    if strat == 'long_straddle':
+        k = xsp_k if xsp_k > 0 else round(xsp_spot / 5) * 5
+        cp = bs_price(xsp_spot, k, T, R_FREE, iv_dec, 'c')
+        pp = bs_price(xsp_spot, k, T, R_FREE, iv_dec, 'p')
+        legs = [
+            {'side': 'BUY', 'type': 'CALL', 'strike': k,
+             'premium_pts': round(cp, 2), 'premium_usd': round(cp * 100, 0)},
+            {'side': 'BUY', 'type': 'PUT', 'strike': k,
+             'premium_pts': round(pp, 2), 'premium_usd': round(pp * 100, 0)},
+        ]
+    elif strat == 'long_strangle':
+        # Reconstruct OTM strikes around spot using the same EM logic
+        em_xsp = xsp_spot * iv_dec / math.sqrt(252) * math.sqrt(dte)
+        kc = xsp_k if xsp_k > 0 else round((xsp_spot + em_xsp) / 5) * 5
+        kp = round((xsp_spot - em_xsp) / 5) * 5
+        cp = bs_price(xsp_spot, kc, T, R_FREE, iv_dec, 'c')
+        pp = bs_price(xsp_spot, kp, T, R_FREE, iv_dec, 'p')
+        legs = [
+            {'side': 'BUY', 'type': 'CALL', 'strike': kc,
+             'premium_pts': round(cp, 2), 'premium_usd': round(cp * 100, 0)},
+            {'side': 'BUY', 'type': 'PUT', 'strike': kp,
+             'premium_pts': round(pp, 2), 'premium_usd': round(pp * 100, 0)},
+        ]
+    else:
+        return None
+
+    return legs if legs else None
+
+
+def backfill_legs() -> dict:
+    """Reconstruct and SAVE approximate legs for past trades missing legs_json.
+
+    Marks reconstructed legs with 'reconstructed': True so the UI can flag them
+    as estimates. Returns a summary {filled, skipped, total}.
+    """
+    df = load_positions()
+    summary = {'filled': 0, 'skipped': 0, 'total': len(df)}
+    if df.empty:
+        return summary
+
+    if 'legs_json' not in df.columns:
+        df['legs_json'] = ''
+    df['legs_json'] = df['legs_json'].astype(object)
+
+    for idx, row in df.iterrows():
+        existing = row.get('legs_json')
+        if isinstance(existing, str) and existing.strip():
+            summary['skipped'] += 1          # already has real legs
+            continue
+        legs = reconstruct_legs_for_row(row)
+        if legs:
+            for l in legs:
+                l['reconstructed'] = True     # flag as estimate
+            df.at[idx, 'legs_json'] = json.dumps(legs)
+            summary['filled'] += 1
+        else:
+            summary['skipped'] += 1
+
+    _save_positions(df)
+    return summary
+
+
 def open_paper_position(decision: LiteDecision, spot: float,
                         regime: str, vol_premium: float, hhi: float,
                         atm_iv: float) -> int:
@@ -317,6 +504,8 @@ def open_paper_position(decision: LiteDecision, spot: float,
         'confidence': decision.confidence, 'status': 'OPEN', 'close_date': '',
         'exit_premium': '', 'pnl_usd': '', 'exit_reason': '',
         'regime': regime, 'vol_premium': vol_premium, 'hhi': hhi,
+        'decision_note': decision.explanation,
+        'legs_json': json.dumps(decision.legs) if decision.legs else '',
     }
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     _save_positions(df)

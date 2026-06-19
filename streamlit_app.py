@@ -1323,6 +1323,41 @@ with tab7:
                           if _atm_iv else "—")
             st.markdown(_dec.summary_html, unsafe_allow_html=True)
 
+            # Explicit option legs (what would be bought/sold)
+            if _dec.action == 'TRADE' and _dec.legs:
+                st.markdown("<span style='font-size:12px;'><b>Gambe dell'operazione "
+                            "(XSP):</b></span>", unsafe_allow_html=True)
+                _legrows = [{
+                    'Lato': l['side'], 'Tipo': l['type'],
+                    'Strike': f"{l['strike']:.0f}",
+                    'Premio (punti)': f"{l['premium_pts']:.2f}",
+                    'Premio ($)': f"${l['premium_usd']:.0f}",
+                } for l in _dec.legs]
+                _legrows.append({
+                    'Lato': '', 'Tipo': 'TOTALE', 'Strike': '',
+                    'Premio (punti)': f"{_dec.est_premium:.2f}",
+                    'Premio ($)': f"${_dec.est_premium*100:.0f}",
+                })
+                st.dataframe(pd.DataFrame(_legrows), use_container_width=True,
+                             hide_index=True)
+
+            # Per-condition checklist + explanation
+            if _dec.conditions:
+                _cccols = st.columns(2)
+                for _i, _c in enumerate(_dec.conditions):
+                    _icon = "✅" if _c['met'] else "❌"
+                    _cccols[_i % 2].markdown(
+                        f"<span style='font-size:12px;'>{_icon} <b>{_c['label']}</b><br>"
+                        f"<span style='color:#6B7280;'>{_c['detail']}</span></span>",
+                        unsafe_allow_html=True)
+            if _dec.explanation:
+                _exp_color = '#10B981' if _dec.action == 'TRADE' else '#9CA3AF'
+                st.markdown(
+                    f"<div style='background:{_exp_color}12;border-left:3px solid {_exp_color};"
+                    f"border-radius:4px;padding:10px 14px;margin-top:8px;font-size:13px;'>"
+                    + _dec.explanation.replace(chr(10), '<br>') + "</div>",
+                    unsafe_allow_html=True)
+
         st.markdown("---")
 
         # ── Positions history ─────────────────────────────────────────────────
@@ -1342,6 +1377,60 @@ with tab7:
                 return ""
             _show['P&L latente'] = _pos.apply(_live_pnl, axis=1)
             st.dataframe(_show, use_container_width=True, hide_index=True)
+
+            # Backfill: reconstruct legs for past trades missing them
+            _missing_legs = 0
+            if 'legs_json' in _pos.columns:
+                _missing_legs = int(_pos['legs_json'].apply(
+                    lambda x: not (isinstance(x, str) and x.strip())).sum())
+            else:
+                _missing_legs = len(_pos)
+            if _missing_legs > 0:
+                _bc1, _bc2 = st.columns([3, 1])
+                _bc1.caption(f"⚠️ {_missing_legs} trade passati non hanno il dettaglio "
+                             "delle gambe (registrati prima dell'aggiornamento).")
+                if _bc2.button("🔧 Ricostruisci gambe", key="backfill_legs"):
+                    _res = tl.backfill_legs()
+                    st.success(f"Ricostruite le gambe per {_res['filled']} trade "
+                               f"(saltati {_res['skipped']}). Sono STIME, non i dati "
+                               f"originali del momento dell'apertura.")
+                    st.rerun()
+
+            # Per-trade decision rationale (why each trade was opened)
+            if 'decision_note' in _pos.columns:
+                with st.expander("📝 Motivazione di ogni trade (perché è stato aperto)",
+                                 expanded=False):
+                    for _, _r in _pos.iterrows():
+                        _note = _r.get('decision_note')
+                        if isinstance(_note, str) and _note.strip():
+                            st.markdown(
+                                f"**Trade #{int(_r['id'])}** — {_r['open_date']} · "
+                                f"{_r['strategy']} · XSP {_r['xsp_strike']}")
+                            # Show explicit legs if available
+                            _lj = _r.get('legs_json')
+                            if isinstance(_lj, str) and _lj.strip():
+                                try:
+                                    import json as _json
+                                    _legs = _json.loads(_lj)
+                                    _is_recon = any(l.get('reconstructed') for l in _legs)
+                                    _lr = [{
+                                        'Lato': l['side'], 'Tipo': l['type'],
+                                        'Strike': f"{l['strike']:.0f}",
+                                        'Premio (punti)': f"{l['premium_pts']:.2f}",
+                                        'Premio ($)': f"${l['premium_usd']:.0f}",
+                                    } for l in _legs]
+                                    st.dataframe(pd.DataFrame(_lr),
+                                                 use_container_width=True, hide_index=True)
+                                    if _is_recon:
+                                        st.caption("⚠️ Gambe RICOSTRUITE (stime ricalcolate, "
+                                                   "non i dati originali dell'apertura).")
+                                except Exception:
+                                    pass
+                            st.markdown(
+                                f"<div style='font-size:12px;color:#4B5563;"
+                                f"margin-bottom:10px;'>"
+                                + str(_note).replace(chr(10), '<br>') + "</div>",
+                                unsafe_allow_html=True)
 
             # Equity curve from closed trades
             _closed = _pos[_pos['status'] == 'CLOSED'].copy()

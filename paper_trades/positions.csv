@@ -1,2 +1,2 @@
 id,open_date,mode,strategy,signal_spot,xsp_spot,xsp_strike,dte_target,entry_iv,entry_premium,n_contracts,confidence,status,close_date,exit_premium,pnl_usd,exit_reason,regime,vol_premium,hhi
-1,2026-06-18,long_vol,long_strangle,7500.58,750.058,810,45,1.29515,55.94,1,0.502,OPEN,,,,,LONG,2.148328645748748,0.0015382257137179
+

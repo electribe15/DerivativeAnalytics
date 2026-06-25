@@ -1589,17 +1589,23 @@ with tab8:
 
     with st.expander("ℹ️ Nota su trademark e differenze rispetto all'indice ufficiale",
                      expanded=False):
-        st.markdown("""
-- **Non è il prodotto Nations Indexes/Nasdaq licenziato.** VolDex®, VOLQ®,
-  CallDex®, PutDex® e TailDex® sono marchi registrati dei rispettivi proprietari.
-- Questa è un'implementazione originale della **metodologia pubblicata**
-  (formula di Brenner-Subrahmanyam su strike ATM, pesati con kernel triangolare,
-  interpolati a 30 giorni), calcolata qui su **SPX** invece che su NDX.
-- I prezzi usati sono **mid-quote** dal feed dati di questa dashboard, non
-  NBBO real-time come l'indice ufficiale.
-- I valori assoluti **non coincideranno** con il ticker VOLQ/VolDex ufficiale —
-  è una misura indipendente, stessa metodologia, sottostante diverso.
-        """)
+        st.markdown(
+            "<div style='color:#1A1A2E;font-size:13px;line-height:1.6;'>"
+            "<ul style='margin:0;padding-left:18px;'>"
+            "<li><b>Non è il prodotto Nations Indexes/Nasdaq licenziato.</b> "
+            "VolDex®, VOLQ®, CallDex®, PutDex® e TailDex® sono marchi registrati "
+            "dei rispettivi proprietari.</li>"
+            "<li>Questa è un'implementazione originale della <b>metodologia "
+            "pubblicata</b> (formula di Brenner-Subrahmanyam su strike ATM, pesati "
+            "con kernel triangolare, interpolati a 30 giorni), calcolata qui su "
+            "<b>SPX</b> invece che su NDX.</li>"
+            "<li>I prezzi usati sono <b>mid-quote</b> dal feed dati di questa "
+            "dashboard, non NBBO real-time come l'indice ufficiale.</li>"
+            "<li>I valori assoluti <b>non coincideranno</b> con il ticker "
+            "VOLQ/VolDex ufficiale — è una misura indipendente, stessa metodologia, "
+            "sottostante diverso.</li>"
+            "</ul></div>",
+            unsafe_allow_html=True)
 
     try:
         _has_data8 = ("data" in st.session_state and

@@ -56,10 +56,26 @@ IV_CHEAP_BELOW       = 16.0
 IV_SKIP_ABOVE        = 28.0
 VP_BUY_BELOW         = 2.0
 DTE_TARGET           = 45
-PROFIT_TARGET_MULT   = 2.5
-STOP_LOSS_PCT        = 50.0
+PROFIT_TARGET_MULT   = 2.5     # full profit target — hard ceiling, always closes
+STOP_LOSS_PCT        = 50.0    # stop loss: close if premium falls to this % of entry
 MIN_CONFIDENCE       = 0.45
 HOLD_DTE_FLOOR       = 14
+
+# ── Trailing stop (Option A) — lock in profit before it evaporates ──────────────
+# Once a position's value reaches TRAIL_ARM_MULT × entry, a trailing stop arms.
+# After that, if the value retraces TRAIL_GIVEBACK_PCT % from its peak, the
+# position is closed to bank the gain — instead of waiting for the full 2.5×
+# target that may never come. This directly addresses the "a winning position
+# turning into a loss" problem.
+TRAIL_ARM_MULT       = 1.5     # trailing stop activates once value ≥ 1.5× entry
+TRAIL_GIVEBACK_PCT   = 25.0    # close if value falls 25% from the peak reached
+
+# ── VolDex exit (best-effort reinforcement of the same principle) ───────────────
+# The long-vol thesis is "I bought vol cheap; close when vol is no longer cheap."
+# If VolDex has risen VOLDEX_EXIT_MULT × above its entry level AND the position
+# is in profit, the thesis has played out — close. This only fires when VolDex
+# is computable; it never blocks the engine if VolDex is unavailable.
+VOLDEX_EXIT_MULT     = 1.40    # close if VolDex ≥ 1.40× the entry VolDex (+40%)
 
 # Risk-free + dividend (match dashboard)
 R_FREE               = 0.053221
@@ -92,6 +108,26 @@ def straddle_price(S, K, T, sigma):
     return bs_price(S, K, T, R_FREE, sigma, 'c') + bs_price(S, K, T, R_FREE, sigma, 'p')
 
 
+def legs_value(legs: list, S: float, T: float, sigma: float) -> float:
+    """Mark-to-model value of an explicit list of option legs.
+
+    Generalises straddle_price() to any combination of legs (straddle,
+    strangle, single put, etc.) — BUY legs add value, SELL legs subtract,
+    each leg's own strike/type/quantity is respected. This is the valuation
+    used by mark_and_manage()/compute_unrealized() for OPEN positions,
+    so a strangle (two different strikes) is revalued correctly instead of
+    being approximated as a straddle on a single strike.
+    """
+    total = 0.0
+    for l in legs:
+        sign = 1.0 if l.get('side', 'BUY') == 'BUY' else -1.0
+        qty  = float(l.get('qty', 1))
+        flag = 'c' if l.get('type') == 'CALL' else 'p'
+        px   = bs_price(S, float(l['strike']), T, R_FREE, sigma, flag)
+        total += sign * qty * px
+    return total
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Decision
 # ══════════════════════════════════════════════════════════════════════════════
@@ -116,7 +152,8 @@ class LiteDecision:
             return f"<b style='color:#9CA3AF'>⏸ SKIP</b> — {self.skip_reason}"
         color = '#10B981' if self.confidence > 0.6 else '#F59E0B'
         strat = {'long_straddle': '🎯 Long Straddle',
-                 'long_strangle': '🎲 Long Strangle'}.get(self.strategy, self.strategy)
+                 'long_strangle': '🎲 Long Strangle',
+                 'long_put': '🛡 Long Put (tail)'}.get(self.strategy, self.strategy)
         return (f"<b style='color:{color}'>{strat}</b> · "
                 f"DTE {self.target_dte} · XSP strike {self.xsp_strike:.0f} · "
                 f"premio stim. {self.est_premium:.2f} · "
@@ -125,14 +162,36 @@ class LiteDecision:
 
 def evaluate_signal(spot: float, regime: str, hhi: float,
                     vol_premium: Optional[float], atm_iv: Optional[float],
-                    expected_move: Optional[float]) -> LiteDecision:
+                    expected_move: Optional[float],
+                    voldex: Optional[float] = None,
+                    calldex: Optional[float] = None,
+                    putdex: Optional[float] = None,
+                    taildex: Optional[float] = None,
+                    skew_trend: Optional[float] = None) -> LiteDecision:
     """Long-vol decision from the analytics the dashboard already computes.
 
     Simplified mirror of LongVolSelector.select() — uses the core signals
-    available without market_context (IV level, VP, regime, HHI).
+    available without market_context (IV level, VP, regime, HHI), PLUS the
+    VolDex suite when available:
+      voldex      — ATM 30-day implied vol (%) — preferred IV source over
+                    the raw single-strike atm_iv when present (cleaner signal)
+      calldex/putdex — ~16-delta OTM call/put IV (%) — used for the skew reading
+      taildex     — ~10-delta (deeper OTM) put IV (%) — tail-risk proxy
+      skew_trend  — today's (putdex-calldex) minus its recent rolling average,
+                    in percentage points. Positive = skew widening (stress
+                    building). Computed by the caller from voldex_history.csv
+                    since this module stays self-contained / file-system free.
+
+    All VolDex-derived parameters are OPTIONAL and the function degrades
+    gracefully to the original IV-only logic if they are None — the
+    automatic engine must never block on a chain that can't produce VolDex.
     """
     d = LiteDecision()
-    iv = (atm_iv or 0.18) * 100 if (atm_iv and atm_iv < 1) else (atm_iv or 18.0)
+    # Prefer VolDex (cleaner ATM measure) over the single-strike atm_iv
+    if voldex is not None:
+        iv = voldex
+    else:
+        iv = (atm_iv or 0.18) * 100 if (atm_iv and atm_iv < 1) else (atm_iv or 18.0)
     vp = vol_premium if vol_premium is not None else 5.0
     factors = []
     conditions = []   # (label, met:bool, detail)
@@ -140,34 +199,36 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
     def cond(label, met, detail):
         conditions.append({'label': label, 'met': bool(met), 'detail': detail})
 
+    iv_source = "VolDex" if voldex is not None else "IV singolo strike"
+
     # Hard skip: vol too expensive to buy
     if iv > IV_SKIP_ABOVE:
         cond("Vol acquistabile", False,
-             f"IV {iv:.1f}% > {IV_SKIP_ABOVE}% (soglia max) — vol troppo cara")
+             f"IV ({iv_source}) {iv:.1f}% > {IV_SKIP_ABOVE}% (soglia max) — vol troppo cara")
         d.skip_reason = f"IV {iv:.1f}% > {IV_SKIP_ABOVE}% — vol troppo cara da comprare"
         d.conditions = conditions
         d.explanation = (
-            f"❌ NESSUN TRADE. La volatilità implicita ({iv:.1f}%) è sopra la soglia "
-            f"massima di acquisto ({IV_SKIP_ABOVE}%). Comprare vol così cara elimina il "
-            f"vantaggio della strategia long-vol: si paga troppo premio. Il sistema "
-            f"aspetta che l'IV scenda prima di considerare un acquisto.")
+            f"❌ NESSUN TRADE. La volatilità implicita ({iv_source}: {iv:.1f}%) è sopra "
+            f"la soglia massima di acquisto ({IV_SKIP_ABOVE}%). Comprare vol così cara "
+            f"elimina il vantaggio della strategia long-vol: si paga troppo premio. "
+            f"Il sistema aspetta che l'IV scenda prima di considerare un acquisto.")
         return d
 
     score = 0.0
-    # 1. Cheap IV (0-0.35)
+    # 1. Cheap IV (0-0.30) — uses VolDex if available, else single-strike IV
     if iv < IV_CHEAP_BELOW:
-        score += min((IV_CHEAP_BELOW - iv) / IV_CHEAP_BELOW, 1.0) * 0.35
-        factors.append(f"IV {iv:.1f}% &lt; {IV_CHEAP_BELOW}% — vol economica")
+        score += min((IV_CHEAP_BELOW - iv) / IV_CHEAP_BELOW, 1.0) * 0.30
+        factors.append(f"IV ({iv_source}) {iv:.1f}% &lt; {IV_CHEAP_BELOW}% — vol economica")
         cond("IV economica", True,
-             f"IV {iv:.1f}% < {IV_CHEAP_BELOW}% — vol a buon mercato (+0.35 max)")
+             f"IV ({iv_source}) {iv:.1f}% < {IV_CHEAP_BELOW}% — vol a buon mercato (+0.30 max)")
     elif iv < 20:
         score += 0.10
-        factors.append(f"IV {iv:.1f}% — moderata")
+        factors.append(f"IV ({iv_source}) {iv:.1f}% — moderata")
         cond("IV economica", False,
-             f"IV {iv:.1f}% moderata (tra {IV_CHEAP_BELOW}% e 20%) — solo +0.10")
+             f"IV ({iv_source}) {iv:.1f}% moderata (tra {IV_CHEAP_BELOW}% e 20%) — solo +0.10")
     else:
         cond("IV economica", False,
-             f"IV {iv:.1f}% non economica (≥ 20%) — nessun bonus")
+             f"IV ({iv_source}) {iv:.1f}% non economica (≥ 20%) — nessun bonus")
 
     # 2. Low/negative vol premium (0-0.25)
     if vp < VP_BUY_BELOW:
@@ -209,6 +270,25 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
         cond("Niente pinning forte", False,
              f"HHI {hhi:.3f} intermedio (tra 0.02 e 0.06) — nessun bonus né penalità")
 
+    # 5. NEW — Skew dynamics (0-0.10): widening Put-Call skew = stress building
+    if skew_trend is not None:
+        if skew_trend > 0.5:
+            score += 0.10
+            factors.append(f"Skew Put−Call in espansione (+{skew_trend:.2f}pt "
+                           "vs media recente) — stress crescente")
+            cond("Skew in espansione", True,
+                 f"Skew oggi {skew_trend:+.2f}pt sopra la media recente — "
+                 "il mercato sta pagando più protezione al ribasso (+0.10)")
+        elif skew_trend < -0.5:
+            cond("Skew in espansione", False,
+                 f"Skew oggi {skew_trend:+.2f}pt sotto la media recente — "
+                 "in contrazione, nessun bonus")
+        else:
+            cond("Skew in espansione", False,
+                 f"Skew stabile ({skew_trend:+.2f}pt vs media) — nessun bonus")
+    else:
+        cond("Skew in espansione", False, "Dato non disponibile (serve storico VolDex)")
+
     score = max(0.0, min(1.0, score))
     d.confidence = round(score, 3)
     d.conditions = conditions
@@ -219,7 +299,6 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
     if score < MIN_CONFIDENCE:
         d.skip_reason = (f"Conviction {score:.2f} &lt; {MIN_CONFIDENCE} — "
                          "condizioni non abbastanza favorevoli per comprare vol")
-        # Build explanation of what was missing
         missing = "; ".join(c['label'] for c in _unmet) or "nessuna condizione chiave"
         present = "; ".join(c['label'] for c in _met) or "nessuna"
         d.explanation = (
@@ -233,8 +312,26 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
             f"La maggior parte dei giorni il sistema resta in attesa.")
         return d
 
-    # TRADE — choose strategy
-    strategy = 'long_straddle' if (iv < IV_CHEAP_BELOW and score > 0.6) else 'long_strangle'
+    # ── Strategy selection ───────────────────────────────────────────────────────
+    # Tail bias: if the tail (TailDex) is pricing meaningfully more than the
+    # moderate OTM put (PutDex), the market is signalling elevated crash risk.
+    # In that case prefer a SINGLE long OTM put — same bounded-risk philosophy
+    # as straddle/strangle (max loss = premium paid), but asymmetrically
+    # downside-oriented. We deliberately do NOT use a short-leg backspread
+    # here: a 1x2 ratio put backspread has a loss pocket between the strikes
+    # that can exceed the net premium paid, which would break the "max loss
+    # = premium paid" guarantee this whole system is built on.
+    tail_spread = (taildex - putdex) if (taildex is not None and putdex is not None) else None
+    bias_tail   = (tail_spread is not None and tail_spread > 1.5 and regime == 'SHORT')
+
+    if bias_tail:
+        strategy = 'long_put'
+        factors.append(f"TailDex−PutDex {tail_spread:+.2f}pt — coda più cara del corpo, "
+                       "rischio di coda in aumento")
+    elif iv < IV_CHEAP_BELOW and score > 0.6:
+        strategy = 'long_straddle'
+    else:
+        strategy = 'long_strangle'
 
     xsp_spot   = spot / SPX_XSP_RATIO
     T          = DTE_TARGET / 365.0
@@ -242,46 +339,61 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
     em_xsp     = (expected_move / SPX_XSP_RATIO if expected_move
                   else xsp_spot * iv_dec / math.sqrt(252) * math.sqrt(DTE_TARGET))
 
-    # Build explicit legs (each: side, type, strike, premium per contract in $)
+    # Build explicit legs (each: side, type, strike, qty, premium per contract)
     legs = []
     if strategy == 'long_straddle':
-        # Buy ATM call + ATM put at the same strike
         k = round(xsp_spot / 5) * 5
         cp = bs_price(xsp_spot, k, T, R_FREE, iv_dec, 'c')
         pp = bs_price(xsp_spot, k, T, R_FREE, iv_dec, 'p')
-        legs.append({'side': 'BUY', 'type': 'CALL', 'strike': k,
+        legs.append({'side': 'BUY', 'type': 'CALL', 'strike': k, 'qty': 1,
                      'premium_pts': round(cp, 2), 'premium_usd': round(cp * 100, 0)})
-        legs.append({'side': 'BUY', 'type': 'PUT', 'strike': k,
+        legs.append({'side': 'BUY', 'type': 'PUT', 'strike': k, 'qty': 1,
                      'premium_pts': round(pp, 2), 'premium_usd': round(pp * 100, 0)})
         xsp_strike = k
+    elif strategy == 'long_put':
+        # Single OTM put ~1 EM below spot — tail-oriented, bounded risk = premium
+        kp = round((xsp_spot - em_xsp) / 5) * 5
+        pp = bs_price(xsp_spot, kp, T, R_FREE, iv_dec, 'p')
+        legs.append({'side': 'BUY', 'type': 'PUT', 'strike': kp, 'qty': 1,
+                     'premium_pts': round(pp, 2), 'premium_usd': round(pp * 100, 0)})
+        xsp_strike = kp
     else:
-        # Long strangle: buy OTM call (above) + OTM put (below), ~1 EM apart
         kc = round((xsp_spot + em_xsp) / 5) * 5
         kp = round((xsp_spot - em_xsp) / 5) * 5
         cp = bs_price(xsp_spot, kc, T, R_FREE, iv_dec, 'c')
         pp = bs_price(xsp_spot, kp, T, R_FREE, iv_dec, 'p')
-        legs.append({'side': 'BUY', 'type': 'CALL', 'strike': kc,
+        legs.append({'side': 'BUY', 'type': 'CALL', 'strike': kc, 'qty': 1,
                      'premium_pts': round(cp, 2), 'premium_usd': round(cp * 100, 0)})
-        legs.append({'side': 'BUY', 'type': 'PUT', 'strike': kp,
+        legs.append({'side': 'BUY', 'type': 'PUT', 'strike': kp, 'qty': 1,
                      'premium_pts': round(pp, 2), 'premium_usd': round(pp * 100, 0)})
         xsp_strike = kc  # reference strike for display (call side)
 
-    est_prem   = sum(l['premium_pts'] for l in legs)
+    est_prem   = sum(l['premium_pts'] * l.get('qty', 1) for l in legs)
     strike_spx = round(xsp_strike * SPX_XSP_RATIO / 5) * 5
 
     _strat_name = {'long_straddle': 'Long Straddle (ATM)',
-                   'long_strangle': 'Long Strangle (OTM)'}.get(strategy, strategy)
+                   'long_strangle': 'Long Strangle (OTM)',
+                   'long_put': 'Long Put (tail, OTM)'}.get(strategy, strategy)
     _legs_txt = "  |  ".join(
-        f"{l['side']} {l['type']} {l['strike']:.0f} @ {l['premium_pts']:.2f} "
-        f"(~${l['premium_usd']:.0f})" for l in legs)
+        f"{l['side']} {l.get('qty',1)}x {l['type']} {l['strike']:.0f} @ "
+        f"{l['premium_pts']:.2f} (~${l['premium_usd']:.0f})" for l in legs)
     present = "; ".join(c['label'] for c in _met) or "nessuna"
+    _why_strategy = {
+        'long_straddle': 'IV molto economica e convinzione alta — si compra al denaro '
+                         'per la massima sensibilità al movimento',
+        'long_strangle': 'convinzione moderata — strangle OTM più economico, serve un '
+                         'movimento più ampio',
+        'long_put': 'TailDex segnala rischio di coda in aumento (la put profonda costa '
+                    'più della put moderata) — si preferisce una singola put OTM, '
+                    'esposizione asimmetrica al ribasso con perdita comunque limitata '
+                    'al premio pagato',
+    }.get(strategy, '')
     d.explanation = (
         f"✅ TRADE: {_strat_name}. Punteggio di convinzione {score:.2f}, sopra la "
         f"soglia minima di {MIN_CONFIDENCE}. Le condizioni favorevoli si sono allineate.\n\n"
         f"✓ Condizioni che hanno guidato la decisione: {present}.\n\n"
         f"Gambe dell'operazione (su XSP):\n{_legs_txt}\n\n"
-        f"Strategia {'straddle ATM' if strategy=='long_straddle' else 'strangle OTM'} "
-        f"perché {'IV molto economica e convinzione alta — si compra al denaro per la massima sensibilità al movimento' if strategy=='long_straddle' else 'convinzione moderata — strangle OTM più economico, serve un movimento più ampio'}. "
+        f"Strategia scelta perché {_why_strategy}. "
         f"Scadenza {DTE_TARGET} giorni, premio totale {est_prem:.2f} punti "
         f"(~${est_prem*100:.0f}). Perdita massima limitata al premio pagato.")
 
@@ -302,7 +414,9 @@ _POS_COLS = ['id', 'open_date', 'mode', 'strategy', 'signal_spot', 'xsp_spot',
              'xsp_strike', 'dte_target', 'entry_iv', 'entry_premium',
              'n_contracts', 'confidence', 'status', 'close_date',
              'exit_premium', 'pnl_usd', 'exit_reason',
-             'regime', 'vol_premium', 'hhi', 'decision_note', 'legs_json']
+             'regime', 'vol_premium', 'hhi', 'decision_note', 'legs_json',
+             'voldex', 'calldex', 'putdex', 'taildex', 'skew_trend',
+             'peak_ratio']
 
 
 def _ensure_dir():
@@ -490,8 +604,18 @@ def backfill_legs() -> dict:
 
 def open_paper_position(decision: LiteDecision, spot: float,
                         regime: str, vol_premium: float, hhi: float,
-                        atm_iv: float) -> int:
-    """Record a simulated long-vol position. Returns the new id."""
+                        atm_iv: float,
+                        voldex: Optional[float] = None,
+                        calldex: Optional[float] = None,
+                        putdex: Optional[float] = None,
+                        taildex: Optional[float] = None,
+                        skew_trend: Optional[float] = None) -> int:
+    """Record a simulated long-vol position. Returns the new id.
+
+    The VolDex suite values (when available) are stored alongside the
+    trade for transparency — same spirit as regime/vol_premium/hhi — so
+    the historical record shows exactly what each signal read at entry.
+    """
     df = load_positions()
     new_id = (int(df['id'].max()) + 1) if not df.empty else 1
     xsp_spot = spot / SPX_XSP_RATIO
@@ -506,18 +630,45 @@ def open_paper_position(decision: LiteDecision, spot: float,
         'regime': regime, 'vol_premium': vol_premium, 'hhi': hhi,
         'decision_note': decision.explanation,
         'legs_json': json.dumps(decision.legs) if decision.legs else '',
+        'voldex': voldex, 'calldex': calldex, 'putdex': putdex,
+        'taildex': taildex, 'skew_trend': skew_trend,
+        'peak_ratio': 1.0,   # entry value / entry premium = 1.0 at open
     }
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     _save_positions(df)
     return new_id
 
 
-def mark_and_manage(current_spot: float, current_iv: float) -> list:
+def _position_legs(pos) -> Optional[list]:
+    """Parse the stored legs_json for a position row, if present."""
+    lj = pos.get('legs_json') if hasattr(pos, 'get') else pos['legs_json']
+    if isinstance(lj, str) and lj.strip():
+        try:
+            return json.loads(lj)
+        except Exception:
+            return None
+    return None
+
+
+def mark_and_manage(current_spot: float, current_iv: float,
+                    current_voldex: Optional[float] = None) -> list:
     """Mark open positions to model value and close those hitting exit rules.
 
     Returns a list of (id, action, detail) describing what happened.
-    Simulation pricing: revalue the straddle at the current XSP spot and IV,
-    with linear theta decay via reduced time-to-expiry.
+    Simulation pricing: revalue the position's ACTUAL legs (straddle,
+    strangle, or single put) at the current XSP spot and IV, with theta
+    decay via reduced time-to-expiry.
+
+    Exit rules, in priority order:
+      1. Profit target  — value ≥ PROFIT_TARGET_MULT × entry (hard ceiling)
+      2. Trailing stop  — once value peaked ≥ TRAIL_ARM_MULT × entry, close if
+                          it gives back TRAIL_GIVEBACK_PCT % from that peak
+                          (locks in profit before it evaporates)
+      3. VolDex exit    — if current VolDex ≥ VOLDEX_EXIT_MULT × entry VolDex
+                          and position in profit (vol thesis played out;
+                          best-effort, only when VolDex is provided)
+      4. Stop loss      — value ≤ STOP_LOSS_PCT % of entry (cut the loss)
+      5. DTE floor      — ≤ HOLD_DTE_FLOOR days left (avoid theta acceleration)
     """
     df = load_positions()
     if df.empty:
@@ -529,8 +680,12 @@ def mark_and_manage(current_spot: float, current_iv: float) -> list:
     today = date.today()
 
     # Ensure mutable columns can hold mixed types (avoid float64 coercion errors)
-    for _c in ('status', 'close_date', 'exit_premium', 'pnl_usd', 'exit_reason'):
-        df[_c] = df[_c].astype(object)
+    for _c in ('status', 'close_date', 'exit_premium', 'pnl_usd', 'exit_reason',
+               'peak_ratio'):
+        if _c in df.columns:
+            df[_c] = df[_c].astype(object)
+    if 'peak_ratio' not in df.columns:
+        df['peak_ratio'] = 1.0
 
     for idx, pos in df[df['status'] == 'OPEN'].iterrows():
         try:
@@ -542,21 +697,56 @@ def mark_and_manage(current_spot: float, current_iv: float) -> list:
         T_left    = max(dte_left / 365.0, 1e-4)
 
         entry_prem = float(pos['entry_premium'])
-        cur_val    = straddle_price(xsp_spot_now, float(pos['xsp_strike']),
-                                    T_left, iv_dec)
+        legs = _position_legs(pos)
+        if legs:
+            cur_val = legs_value(legs, xsp_spot_now, T_left, iv_dec)
+            n_legs  = len(legs)
+        else:
+            # Legacy fallback: same-strike straddle approximation
+            cur_val = straddle_price(xsp_spot_now, float(pos['xsp_strike']),
+                                     T_left, iv_dec)
+            n_legs  = 2
         ratio = cur_val / entry_prem if entry_prem > 0 else 0.0
 
+        # Update the running peak ratio (for the trailing stop)
+        try:
+            prev_peak = float(pos.get('peak_ratio') or 1.0)
+        except Exception:
+            prev_peak = 1.0
+        peak = max(prev_peak, ratio)
+        df.at[idx, 'peak_ratio'] = round(peak, 3)
+
         reason = None
+        # 1. Full profit target — hard ceiling
         if ratio >= PROFIT_TARGET_MULT:
             reason = f"Profit target {PROFIT_TARGET_MULT:.1f}× ({ratio:.1f}×)"
-        elif ratio <= (STOP_LOSS_PCT / 100.0):
+        # 2. Trailing stop — armed once peak ≥ TRAIL_ARM_MULT, fires on giveback
+        elif (peak >= TRAIL_ARM_MULT and
+              ratio <= peak * (1.0 - TRAIL_GIVEBACK_PCT / 100.0) and
+              ratio > 1.0):
+            reason = (f"Trailing stop — profitto bloccato a {ratio:.2f}× "
+                      f"(picco {peak:.2f}×, ripiego {TRAIL_GIVEBACK_PCT:.0f}%)")
+        # 3. VolDex exit — vol bought cheap is now expensive (best-effort)
+        elif (current_voldex is not None and pos.get('voldex') not in (None, '') and
+              ratio > 1.0):
+            try:
+                entry_vd = float(pos['voldex'])
+                if entry_vd > 0 and current_voldex >= entry_vd * VOLDEX_EXIT_MULT:
+                    reason = (f"Uscita VolDex — vol salita a {current_voldex:.1f}% "
+                              f"(da {entry_vd:.1f}% all'entrata, +{VOLDEX_EXIT_MULT:.0%} "
+                              f"raggiunto) — tesi long-vol avverata, ratio {ratio:.2f}×")
+            except Exception:
+                pass
+        # 4. Stop loss — cut the loss
+        if reason is None and ratio <= (STOP_LOSS_PCT / 100.0):
             reason = f"Stop loss — premio a {ratio*100:.0f}% dell'entry"
-        elif dte_left <= HOLD_DTE_FLOOR:
+        # 5. DTE floor — exit before theta accelerates
+        if reason is None and dte_left <= HOLD_DTE_FLOOR:
             reason = f"DTE floor ({dte_left}g) — chiusura prima dell'accelerazione theta"
 
         if reason:
-            # Long vol P&L: (exit - entry) × 100; minus simple cost estimate
-            cost = (1.25 * 4) + (entry_prem * 100 * 0.015 * 4)  # 2 legs, round trip
+            # Long vol P&L: (exit - entry) × 100; cost scales with leg count
+            cost = (1.25 * 2 * n_legs) + (entry_prem * 100 * 0.015 * 2 * n_legs)
             pnl  = (cur_val - entry_prem) * 100 - cost
             df.at[idx, 'status']       = 'CLOSED'
             df.at[idx, 'close_date']   = today.isoformat()
@@ -602,8 +792,12 @@ def compute_unrealized(current_spot: float, current_iv: float) -> dict:
         T_left    = max(dte_left / 365.0, 1e-4)
 
         entry_prem = float(pos['entry_premium'])
-        cur_val    = straddle_price(xsp_spot_now, float(pos['xsp_strike']),
-                                    T_left, iv_dec)
+        legs = _position_legs(pos)
+        if legs:
+            cur_val = legs_value(legs, xsp_spot_now, T_left, iv_dec)
+        else:
+            cur_val = straddle_price(xsp_spot_now, float(pos['xsp_strike']),
+                                     T_left, iv_dec)
         ratio  = cur_val / entry_prem if entry_prem > 0 else 0.0
         # Unrealized P&L (no exit costs applied — position still open)
         unreal = (cur_val - entry_prem) * 100

@@ -2050,24 +2050,28 @@ def build_alert_flags(raw_df, spot, dte0_metrics=None,
     """
     flags = []
 
-    # 1. Gamma Regime — spot vs 0DTE GEX Flip
+    # 1. Gamma Regime — spot vs 0DTE GEX Flip (SOLO scadenza di oggi —
+    #    diverso dal "GEX Regime" della tab GEX/DEX, che usa tutte le
+    #    scadenze nel range selezionato dallo slider)
     flip = (dte0_metrics or {}).get('gex_flip')
     if flip and spot:
         dist_pct = (spot - flip) / spot * 100
         if spot < flip:
-            flags.append(dict(name='Gamma Regime', status=_AL_RED,
+            flags.append(dict(name='Gamma Regime (0DTE)', status=_AL_RED,
                 value=f'SHORT', threshold=f'Flip ${flip:,.0f}',
-                detail=f'Spot {dist_pct:+.2f}% dal flip → amplificante'))
+                detail=f'Spot {dist_pct:+.2f}% dal flip 0DTE → amplificante oggi'))
         elif abs(dist_pct) < 0.5:
-            flags.append(dict(name='Gamma Regime', status=_AL_AMBER,
+            flags.append(dict(name='Gamma Regime (0DTE)', status=_AL_AMBER,
                 value='NEAR FLIP', threshold=f'Flip ${flip:,.0f}',
                 detail=f'Zona transizione (Δ={abs(spot-flip):.0f}pt)'))
         else:
-            flags.append(dict(name='Gamma Regime', status=_AL_GREEN,
+            flags.append(dict(name='Gamma Regime (0DTE)', status=_AL_GREEN,
                 value='LONG γ', threshold=f'Flip ${flip:,.0f}',
-                detail=f'Spot {dist_pct:+.2f}% sopra flip → stabilizzante'))
+                detail=f'Spot {dist_pct:+.2f}% sopra flip 0DTE → stabilizzante oggi. '
+                       f'Nota: misura solo la scadenza odierna — può differire dal '
+                       f'"GEX Regime" in tab GEX/DEX, che aggrega tutte le scadenze.'))
     else:
-        flags.append(dict(name='Gamma Regime', status=_AL_GREY,
+        flags.append(dict(name='Gamma Regime (0DTE)', status=_AL_GREY,
             value='N/D', threshold='—', detail='Carica 0DTE'))
 
     # 2. P/C Ratio
@@ -4423,3 +4427,293 @@ if __name__ == '__main__':
     print('   Press  Ctrl+C  in this terminal to stop.\n')
     app.run(debug=False, use_reloader=False, threaded=True,
             port=selected_port, host='127.0.0.1')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VolDex-style ATM Implied Volatility Index — independent replica
+# ══════════════════════════════════════════════════════════════════════════════
+# Re-implements the PUBLISHED Nations VolDex® / Nasdaq VOLQ® methodology
+# (Brenner & Subrahmanyam closed-form implied volatility on at-the-money
+# options, interpolated across expiries to a constant horizon) on the SPX
+# chain already loaded by this dashboard.
+#
+# IMPORTANT: this is NOT the licensed Nations Indexes product. VolDex®,
+# VOLQ®, CallDex®, PutDex® and TailDex® are registered trademarks of their
+# respective owners. This is an original implementation of the publicly
+# documented mathematics, computed on a different underlying (SPX, not
+# NDX) using mid-quotes from this dashboard's own data feed (not real-time
+# NBBO). Absolute values will differ from the official tickers — treat
+# this as an independent, same-methodology measure for SPX.
+
+VOLDEX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'voldex_history')
+VOLDEX_CSV = os.path.join(VOLDEX_DIR, 'voldex_history.csv')
+
+
+def _brenner_subrahmanyam_iv(price: float, F: float, T: float) -> float:
+    """Closed-form implied volatility (Brenner & Subrahmanyam, 1988).
+
+    CFIV = sqrt(2π / T) × price / F
+
+    A fast, exact approximation valid for near at-the-money options —
+    the same formula used by VOLQ/VolDex. price and F must be in the
+    same units (index points).
+    """
+    if T <= 0 or F <= 0 or price <= 0:
+        return 0.0
+    return float(np.sqrt(2.0 * np.pi / T) * (price / F))
+
+
+def _triangular_weights(distances: list) -> list:
+    """Normalised triangular-kernel weights from a list of |distance| values.
+
+    Bandwidth = max(distances) × 1.01, so every input gets a strictly
+    positive raw weight (closer points weighted more). Mirrors the kernel
+    used by VolDex/VOLQ for both strike-weighting and term-weighting.
+    """
+    if not distances:
+        return []
+    n = len(distances)
+    bw = max(distances) * 1.01
+    if bw <= 0:
+        return [1.0 / n] * n
+    raw = [max(0.0, 1.0 - d / bw) for d in distances]
+    total = sum(raw)
+    if total <= 0:
+        return [1.0 / n] * n
+    return [w / total for w in raw]
+
+
+def _voldex_term_metrics(grp: pd.DataFrame, spot: float,
+                         r: float = RISK_FREE_RATE) -> dict:
+    """VolDex-style ATM forward, ATM call/put price and total variance for
+    ONE expiry ("term"). Returns None if the expiry lacks enough strikes.
+
+    Steps (mirrors the published VolDex/VOLQ methodology):
+      1. Find K* minimising |Call(K) − Put(K)| → forward price via put-call parity
+      2. Select the 2 strikes immediately above and 2 immediately below F
+      3. Weight them with a triangular kernel on |K − F|
+      4. ATM call/put price = weighted average across those 4 strikes
+      5. Closed-form IV (Brenner-Subrahmanyam) for call and put separately
+      6. Total variance = T × average(CFIV_call², CFIV_put²)
+    """
+    T = float(grp['T_years'].iloc[0]) if 'T_years' in grp.columns else 0.0
+    if T <= 0:
+        return None
+
+    calls = grp[grp['flag'] == 'c'].dropna(subset=['strike', 'mid'])
+    puts  = grp[grp['flag'] == 'p'].dropna(subset=['strike', 'mid'])
+    if calls.empty or puts.empty:
+        return None
+
+    common_strikes = sorted(set(calls['strike']) & set(puts['strike']))
+    if len(common_strikes) < 4:
+        return None
+
+    # 1. Forward price via put-call parity at min |C-P|
+    best = None
+    for K in common_strikes:
+        c = float(calls.loc[calls['strike'] == K, 'mid'].iloc[0])
+        p = float(puts.loc[puts['strike'] == K, 'mid'].iloc[0])
+        d = abs(c - p)
+        if best is None or d < best[0]:
+            best = (d, K, c, p)
+    _, k_star, c_star, p_star = best
+    F = k_star + np.exp(r * T) * (c_star - p_star)
+    if F <= 0:
+        return None
+
+    # 2. Two strikes immediately above F, two immediately at/below F
+    above = sorted([k for k in common_strikes if k > F])[:2]
+    below = sorted([k for k in common_strikes if k <= F], reverse=True)[:2]
+    if len(above) < 2 or len(below) < 2:
+        return None
+    sel_strikes = sorted(below + above)
+
+    # 3. Triangular kernel weights on |K - F|
+    dists   = [abs(k - F) for k in sel_strikes]
+    weights = _triangular_weights(dists)
+
+    # 4. Weighted ATM call / put price
+    atm_call = atm_put = 0.0
+    for K, w in zip(sel_strikes, weights):
+        c = float(calls.loc[calls['strike'] == K, 'mid'].iloc[0])
+        p = float(puts.loc[puts['strike'] == K, 'mid'].iloc[0])
+        atm_call += w * c
+        atm_put  += w * p
+
+    # 5. Brenner-Subrahmanyam closed-form IV
+    cfiv_call = _brenner_subrahmanyam_iv(atm_call, F, T)
+    cfiv_put  = _brenner_subrahmanyam_iv(atm_put, F, T)
+    if cfiv_call <= 0 and cfiv_put <= 0:
+        return None
+
+    # 6. Total variance for this term
+    variance = T * (cfiv_call**2 + cfiv_put**2) / 2.0
+
+    return {
+        'T_years': T, 'T_days': T * 365.0, 'forward': F, 'k_star': k_star,
+        'strikes': sel_strikes, 'weights': [round(w, 3) for w in weights],
+        'atm_call': round(atm_call, 2), 'atm_put': round(atm_put, 2),
+        'cfiv_call': round(cfiv_call, 4), 'cfiv_put': round(cfiv_put, 4),
+        'variance': variance,
+    }
+
+
+def compute_voldex(raw_df: pd.DataFrame, spot: float,
+                   r: float = RISK_FREE_RATE,
+                   target_days: float = 30.0) -> dict:
+    """Independent replica of the Nations VolDex® / Nasdaq VOLQ® methodology
+    on the SPX chain. See module docstring above for the trademark/scope note.
+
+    Returns a dict:
+      voldex   — headline ATM 30-day implied volatility (annualised %)
+      calldex  — IV of the ~16-delta (≈1 std-dev) OTM call, interpolated to 30d
+      putdex   — IV of the ~16-delta OTM put, interpolated to 30d
+      taildex  — IV of the ~10-delta (deeper OTM) put — tail-risk proxy
+      terms    — per-expiry diagnostic table (forward, strikes, weights, CFIV)
+      error    — set if the computation could not be completed
+    """
+    out = {'voldex': None, 'calldex': None, 'putdex': None, 'taildex': None,
+          'terms': [], 'error': None}
+
+    if raw_df is None or raw_df.empty or not spot or spot <= 0:
+        out['error'] = 'Chain non disponibile — carica la chain prima.'
+        return out
+
+    data = raw_df.dropna(subset=['T_years', 'strike', 'mid', 'flag']).copy()
+    if data.empty:
+        out['error'] = 'Dati insufficienti nella chain (mancano mid/strike/iv).'
+        return out
+
+    term_results = []
+    for exp, grp in data.groupby('expiry'):
+        m = _voldex_term_metrics(grp, spot, r)
+        if m:
+            m['expiry'] = exp
+            term_results.append(m)
+
+    if len(term_results) < 2:
+        out['error'] = ('Servono almeno 2 scadenze valide per interpolare a '
+                        f'{target_days:.0f} giorni — solo '
+                        f'{len(term_results)} disponibile/i.')
+        return out
+
+    term_results.sort(key=lambda x: x['T_days'])
+    out['terms'] = term_results
+
+    # ── Headline VolDex: interpolate total variance to the target horizon ──────
+    closest = sorted(term_results, key=lambda t: abs(t['T_days'] - target_days))[:4]
+    dists   = [abs(t['T_days'] - target_days) for t in closest]
+    weights = _triangular_weights(dists)
+    variance_30 = sum(w * t['variance'] for w, t in zip(weights, closest))
+    T_30   = target_days / 365.0
+    cfiv_30 = np.sqrt(max(variance_30, 0.0) / T_30)
+    out['voldex'] = round(100.0 * cfiv_30, 2)
+
+    # ── Companion measures: CallDex / PutDex / TailDex ─────────────────────────
+    # Use the chain's own per-contract IV at specific delta targets, then
+    # apply the same triangular time-interpolation to 30 days.
+    def _iv_at_delta(flag, target_delta):
+        rows = []
+        for exp, grp in data.groupby('expiry'):
+            T = float(grp['T_years'].iloc[0]) if 'T_years' in grp.columns else 0.0
+            if T <= 0:
+                continue
+            sub = grp[grp['flag'] == flag].dropna(subset=['iv'])
+            sub = sub[sub['iv'] > 0]
+            if sub.empty:
+                continue
+            q = float(sub['q_impl'].iloc[0]) if 'q_impl' in sub.columns else SPX_DIV_YIELD
+            try:
+                ds = sub.apply(lambda row: bs_delta(spot, row['strike'], T, r,
+                                                    max(float(row['iv']), 1e-4),
+                                                    flag, q), axis=1)
+            except Exception:
+                continue
+            idx = (ds - target_delta).abs().idxmin()
+            rows.append((T * 365.0, float(sub.loc[idx, 'iv'])))
+        return rows
+
+    def _interp_to_30d(rows):
+        if not rows or len(rows) < 2:
+            return None
+        rs = sorted(rows, key=lambda x: abs(x[0] - target_days))[:4]
+        dd = [abs(d - target_days) for d, _ in rs]
+        ww = _triangular_weights(dd)
+        return round(100.0 * sum(w * iv for w, (_, iv) in zip(ww, rs)), 2)
+
+    try:
+        out['calldex']  = _interp_to_30d(_iv_at_delta('c', 0.16))
+        out['putdex']   = _interp_to_30d(_iv_at_delta('p', -0.16))
+        out['taildex']  = _interp_to_30d(_iv_at_delta('p', -0.10))
+    except Exception:
+        pass
+
+    return out
+
+
+def save_voldex_snapshot(values: dict) -> str:
+    """Append today's VolDex/CallDex/PutDex/TailDex to a small CSV history
+    file — same persistence pattern as the chain snapshots: a daily row,
+    committed by GitHub Actions, so the series survives Streamlit Cloud
+    restarts and grows day by day.
+    """
+    os.makedirs(VOLDEX_DIR, exist_ok=True)
+    row = {
+        'date':    date.today().isoformat(),
+        'voldex':  values.get('voldex'),
+        'calldex': values.get('calldex'),
+        'putdex':  values.get('putdex'),
+        'taildex': values.get('taildex'),
+    }
+    df_new = pd.DataFrame([row])
+    if os.path.exists(VOLDEX_CSV):
+        try:
+            df_old = pd.read_csv(VOLDEX_CSV)
+            df_old = df_old[df_old['date'] != row['date']]   # replace same-day row
+            df_all = pd.concat([df_old, df_new], ignore_index=True)
+        except Exception:
+            df_all = df_new
+    else:
+        df_all = df_new
+    df_all.to_csv(VOLDEX_CSV, index=False)
+    return VOLDEX_CSV
+
+
+def load_voldex_history() -> pd.DataFrame:
+    """Load the persisted VolDex history (empty DataFrame if none yet)."""
+    if os.path.exists(VOLDEX_CSV):
+        try:
+            df = pd.read_csv(VOLDEX_CSV)
+            df['date'] = pd.to_datetime(df['date'])
+            return df.sort_values('date').reset_index(drop=True)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=['date', 'voldex', 'calldex', 'putdex', 'taildex'])
+
+
+def voldex_history_chart(hist: pd.DataFrame):
+    """Multi-line chart of the VolDex suite history."""
+    import plotly.graph_objects as go
+    if hist is None or hist.empty or len(hist) < 2:
+        fig = go.Figure()
+        fig.update_layout(**base_layout(
+            "VolDex Suite — storico (servono ≥ 2 giorni di dati)", height=360))
+        return fig
+
+    fig = go.Figure()
+    colors = {'voldex': '#6C63FF', 'calldex': '#10B981',
+              'putdex': '#EF4444', 'taildex': '#F59E0B'}
+    names  = {'voldex': 'VolDex (ATM 30d)', 'calldex': 'CallDex (call ~16Δ)',
+              'putdex': 'PutDex (put ~16Δ)', 'taildex': 'TailDex (put ~10Δ)'}
+    for col in ['voldex', 'calldex', 'putdex', 'taildex']:
+        if col in hist.columns:
+            fig.add_scatter(x=hist['date'], y=hist[col], mode='lines+markers',
+                            name=names[col],
+                            line=dict(color=colors[col], width=2.2),
+                            marker=dict(size=5))
+    layout = base_layout("VolDex Suite (replica SPX) — storico", height=380)
+    layout.update(yaxis_title='Volatilità implicita ATM (%, annualizzata)',
+                  legend=dict(orientation='h', y=-0.18))
+    fig.update_layout(**layout)
+    return fig

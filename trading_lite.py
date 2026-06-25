@@ -46,7 +46,13 @@ CONTEXT_CSV      = os.path.join(PAPER_DIR, 'signal_context.csv')
 
 # ── Account / risk (5k paper account) ──────────────────────────────────────────
 INITIAL_CAPITAL      = 5000.0
-MAX_PREMIUM_PCT      = 2.0     # max premium per trade = 2% of account
+MAX_PREMIUM_PCT      = 8.0     # hard cap: max premium per trade = 8% of account ($400)
+                               # ($1,250 on 5k). Anything above this is BLOCKED.
+                               # On a small account, an ATM XSP straddle (~$2,200)
+                               # exceeds this — by design the engine prefers cheaper
+                               # structures (strangle, single put) and shorter DTE,
+                               # and SKIPS entirely if nothing fits the budget.
+PREMIUM_PREFER_PCT    = 5.0    # soft target: prefer structures under 5% ($250)
 MAX_DAILY_LOSS       = 250.0   # circuit breaker (informational in sim)
 MAX_DRAWDOWN_PCT     = 50.0    # hard stop (the 50% rule)
 SPX_XSP_RATIO        = 10.0    # signal SPX → execution XSP scale
@@ -312,63 +318,110 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
             f"La maggior parte dei giorni il sistema resta in attesa.")
         return d
 
-    # ── Strategy selection ───────────────────────────────────────────────────────
-    # Tail bias: if the tail (TailDex) is pricing meaningfully more than the
-    # moderate OTM put (PutDex), the market is signalling elevated crash risk.
-    # In that case prefer a SINGLE long OTM put — same bounded-risk philosophy
-    # as straddle/strangle (max loss = premium paid), but asymmetrically
-    # downside-oriented. We deliberately do NOT use a short-leg backspread
-    # here: a 1x2 ratio put backspread has a loss pocket between the strikes
-    # that can exceed the net premium paid, which would break the "max loss
-    # = premium paid" guarantee this whole system is built on.
-    tail_spread = (taildex - putdex) if (taildex is not None and putdex is not None) else None
-    bias_tail   = (tail_spread is not None and tail_spread > 1.5 and regime == 'SHORT')
-
-    if bias_tail:
-        strategy = 'long_put'
-        factors.append(f"TailDex−PutDex {tail_spread:+.2f}pt — coda più cara del corpo, "
-                       "rischio di coda in aumento")
-    elif iv < IV_CHEAP_BELOW and score > 0.6:
-        strategy = 'long_straddle'
-    else:
-        strategy = 'long_strangle'
-
+    # ── Strategy selection (budget-aware) ─────────────────────────────────────────
+    # On a small account an ATM XSP straddle (~$2,200) blows past the premium
+    # cap. So instead of picking one strategy and opening it at any cost, we
+    # build candidate structures, compute each one's real premium, and choose
+    # the cheapest that BOTH fits the signal AND fits the budget. If nothing
+    # fits the hard cap, we SKIP — never open an oversized position.
     xsp_spot   = spot / SPX_XSP_RATIO
     T          = DTE_TARGET / 365.0
     iv_dec     = iv / 100
-    em_xsp     = (expected_move / SPX_XSP_RATIO if expected_move
-                  else xsp_spot * iv_dec / math.sqrt(252) * math.sqrt(DTE_TARGET))
+    # Expected move over the TRADE horizon (DTE_TARGET), not a short-term 0DTE
+    # figure. A 1-sigma move at 45 days sets where the OTM legs sit; using a
+    # tiny intraday EM would place them almost ATM and make them expensive.
+    em_horizon = xsp_spot * iv_dec * math.sqrt(DTE_TARGET / 365.0)
+    # If a same-horizon expected_move was supplied, prefer it; otherwise use
+    # the model figure above. (expected_move from 0DTE is too small — ignore it
+    # when it implies a sub-0.5-sigma strike.)
+    em_xsp = em_horizon
+    if expected_move:
+        em_candidate = expected_move / SPX_XSP_RATIO
+        # only trust the supplied EM if it's at least ~half the horizon sigma
+        if em_candidate >= 0.5 * em_horizon:
+            em_xsp = em_candidate
 
-    # Build explicit legs (each: side, type, strike, qty, premium per contract)
-    legs = []
-    if strategy == 'long_straddle':
-        k = round(xsp_spot / 5) * 5
-        cp = bs_price(xsp_spot, k, T, R_FREE, iv_dec, 'c')
-        pp = bs_price(xsp_spot, k, T, R_FREE, iv_dec, 'p')
-        legs.append({'side': 'BUY', 'type': 'CALL', 'strike': k, 'qty': 1,
-                     'premium_pts': round(cp, 2), 'premium_usd': round(cp * 100, 0)})
-        legs.append({'side': 'BUY', 'type': 'PUT', 'strike': k, 'qty': 1,
-                     'premium_pts': round(pp, 2), 'premium_usd': round(pp * 100, 0)})
-        xsp_strike = k
-    elif strategy == 'long_put':
-        # Single OTM put ~1 EM below spot — tail-oriented, bounded risk = premium
+    def _leg(side, typ, strike):
+        px = bs_price(xsp_spot, strike, T, R_FREE, iv_dec,
+                      'c' if typ == 'CALL' else 'p')
+        return {'side': side, 'type': typ, 'strike': strike, 'qty': 1,
+                'premium_pts': round(px, 2), 'premium_usd': round(px * 100, 0)}
+
+    def _build(strategy):
+        """Return (legs, ref_strike) for a strategy name."""
+        if strategy == 'long_straddle':
+            k = round(xsp_spot / 5) * 5
+            return [_leg('BUY','CALL',k), _leg('BUY','PUT',k)], k
+        if strategy == 'long_strangle':
+            kc = round((xsp_spot + em_xsp) / 5) * 5
+            kp = round((xsp_spot - em_xsp) / 5) * 5
+            return [_leg('BUY','CALL',kc), _leg('BUY','PUT',kp)], kc
+        # long_put — single OTM put, cheapest structure
         kp = round((xsp_spot - em_xsp) / 5) * 5
-        pp = bs_price(xsp_spot, kp, T, R_FREE, iv_dec, 'p')
-        legs.append({'side': 'BUY', 'type': 'PUT', 'strike': kp, 'qty': 1,
-                     'premium_pts': round(pp, 2), 'premium_usd': round(pp * 100, 0)})
-        xsp_strike = kp
+        return [_leg('BUY','PUT',kp)], kp
+
+    # Candidate ranking by signal preference (best-fit first)
+    tail_spread = (taildex - putdex) if (taildex is not None and putdex is not None) else None
+    bias_tail   = (tail_spread is not None and tail_spread > 1.5 and regime == 'SHORT')
+    if bias_tail:
+        factors.append(f"TailDex−PutDex {tail_spread:+.2f}pt — coda più cara del corpo, "
+                       "rischio di coda in aumento")
+        preference = ['long_put', 'long_strangle', 'long_straddle']
+    elif iv < IV_CHEAP_BELOW and score > 0.6:
+        # Would prefer straddle, but it's the most expensive — keep it last-resort
+        preference = ['long_strangle', 'long_put', 'long_straddle']
     else:
-        kc = round((xsp_spot + em_xsp) / 5) * 5
-        kp = round((xsp_spot - em_xsp) / 5) * 5
-        cp = bs_price(xsp_spot, kc, T, R_FREE, iv_dec, 'c')
-        pp = bs_price(xsp_spot, kp, T, R_FREE, iv_dec, 'p')
-        legs.append({'side': 'BUY', 'type': 'CALL', 'strike': kc, 'qty': 1,
-                     'premium_pts': round(cp, 2), 'premium_usd': round(cp * 100, 0)})
-        legs.append({'side': 'BUY', 'type': 'PUT', 'strike': kp, 'qty': 1,
-                     'premium_pts': round(pp, 2), 'premium_usd': round(pp * 100, 0)})
-        xsp_strike = kc  # reference strike for display (call side)
+        preference = ['long_strangle', 'long_put', 'long_straddle']
 
-    est_prem   = sum(l['premium_pts'] * l.get('qty', 1) for l in legs)
+    hard_cap   = INITIAL_CAPITAL * MAX_PREMIUM_PCT / 100.0      # $ ceiling
+    prefer_cap = INITIAL_CAPITAL * PREMIUM_PREFER_PCT / 100.0   # $ soft target
+
+    # Evaluate all candidates
+    candidates = []
+    for strat in preference:
+        legs_c, ref_c = _build(strat)
+        prem_pts = sum(l['premium_pts'] * l.get('qty', 1) for l in legs_c)
+        prem_usd = prem_pts * 100
+        candidates.append((strat, legs_c, ref_c, prem_pts, prem_usd))
+
+    # Pick: cheapest that fits the SOFT target; else cheapest under HARD cap;
+    # else nothing fits → SKIP
+    fits_soft = [c for c in candidates if c[4] <= prefer_cap]
+    fits_hard = [c for c in candidates if c[4] <= hard_cap]
+    chosen = None
+    if fits_soft:
+        chosen = min(fits_soft, key=lambda c: c[4])
+    elif fits_hard:
+        chosen = min(fits_hard, key=lambda c: c[4])
+
+    if chosen is None:
+        cheapest = min(candidates, key=lambda c: c[4])
+        d.action = 'SKIP'
+        d.confidence = round(score, 3)
+        d.skip_reason = (f"Premio minimo ${cheapest[4]:.0f} &gt; cap "
+                         f"${hard_cap:.0f} ({MAX_PREMIUM_PCT:.0f}% di "
+                         f"${INITIAL_CAPITAL:.0f})")
+        cond("Premio entro budget", False,
+             f"Struttura più economica ({cheapest[0]}) costa ${cheapest[4]:.0f}, "
+             f"oltre il tetto di ${hard_cap:.0f} — posizione troppo grande per il conto")
+        d.conditions = conditions
+        d.explanation = (
+            f"❌ NESSUN TRADE. Il segnale era favorevole (conviction {score:.2f}), "
+            f"ma anche la struttura più economica disponibile ({cheapest[0]}) "
+            f"costerebbe ${cheapest[4]:.0f} di premio — oltre il tetto massimo di "
+            f"${hard_cap:.0f} ({MAX_PREMIUM_PCT:.0f}% del capitale). Aprire questa "
+            f"posizione metterebbe a rischio una quota eccessiva del conto da "
+            f"${INITIAL_CAPITAL:.0f}. Il sistema non apre posizioni sovradimensionate: "
+            f"con questo capitale, su XSP a {DTE_TARGET} giorni i premi sono troppo "
+            f"alti. Servirebbe più capitale, una scadenza più breve, o attendere "
+            f"un'IV più bassa che abbassi i premi.")
+        return d
+
+    strategy, legs, xsp_strike, est_prem, est_usd = chosen
+    cond("Premio entro budget", True,
+         f"{strategy} costa ${est_usd:.0f} — entro il tetto di ${hard_cap:.0f} "
+         f"({est_usd/INITIAL_CAPITAL*100:.0f}% del capitale)")
+
     strike_spx = round(xsp_strike * SPX_XSP_RATIO / 5) * 5
 
     _strat_name = {'long_straddle': 'Long Straddle (ATM)',
@@ -379,14 +432,13 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
         f"{l['premium_pts']:.2f} (~${l['premium_usd']:.0f})" for l in legs)
     present = "; ".join(c['label'] for c in _met) or "nessuna"
     _why_strategy = {
-        'long_straddle': 'IV molto economica e convinzione alta — si compra al denaro '
-                         'per la massima sensibilità al movimento',
-        'long_strangle': 'convinzione moderata — strangle OTM più economico, serve un '
-                         'movimento più ampio',
-        'long_put': 'TailDex segnala rischio di coda in aumento (la put profonda costa '
-                    'più della put moderata) — si preferisce una singola put OTM, '
-                    'esposizione asimmetrica al ribasso con perdita comunque limitata '
-                    'al premio pagato',
+        'long_straddle': 'IV molto economica e convinzione alta — straddle ATM per la '
+                         'massima sensibilità al movimento (struttura più cara, scelta '
+                         'solo se rientra nel budget)',
+        'long_strangle': 'strangle OTM — più economico dello straddle, serve un '
+                         'movimento più ampio ma costa meno premio',
+        'long_put': 'singola put OTM — la struttura più economica e a rischio definito; '
+                    'esposizione asimmetrica al ribasso, premio contenuto',
     }.get(strategy, '')
     d.explanation = (
         f"✅ TRADE: {_strat_name}. Punteggio di convinzione {score:.2f}, sopra la "
@@ -395,7 +447,8 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
         f"Gambe dell'operazione (su XSP):\n{_legs_txt}\n\n"
         f"Strategia scelta perché {_why_strategy}. "
         f"Scadenza {DTE_TARGET} giorni, premio totale {est_prem:.2f} punti "
-        f"(~${est_prem*100:.0f}). Perdita massima limitata al premio pagato.")
+        f"(~${est_usd:.0f}, {est_usd/INITIAL_CAPITAL*100:.0f}% del capitale). "
+        f"Perdita massima limitata al premio pagato.")
 
     d.action      = 'TRADE'
     d.strategy    = strategy
@@ -846,6 +899,126 @@ def can_open_new() -> tuple[bool, str]:
     if cs['n_open'] >= 1:
         return False, "Massimo 1 posizione aperta (conto 5k)"
     return True, "OK"
+
+
+def archive_and_reset() -> dict:
+    """Archive the current positions history to a timestamped file and start
+    fresh with an empty store.
+
+    The old positions.csv is renamed to positions_archive_YYYYMMDD_HHMMSS.csv
+    in the same folder (nothing is deleted — full audit trail preserved), and
+    a new empty positions.csv takes its place. The paper account effectively
+    restarts from the initial capital with zero open/closed trades, while the
+    archived file remains for reference.
+
+    Returns a summary dict: {archived, archive_path, rows_archived}.
+    """
+    df = load_positions()
+    if df.empty:
+        return {'archived': False, 'archive_path': None, 'rows_archived': 0,
+                'reason': 'Storico già vuoto — niente da archiviare.'}
+
+    _ensure_dir()
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    archive_path = os.path.join(PAPER_DIR, f'positions_archive_{stamp}.csv')
+    df.to_csv(archive_path, index=False)              # save a copy
+    # Replace live store with an empty one (same schema)
+    pd.DataFrame(columns=_POS_COLS).to_csv(POSITIONS_CSV, index=False)
+    return {'archived': True, 'archive_path': archive_path,
+            'rows_archived': len(df)}
+
+
+def list_archives() -> list:
+    """Return the list of archived history files (most recent first)."""
+    if not os.path.isdir(PAPER_DIR):
+        return []
+    arc = [f for f in os.listdir(PAPER_DIR)
+           if f.startswith('positions_archive_') and f.endswith('.csv')]
+    return sorted(arc, reverse=True)
+
+
+def find_oversized_open(current_spot: float = None,
+                        current_iv: float = None) -> list:
+    """Identify OPEN positions whose entry premium exceeds the current hard cap.
+
+    These are typically legacy trades opened by an earlier version of the
+    engine (before budget-aware sizing existed) that are too large for the
+    account. Returns a list of dicts describing each, with current marked
+    value if spot/iv are provided. Read-only — does not change anything.
+    """
+    df = load_positions()
+    if df.empty:
+        return []
+    cap = INITIAL_CAPITAL * MAX_PREMIUM_PCT / 100.0
+    out = []
+    for _, pos in df[df['status'] == 'OPEN'].iterrows():
+        try:
+            prem_usd = float(pos['entry_premium']) * 100
+        except Exception:
+            continue
+        if prem_usd > cap:
+            info = {
+                'id': int(pos['id']),
+                'strategy': pos.get('strategy', ''),
+                'entry_premium_usd': round(prem_usd, 0),
+                'cap_usd': round(cap, 0),
+                'pct_of_capital': round(prem_usd / INITIAL_CAPITAL * 100, 1),
+            }
+            out.append(info)
+    return out
+
+
+def close_position_manual(pos_id: int, current_spot: float,
+                          current_iv: float) -> dict:
+    """Manually close a single OPEN position at current marked value.
+
+    Used to clean up oversized legacy positions. Marks the position CLOSED
+    with reason 'Chiusura manuale (sovradimensionata)' and records the P&L.
+    Returns a summary dict.
+    """
+    df = load_positions()
+    if df.empty:
+        return {'closed': False, 'reason': 'nessuna posizione'}
+
+    iv_dec = current_iv / 100 if (current_iv and current_iv > 1) else (current_iv or 0.15)
+    xsp_spot_now = current_spot / SPX_XSP_RATIO
+    today = date.today()
+
+    for _c in ('status', 'close_date', 'exit_premium', 'pnl_usd', 'exit_reason'):
+        df[_c] = df[_c].astype(object)
+
+    mask = (df['id'] == pos_id) & (df['status'] == 'OPEN')
+    if not mask.any():
+        return {'closed': False, 'reason': f'posizione #{pos_id} non aperta'}
+
+    idx = df[mask].index[0]
+    pos = df.loc[idx]
+    try:
+        open_d = date.fromisoformat(str(pos['open_date']))
+    except Exception:
+        open_d = today
+    days_held = (today - open_d).days
+    dte_left  = max(int(pos['dte_target']) - days_held, 0)
+    T_left    = max(dte_left / 365.0, 1e-4)
+    entry_prem = float(pos['entry_premium'])
+
+    legs = _position_legs(pos)
+    if legs:
+        cur_val = legs_value(legs, xsp_spot_now, T_left, iv_dec)
+        n_legs  = len(legs)
+    else:
+        cur_val = straddle_price(xsp_spot_now, float(pos['xsp_strike']), T_left, iv_dec)
+        n_legs  = 2
+    cost = (1.25 * 2 * n_legs) + (entry_prem * 100 * 0.015 * 2 * n_legs)
+    pnl  = (cur_val - entry_prem) * 100 - cost
+
+    df.at[idx, 'status']       = 'CLOSED'
+    df.at[idx, 'close_date']   = today.isoformat()
+    df.at[idx, 'exit_premium'] = round(cur_val, 2)
+    df.at[idx, 'pnl_usd']      = round(pnl, 2)
+    df.at[idx, 'exit_reason']  = 'Chiusura manuale (posizione sovradimensionata legacy)'
+    _save_positions(df)
+    return {'closed': True, 'id': pos_id, 'pnl_usd': round(pnl, 2)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

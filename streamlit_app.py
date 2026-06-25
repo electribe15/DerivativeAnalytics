@@ -1295,6 +1295,36 @@ with tab7:
             st.caption("💡 Carica la chain (CARICA FULL CHAIN) per vedere il P&L latente "
                        "in tempo reale delle posizioni aperte.")
 
+        # ── Oversized legacy positions warning ────────────────────────────────
+        _oversized = tl.find_oversized_open()
+        if _oversized:
+            st.warning(
+                f"⚠️ **{len(_oversized)} posizione/i sovradimensionata/e** — aperte da una "
+                f"versione precedente del motore, con premio oltre il limite attuale "
+                f"dell'{tl.MAX_PREMIUM_PCT:.0f}% del capitale. Queste sono la causa di "
+                f"perdite sproporzionate rispetto a un conto da ${tl.INITIAL_CAPITAL:.0f}.")
+            for _ov in _oversized:
+                _c1, _c2 = st.columns([3, 1])
+                _c1.markdown(
+                    f"Trade **#{_ov['id']}** ({_ov['strategy']}): premio "
+                    f"${_ov['entry_premium_usd']:.0f} = **{_ov['pct_of_capital']:.0f}%** "
+                    f"del capitale (limite ${_ov['cap_usd']:.0f})")
+                if _has_data:
+                    if _c2.button(f"Chiudi #{_ov['id']}", key=f"close_ov_{_ov['id']}"):
+                        _dd_ov = st.session_state["data"]
+                        _m0_ov = compute_0dte_metrics(_dd_ov.get("raw_full"),
+                                                      _dd_ov.get("spot", 0)) or {}
+                        _iv_ov = (_m0_ov.get('atm_iv') or 0.15)
+                        _iv_ov = _iv_ov*100 if _iv_ov < 1 else _iv_ov
+                        _res = tl.close_position_manual(_ov['id'],
+                                                        _dd_ov.get("spot", 0), _iv_ov)
+                        if _res.get('closed'):
+                            st.success(f"Posizione #{_ov['id']} chiusa, "
+                                       f"P&L ${_res['pnl_usd']:+.0f}.")
+                            st.rerun()
+                else:
+                    _c2.caption("Carica chain per chiudere")
+
         # ── Live signal preview (informational — engine decides at close) ─────
         _has_data = ("data" in st.session_state and
                      st.session_state["data"].get("raw_full") is not None)
@@ -1494,8 +1524,32 @@ with tab7:
                                     margin=dict(t=10,b=30,l=50,r=10), showlegend=False)
                 st.plotly_chart(_efig, use_container_width=True)
 
-            st.download_button("⬇ Esporta CSV", _pos.to_csv(index=False).encode(),
+            _exp1, _exp2 = st.columns([2, 2])
+            _exp1.download_button("⬇ Esporta CSV", _pos.to_csv(index=False).encode(),
                                file_name="paper_trades.csv", mime="text/csv", key="dl_paper")
+            with _exp2:
+                with st.popover("🗄 Archivia e riparti pulito"):
+                    st.markdown("**Archivia lo storico e ricomincia da zero**")
+                    st.caption("Lo storico attuale viene salvato in un file "
+                               "`positions_archive_...csv` (nulla viene cancellato) e "
+                               "il paper trading riparte da 5.000 $ con zero posizioni. "
+                               "Utile per lasciarsi alle spalle le posizioni del vecchio bug "
+                               "e validare il sistema corretto da una linea netta.")
+                    _confirm = st.checkbox("Confermo: archivia e azzera lo storico",
+                                           key="confirm_archive")
+                    if st.button("🗄 Procedi", key="do_archive", disabled=not _confirm):
+                        _res = tl.archive_and_reset()
+                        if _res['archived']:
+                            st.success(f"Archiviate {_res['rows_archived']} posizioni in "
+                                       f"`{os.path.basename(_res['archive_path'])}`. "
+                                       "Storico azzerato — si riparte pulito.")
+                            st.rerun()
+                        else:
+                            st.info(_res.get('reason', 'Niente da archiviare.'))
+            _archives = tl.list_archives()
+            if _archives:
+                st.caption(f"📁 Archivi salvati: {len(_archives)} "
+                           f"(più recente: {_archives[0]})")
         else:
             st.info("Nessuna posizione ancora. Il motore automatico registrerà il primo "
                     "trade quando il segnale sarà favorevole (la maggior parte dei giorni "

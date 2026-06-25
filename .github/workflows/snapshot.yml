@@ -1,6 +1,7 @@
 # Daily chain snapshot — runs Mon-Fri at 13:40 UTC (09:40 ET)
-# Saves a compact per-strike snapshot of the SPX chain into snapshots/
-# and commits it to the repo so history survives Streamlit Cloud restarts.
+# Saves a compact per-strike snapshot of the SPX chain into snapshots/,
+# AND computes/saves the VolDex suite (voldex_history/) — same persistence
+# trick so both series survive Streamlit Cloud restarts.
 #
 # Setup (one-time):
 #   1. Copy this file to .github/workflows/snapshot.yml in the repo
@@ -28,7 +29,7 @@ jobs:
       - name: Install dependencies
         run: pip install pandas numpy scipy requests yfinance
 
-      - name: Fetch chain and save snapshot
+      - name: Fetch chain, save snapshot and VolDex
         run: |
           python - << 'EOF'
           import sys
@@ -41,6 +42,16 @@ jobs:
               if raw is not None and not raw.empty:
                   path = dg.save_daily_snapshot(raw, spot, ticker)
                   print(f'Snapshot saved: {path}')
+
+                  # VolDex suite — same chain, no extra fetch needed
+                  vx = dg.compute_voldex(raw, spot)
+                  if vx.get('error'):
+                      print(f'VolDex not computed: {vx["error"]}')
+                  else:
+                      dg.save_voldex_snapshot(vx)
+                      print(f"VolDex saved: voldex={vx['voldex']} "
+                            f"calldex={vx['calldex']} putdex={vx['putdex']} "
+                            f"taildex={vx['taildex']}")
               else:
                   print('Chain fetch returned empty — no snapshot saved')
           except Exception as e:
@@ -48,10 +59,10 @@ jobs:
               # Do not fail the workflow — Barchart can be flaky
           EOF
 
-      - name: Commit snapshot
+      - name: Commit snapshot and VolDex history
         run: |
           git config user.name  "snapshot-bot"
           git config user.email "actions@github.com"
-          git add snapshots/ || true
+          git add snapshots/ voldex_history/ || true
           git diff --cached --quiet || git commit -m "snapshot: $(date -u +%F)"
           git push || true

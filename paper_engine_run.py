@@ -81,6 +81,13 @@ def main() -> int:
     except Exception as e:
         log(f"Snapshot save failed (non-fatal): {e}")
 
+    # GEX/DEX derived-metrics history (Net GEX, flip, regime, HHI, P/C)
+    try:
+        dg.save_gex_metrics_snapshot(raw, by_strike, spot)
+        log("GEX metrics history updated")
+    except Exception as e:
+        log(f"GEX metrics history save failed (non-fatal): {e}")
+
     # ── 3b. VolDex suite — same chain, no extra fetch needed ──────────────────
     voldex = calldex = putdex = taildex = skew_trend = None
     try:
@@ -124,6 +131,13 @@ def main() -> int:
                                   skew_trend=skew_trend)
     log(f"Decision: {decision.action} {decision.strategy} "
         f"conf={decision.confidence} {decision.skip_reason}")
+
+    # Log the decision (TRADE or SKIP) for selection-logic validation
+    try:
+        tl.log_daily_decision(decision, spot, voldex=voldex,
+                              expected_move_pts=em)
+    except Exception as e:
+        log(f"Skip-log write failed (non-fatal): {e}")
 
     if decision.action == 'TRADE':
         can, why = tl.can_open_new()

@@ -3042,7 +3042,8 @@ def put_monitor_chart(raw_df: pd.DataFrame, spot: float, ticker: str):
 
 def price_vs_dex_chart(by_strike_df: pd.DataFrame, intraday_df,
                        spot: float, ticker: str,
-                       strike_lo=None, strike_hi=None):
+                       strike_lo=None, strike_hi=None,
+                       key_levels: dict = None):
     """Dual-panel chart with shared Y-axis (price / strike level).
 
     Left  — DEX exposure as horizontal bars per strike.
@@ -3051,6 +3052,10 @@ def price_vs_dex_chart(by_strike_df: pd.DataFrame, intraday_df,
             Falls back to the spot price as a horizontal reference line
             when intraday data is unavailable (market closed, weekend,
             or Barchart endpoint restricted).
+
+    key_levels (optional): dict like {'Gamma Flip': 7365, 'Peak GEX': 7300}
+    drawn as horizontal dotted reference lines on the price panel — turns
+    scattered numbers into an operational map.
     """
     from plotly.subplots import make_subplots
     import plotly.graph_objects as go
@@ -3121,6 +3126,23 @@ def price_vs_dex_chart(by_strike_df: pd.DataFrame, intraday_df,
     fig.add_vline(x=0, line_color=GRID_COL, line_width=1, row=1, col=1)
     fig.add_hline(y=spot, line_color=ACCENT_YLW, line_dash='dash',
                   line_width=1.5, row=1, col=1)
+
+    # Key levels overlay — operational map (gamma flip, peak GEX, max pain...)
+    if key_levels:
+        _lvl_colors = {'Gamma Flip': '#10B981', 'Peak GEX': '#A78BFA',
+                       'Max Pain': '#F472B6'}
+        for _name, _lvl in key_levels.items():
+            if _lvl is None:
+                continue
+            try:
+                _lv = float(_lvl)
+            except Exception:
+                continue
+            fig.add_hline(y=_lv, line_color=_lvl_colors.get(_name, '#9CA3AF'),
+                          line_dash='dot', line_width=1.3,
+                          annotation_text=f"{_name} {_lv:,.0f}",
+                          annotation_position='left',
+                          annotation_font_size=9, row=1, col=1)
 
     # ── Intraday price panel ─────────────────────────────────────────────
     if has_intra:
@@ -4775,3 +4797,212 @@ def voldex_history_chart(hist: pd.DataFrame):
                   legend=dict(orientation='h', y=-0.18))
     fig.update_layout(**layout)
     return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GEX/DEX metrics history — persist the DERIVED metrics, not just prices
+# ══════════════════════════════════════════════════════════════════════════════
+# Stores a daily row of the key derived metrics (Net GEX, gamma flip, regime,
+# HHI, P/C ratio, spot) so the dashboard can show the TREND, not only today's
+# value. For a long-vol strategy the *change* in regime/GEX is often more
+# informative than the absolute level. Same persistence pattern as VolDex
+# history: a small CSV committed by GitHub Actions, surviving Cloud restarts.
+
+GEXHIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gex_history')
+GEXHIST_CSV = os.path.join(GEXHIST_DIR, 'gex_metrics_history.csv')
+
+
+def save_gex_metrics_snapshot(raw_df: pd.DataFrame, by_strike_df: pd.DataFrame,
+                              spot: float) -> str:
+    """Append today's derived GEX/DEX metrics to the history CSV.
+
+    One row per day (same-day re-runs replace the row). Computes the metrics
+    via compute_gex_analytics so the stored values match exactly what the
+    dashboard shows.
+    """
+    os.makedirs(GEXHIST_DIR, exist_ok=True)
+    ga = compute_gex_analytics(raw_df, by_strike_df, spot) or {}
+    try:
+        total_gex = float(raw_df['gex'].sum())
+    except Exception:
+        total_gex = None
+    try:
+        total_dex = float(raw_df['dex'].sum())
+    except Exception:
+        total_dex = None
+    try:
+        call_oi = int(raw_df[raw_df['flag'] == 'c']['openInterest'].sum())
+        put_oi  = int(raw_df[raw_df['flag'] == 'p']['openInterest'].sum())
+        pcr = put_oi / call_oi if call_oi else None
+    except Exception:
+        pcr = None
+
+    row = {
+        'date':       date.today().isoformat(),
+        'spot':       round(spot, 2) if spot else None,
+        'total_gex':  round(total_gex, 0) if total_gex is not None else None,
+        'total_dex':  round(total_dex, 0) if total_dex is not None else None,
+        'net_gex':    round(ga.get('net_gex_total'), 0) if ga.get('net_gex_total') is not None else None,
+        'gamma_flip': round(ga.get('gamma_flip'), 0) if ga.get('gamma_flip') is not None else None,
+        'regime':     ga.get('regime'),
+        'hhi':        round(ga.get('hhi'), 4) if ga.get('hhi') is not None else None,
+        'pc_ratio':   round(pcr, 3) if pcr is not None else None,
+    }
+    df_new = pd.DataFrame([row])
+    if os.path.exists(GEXHIST_CSV):
+        try:
+            old = pd.read_csv(GEXHIST_CSV)
+            old = old[old['date'] != row['date']]
+            allrows = pd.concat([old, df_new], ignore_index=True)
+        except Exception:
+            allrows = df_new
+    else:
+        allrows = df_new
+    allrows.to_csv(GEXHIST_CSV, index=False)
+    return GEXHIST_CSV
+
+
+def load_gex_metrics_history() -> pd.DataFrame:
+    """Load the persisted GEX/DEX metrics history (empty if none yet)."""
+    if os.path.exists(GEXHIST_CSV):
+        try:
+            df = pd.read_csv(GEXHIST_CSV)
+            df['date'] = pd.to_datetime(df['date'])
+            return df.sort_values('date').reset_index(drop=True)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=['date', 'spot', 'total_gex', 'total_dex',
+                                 'net_gex', 'gamma_flip', 'regime', 'hhi', 'pc_ratio'])
+
+
+def gex_metrics_history_chart(hist: pd.DataFrame, metric: str = 'net_gex'):
+    """Line chart of one stored GEX metric over time, with spot/flip overlay
+    for the gamma_flip view."""
+    import plotly.graph_objects as go
+    titles = {
+        'net_gex':   'Net GEX ($) — storico',
+        'gamma_flip':'Gamma Flip vs Spot — storico',
+        'hhi':       'HHI (concentrazione GEX) — storico',
+        'pc_ratio':  'Put/Call OI ratio — storico',
+        'total_dex': 'Total DEX ($) — storico',
+    }
+    if hist is None or hist.empty or len(hist) < 2:
+        fig = go.Figure()
+        fig.update_layout(**base_layout(
+            f"{titles.get(metric, metric)} (servono ≥ 2 giorni)", height=320))
+        return fig
+
+    fig = go.Figure()
+    if metric == 'gamma_flip':
+        # overlay spot and flip to show their relationship (regime)
+        fig.add_scatter(x=hist['date'], y=hist['spot'], mode='lines+markers',
+                        name='Spot', line=dict(color='#6C63FF', width=2.2))
+        fig.add_scatter(x=hist['date'], y=hist['gamma_flip'], mode='lines+markers',
+                        name='Gamma Flip', line=dict(color='#F59E0B', width=2.2, dash='dash'))
+    else:
+        colors = {'net_gex': '#EF4444', 'hhi': '#10B981',
+                  'pc_ratio': '#F59E0B', 'total_dex': '#3B82F6'}
+        fig.add_scatter(x=hist['date'], y=hist[metric], mode='lines+markers',
+                        name=metric, line=dict(color=colors.get(metric, '#6C63FF'), width=2.2))
+        if metric == 'net_gex':
+            fig.add_hline(y=0, line_dash='dot', line_color='#9CA3AF')
+    layout = base_layout(titles.get(metric, metric), height=340)
+    layout.update(legend=dict(orientation='h', y=-0.18))
+    fig.update_layout(**layout)
+    return fig
+
+
+def cumulative_gex_chart(by_strike_df: pd.DataFrame, spot: float,
+                         gamma_flip=None, ticker: str = 'SPX'):
+    """Cumulative net-GEX profile across strikes — the curve whose zero-crossing
+    IS the gamma flip. Makes the flip (or its absence) visible at a glance:
+    if the curve never crosses zero near spot, there is no real flip and the
+    market is one-sided. This is the visual complement of the Gamma Flip card.
+    """
+    import plotly.graph_objects as go
+    if by_strike_df is None or by_strike_df.empty or 'net_gex' not in by_strike_df.columns:
+        fig = go.Figure()
+        fig.update_layout(**base_layout("GEX Cumulato — dati non disponibili", height=360))
+        return fig
+
+    d = by_strike_df.sort_values('strike').reset_index(drop=True)
+    cum = d['net_gex'].cumsum() / 1e6   # in $M
+
+    fig = go.Figure()
+    fig.add_scatter(x=d['strike'], y=cum, mode='lines',
+                    name='GEX cumulato', line=dict(color='#6C63FF', width=2.5),
+                    fill='tozeroy', fillcolor='rgba(108,99,255,0.12)')
+    fig.add_hline(y=0, line_dash='dot', line_color='#9CA3AF')
+    if spot:
+        fig.add_vline(x=spot, line_dash='dash', line_color='#F59E0B',
+                      annotation_text=f'Spot ${spot:,.0f}', annotation_position='top')
+    if gamma_flip:
+        fig.add_vline(x=gamma_flip, line_dash='dash', line_color='#10B981',
+                      annotation_text=f'Flip ${gamma_flip:,.0f}',
+                      annotation_position='bottom')
+    layout = base_layout(f"GEX Cumulato per Strike — {ticker}", height=380)
+    layout.update(xaxis_title='Strike', yaxis_title='GEX cumulato ($M)')
+    fig.update_layout(**layout)
+    return fig
+
+
+def signal_health_check(raw_df: pd.DataFrame, by_strike_df: pd.DataFrame,
+                        spot: float, dte0_metrics: dict = None) -> list:
+    """Internal consistency checks across correlated metrics — surfaces
+    suspicious divergences before the user stumbles on them.
+
+    Returns a list of {level, message} dicts. level ∈ {ok, warn, info}.
+    This does NOT hide divergences; it flags them so they can be investigated.
+    """
+    out = []
+    try:
+        ga = compute_gex_analytics(raw_df, by_strike_df, spot) or {}
+    except Exception:
+        return [{'level': 'info', 'message': 'Analytics non disponibili per il check.'}]
+
+    net_gex = ga.get('net_gex_total')
+    regime  = ga.get('regime')
+    flip    = ga.get('gamma_flip')
+
+    # Check 1: regime vs net GEX sign coherence (flip-based may legitimately
+    # differ, but a mismatch is worth explaining)
+    if regime and net_gex is not None:
+        sign_regime = 'LONG' if 'LONG' in regime else 'SHORT'
+        sign_netgex = 'LONG' if net_gex >= 0 else 'SHORT'
+        if sign_regime != sign_netgex:
+            out.append({'level': 'info', 'message':
+                f"Regime ({sign_regime} γ) diverge dal segno del Net GEX grezzo "
+                f"({sign_netgex}). Normale: il regime usa la posizione spot/flip, "
+                f"non la somma grezza. Nessun errore."})
+
+    # Check 2: full-chain regime vs 0DTE gamma regime
+    if dte0_metrics and regime:
+        flip0 = dte0_metrics.get('gex_flip')
+        if flip0 and spot:
+            reg0 = 'LONG' if spot >= flip0 else 'SHORT'
+            regF = 'LONG' if 'LONG' in regime else 'SHORT'
+            if reg0 != regF:
+                out.append({'level': 'warn', 'message':
+                    f"Regime 0DTE ({reg0} γ) ≠ regime full chain ({regF} γ). "
+                    f"Orizzonti diversi: l'intraday può divergere dal medio termine. "
+                    f"Da tenere d'occhio se prendi decisioni multi-giorno."})
+
+    # Check 3: gamma flip plausibility (should be within a reasonable band of spot)
+    if flip and spot:
+        dist_pct = abs(flip - spot) / spot * 100
+        if dist_pct > 8:
+            out.append({'level': 'warn', 'message':
+                f"Gamma flip (${flip:,.0f}) è {dist_pct:.0f}% lontano dallo spot — "
+                f"insolito. Verifica il grafico GEX cumulato: potrebbe non esserci "
+                f"un flip reale (mercato a senso unico)."})
+
+    # Check 4: spot near flip → unstable regime
+    if flip and spot and abs(flip - spot) / spot * 100 < 0.5:
+        out.append({'level': 'info', 'message':
+            f"Spot molto vicino al flip (${flip:,.0f}) — regime instabile, "
+            f"piccoli movimenti possono ribaltarlo."})
+
+    if not out:
+        out.append({'level': 'ok', 'message':
+            'Segnali coerenti: nessuna divergenza sospetta rilevata.'})
+    return out

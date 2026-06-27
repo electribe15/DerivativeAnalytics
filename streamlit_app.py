@@ -147,6 +147,11 @@ try:
         save_voldex_snapshot,
         load_voldex_history,
         voldex_history_chart,
+        save_gex_metrics_snapshot,
+        load_gex_metrics_history,
+        gex_metrics_history_chart,
+        cumulative_gex_chart,
+        signal_health_check,
         compute_0dte_gamma_schedule,
         save_daily_snapshot,
         compute_dod_changes,
@@ -345,7 +350,8 @@ if fetch_btn:
                                          ticker=ticker, raw_full=raw_full,
                                          intraday=intraday,
                                          ohlc_spx=ohlc_spx,
-                                         vix_hist=vix_hist)
+                                         vix_hist=vix_hist,
+                                         fetched_at=datetime.now())
 
         # Persist a compact daily snapshot (enables DoD deltas + GEX percentile)
         try:
@@ -500,9 +506,22 @@ if refresh_intra_btn and "data" in st.session_state:
 strike_lo, strike_hi = delta_strike_bounds(raw_full, delta_range[0], delta_range[1])
 
 # ── Status bar ────────────────────────────────────────────────────────────────
-ts = datetime.now().strftime("%H:%M:%S")
+_fetched = st.session_state.get("data", {}).get("fetched_at")
+if _fetched:
+    _age_min = (datetime.now() - _fetched).total_seconds() / 60
+    if _age_min < 10:
+        _fresh = f"🟢 dati di {_age_min:.0f} min fa"
+    elif _age_min < 60:
+        _fresh = f"🟡 dati di {_age_min:.0f} min fa"
+    else:
+        _hrs = _age_min / 60
+        _fresh = (f"🔴 dati di {_hrs:.1f}h fa — ricarica la chain"
+                  if _hrs < 24 else f"🔴 dati di {_hrs/24:.0f}g fa — ricarica la chain")
+    _fresh_txt = f"{_fetched.strftime('%H:%M')} ({_fresh})"
+else:
+    _fresh_txt = datetime.now().strftime("%H:%M:%S")
 st.markdown(
-    f"<div class='status-bar'>Last updated: {ts} &nbsp;|&nbsp; "
+    f"<div class='status-bar'>Dati caricati: {_fresh_txt} &nbsp;|&nbsp; "
     f"{len(raw_df):,} contracts &nbsp;|&nbsp; {raw_df['expiry'].nunique()} expiries &nbsp;|&nbsp; "
     f"Spot <b style='color:#ffd166'>${spot:.2f}</b> &nbsp;|&nbsp; "
     f"Δ filter: [{delta_range[0]:+.2f}, {delta_range[1]:+.2f}]</div>",
@@ -855,9 +874,22 @@ with tab1:
         st.markdown("---")
     # Price vs DEX Levels — the centrepiece: shared Y-axis chart
     try:
+        _ga_lvl = gex_analytics or {}
+        _max_pain = None
+        try:
+            _max_pain = compute_max_pain(raw_df)
+        except Exception:
+            pass
+        _key_levels = {
+            'Gamma Flip': _ga_lvl.get('gamma_flip'),
+            'Peak GEX': by_strike.loc[by_strike['net_gex'].abs().idxmax(), 'strike']
+                        if not by_strike.empty else None,
+            'Max Pain': _max_pain,
+        }
         st.plotly_chart(
             price_vs_dex_chart(by_strike, intraday, spot, cur_tick,
-                               strike_lo=strike_lo, strike_hi=strike_hi),
+                               strike_lo=strike_lo, strike_hi=strike_hi,
+                               key_levels=_key_levels),
             use_container_width=True,
         )
     except Exception as e:
@@ -883,6 +915,82 @@ with tab1:
         st.plotly_chart(gex_expiry_chart(by_expiry, cur_tick), use_container_width=True)
     except Exception as e:
         st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+
+    # Cumulative GEX profile — the curve whose zero-crossing IS the gamma flip
+    st.markdown("---")
+    st.markdown("##### GEX Cumulato — dove (e se) c'è il gamma flip")
+    st.caption("La curva del GEX cumulato attraversa lo zero esattamente al gamma flip. "
+               "Se non attraversa mai lo zero vicino allo spot, non esiste un flip reale "
+               "e il mercato è interamente in un solo regime.")
+    try:
+        _flip_cum = (gex_analytics or {}).get('gamma_flip')
+        st.plotly_chart(cumulative_gex_chart(by_strike, spot, _flip_cum, cur_tick),
+                        use_container_width=True)
+    except Exception as e:
+        st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+
+    # Signal health — internal consistency checks
+    st.markdown("---")
+    st.markdown("##### 🩺 Coerenza dei segnali")
+    try:
+        _m0_hc = compute_0dte_metrics(raw_df, spot) or {}
+        _checks = signal_health_check(raw_df, by_strike, spot, _m0_hc)
+        for _ck in _checks:
+            _lvl = _ck['level']
+            if _lvl == 'ok':
+                st.success("✓ " + _ck['message'])
+            elif _lvl == 'warn':
+                st.warning("⚠️ " + _ck['message'])
+            else:
+                st.info("ℹ️ " + _ck['message'])
+    except Exception as e:
+        st.caption(f"Check non disponibile: {e}")
+
+    # GEX/DEX metrics history — the TREND, not just today's value
+    st.markdown("---")
+    st.markdown("##### 📈 Storico metriche GEX/DEX")
+    st.caption("Per il long-vol il *cambiamento* del regime conta più del livello "
+               "assoluto. Salva uno snapshot a ogni caricamento (o lascia fare al "
+               "motore automatico) per costruire la serie.")
+    _gh1, _gh2 = st.columns([3, 1])
+    with _gh2:
+        if st.button("💾 Salva metriche oggi", key="save_gexhist"):
+            try:
+                save_gex_metrics_snapshot(raw_df, by_strike, spot)
+                st.success("Salvato.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Errore: {e}")
+    _ghist = load_gex_metrics_history()
+    with _gh1:
+        st.caption(f"Storico: {len(_ghist)} giorni salvati.")
+    if len(_ghist) >= 2:
+        _metric_choice = st.selectbox(
+            "Metrica da visualizzare",
+            options=['net_gex', 'gamma_flip', 'hhi', 'pc_ratio', 'total_dex'],
+            format_func=lambda m: {
+                'net_gex': 'Net GEX', 'gamma_flip': 'Gamma Flip vs Spot',
+                'hhi': 'HHI (concentrazione)', 'pc_ratio': 'Put/Call OI',
+                'total_dex': 'Total DEX'}.get(m, m),
+            key="gexhist_metric")
+        try:
+            st.plotly_chart(gex_metrics_history_chart(_ghist, _metric_choice),
+                            use_container_width=True)
+        except Exception as e:
+            st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+        # Regime timeline
+        if 'regime' in _ghist.columns:
+            _reg_recent = _ghist[['date', 'regime']].tail(10).iloc[::-1]
+            _reg_recent['date'] = _reg_recent['date'].dt.strftime('%Y-%m-%d')
+            st.caption("Regime negli ultimi giorni:")
+            st.dataframe(_reg_recent, use_container_width=True, hide_index=True)
+        st.download_button("⬇ Esporta storico metriche",
+                           _ghist.to_csv(index=False).encode(),
+                           file_name="gex_metrics_history.csv", mime="text/csv",
+                           key="dl_gexhist")
+    else:
+        st.info("Servono almeno 2 giorni di dati per il grafico storico. "
+                "Si popolerà con i prossimi salvataggi (manuali o automatici).")
 
 # ── Tab 2: Range & Skew ───────────────────────────────────────────────────────
 with tab2:

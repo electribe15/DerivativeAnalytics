@@ -837,7 +837,10 @@ with tab1:
                 })[['Movimento','Spot Level','Net GEX ($B)','Gross GEX ($B)','Regime']]
                 st.caption(
                     "Mostra il GEX netto se il prezzo fosse a quel livello — IV e OI rimangono costanti. "
-                    "Identifica dove il regime cambia con movimenti di mercato.")
+                    "Identifica dove il regime cambia con movimenti di mercato. "
+                    "Nota: qui il regime a ogni livello segue il segno del Net GEX a *quel* prezzo "
+                    "ipotetico — il livello in cui passa da SHORT a LONG è il gamma flip, "
+                    "coerente con il 'GEX Regime' della scheda principale.")
                 st.dataframe(profile_disp.reset_index(drop=True),
                              use_container_width=True, hide_index=True)
         st.markdown("---")

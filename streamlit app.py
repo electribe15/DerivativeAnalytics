@@ -143,6 +143,10 @@ try:
         backtest_vol_premium,
         compute_gex_analytics,
         compute_gex_profile,
+        compute_voldex,
+        save_voldex_snapshot,
+        load_voldex_history,
+        voldex_history_chart,
         compute_0dte_gamma_schedule,
         save_daily_snapshot,
         compute_dod_changes,
@@ -201,12 +205,25 @@ def build_stat_metrics(raw_df, by_strike_df, spot):
     call_oi     = int(raw_df[raw_df["flag"] == "c"]["openInterest"].sum())
     put_oi      = int(raw_df[raw_df["flag"] == "p"]["openInterest"].sum())
     pcr         = put_oi / call_oi if call_oi else 0
-    regime      = "🟢 POSITIVE" if total_gex > 0 else "🔴 NEGATIVE"
+    # Flip-based regime (standard of market): set by spot vs the gamma flip
+    # strike, not by the raw sign of total GEX. Consistent with the 0DTE tab.
+    _ga = compute_gex_analytics(raw_df, by_strike_df, spot) or {}
+    _flip = _ga.get('gamma_flip')
+    _reg  = _ga.get('regime')
+    if _reg and 'LONG' in _reg:
+        regime, regime_pos = "🟢 LONG γ", True
+    elif _reg and 'SHORT' in _reg:
+        regime, regime_pos = "🔴 SHORT γ", False
+    else:
+        regime_pos = total_gex > 0
+        regime = "🟢 LONG γ" if regime_pos else "🔴 SHORT γ"
+    flip_str = f"${_flip:,.0f}" if _flip else "—"
     return {
         "Spot Price":      (f"${spot:.2f}",          ACCENT_YLW),
         "Total GEX":       (fmt_billions(total_gex),  ACCENT_GRN if total_gex > 0 else ACCENT_RED),
         "Total DEX":       (fmt_millions(total_dex),  ACCENT_BLU),
-        "GEX Regime":      (regime,                   ACCENT_GRN if total_gex > 0 else ACCENT_RED),
+        "GEX Regime (full chain)": (regime,           ACCENT_GRN if regime_pos else ACCENT_RED),
+        "Gamma Flip":      (flip_str,                 ACCENT_YLW),
         "Peak GEX Strike": (str(peak_strike),         ACCENT_GRN),
         "Put/Call OI":     (f"{pcr:.2f}",             ACCENT_YLW),
         "Contracts":       (f"{len(raw_df):,}",       ACCENT_BLU),
@@ -496,7 +513,10 @@ st.markdown(
 stats = build_stat_metrics(raw_df, by_strike, spot)
 metric_cols = st.columns(len(stats))
 for col, (label, (value, _color)) in zip(metric_cols, stats.items()):
-    col.metric(label=label, value=value)
+    _help = (f"Somma su tutte le scadenze nel range selezionato (≤ {max_days}g). "
+             "Può differire dal 'Gamma Regime (0DTE)' in tab 0DTE, che misura "
+             "solo la scadenza odierna." if "GEX Regime" in label else None)
+    col.metric(label=label, value=value, help=_help)
 
 st.markdown("---")
 
@@ -567,7 +587,7 @@ dte0_metrics = compute_0dte_metrics(raw_full, spot)
 has_0dte     = bool(dte0_metrics)
 
 # ── Tabs — 0DTE is always first and shown by default ─────────────────────────
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "⚡ 0DTE",
     "📊 GEX / DEX",
     "📐 Range & Skew",
@@ -576,6 +596,7 @@ tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🔥 Open Interest",
     "📉 Realized Vol",
     "🤖 Paper Trading",
+    "🌊 VolDex",
 ])
 
 # ── Tab 0: 0DTE ───────────────────────────────────────────────────────────────
@@ -1287,6 +1308,36 @@ with tab7:
             st.caption("💡 Carica la chain (CARICA FULL CHAIN) per vedere il P&L latente "
                        "in tempo reale delle posizioni aperte.")
 
+        # ── Oversized legacy positions warning ────────────────────────────────
+        _oversized = tl.find_oversized_open()
+        if _oversized:
+            st.warning(
+                f"⚠️ **{len(_oversized)} posizione/i sovradimensionata/e** — aperte da una "
+                f"versione precedente del motore, con premio oltre il limite attuale "
+                f"dell'{tl.MAX_PREMIUM_PCT:.0f}% del capitale. Queste sono la causa di "
+                f"perdite sproporzionate rispetto a un conto da ${tl.INITIAL_CAPITAL:.0f}.")
+            for _ov in _oversized:
+                _c1, _c2 = st.columns([3, 1])
+                _c1.markdown(
+                    f"Trade **#{_ov['id']}** ({_ov['strategy']}): premio "
+                    f"${_ov['entry_premium_usd']:.0f} = **{_ov['pct_of_capital']:.0f}%** "
+                    f"del capitale (limite ${_ov['cap_usd']:.0f})")
+                if _has_data:
+                    if _c2.button(f"Chiudi #{_ov['id']}", key=f"close_ov_{_ov['id']}"):
+                        _dd_ov = st.session_state["data"]
+                        _m0_ov = compute_0dte_metrics(_dd_ov.get("raw_full"),
+                                                      _dd_ov.get("spot", 0)) or {}
+                        _iv_ov = (_m0_ov.get('atm_iv') or 0.15)
+                        _iv_ov = _iv_ov*100 if _iv_ov < 1 else _iv_ov
+                        _res = tl.close_position_manual(_ov['id'],
+                                                        _dd_ov.get("spot", 0), _iv_ov)
+                        if _res.get('closed'):
+                            st.success(f"Posizione #{_ov['id']} chiusa, "
+                                       f"P&L ${_res['pnl_usd']:+.0f}.")
+                            st.rerun()
+                else:
+                    _c2.caption("Carica chain per chiudere")
+
         # ── Live signal preview (informational — engine decides at close) ─────
         _has_data = ("data" in st.session_state and
                      st.session_state["data"].get("raw_full") is not None)
@@ -1295,7 +1346,10 @@ with tab7:
             _spot = _dd.get("spot", 0)
             _ga = compute_gex_analytics(_dd.get("raw_full"), _dd.get("by_strike"), _spot) or {}
             _m0 = compute_0dte_metrics(_dd.get("raw_full"), _spot) or {}
-            _regime = 'LONG' if _ga.get('net_gex_total', 0) >= 0 else 'SHORT'
+            _regime_full = _ga.get('regime')
+            _regime = 'LONG' if (_regime_full and 'LONG' in _regime_full) else (
+                      'SHORT' if _regime_full else
+                      ('LONG' if _ga.get('net_gex_total', 0) >= 0 else 'SHORT'))
             _hhi = _ga.get('hhi', 0.0)
             _atm_iv = _m0.get('atm_iv')
             _vp = None
@@ -1308,8 +1362,34 @@ with tab7:
                         _vp = _vixv - float(_rv["EWMA λ=0.94"].iloc[-1])
                 except Exception:
                     pass
+            # VolDex suite — same signals the automatic engine uses
+            _vx_prev = compute_voldex(_dd.get("raw_full"), _spot)
+            _voldex_p = _calldex_p = _putdex_p = _taildex_p = _skewtr_p = None
+            if not _vx_prev.get('error'):
+                _voldex_p  = _vx_prev['voldex']
+                _calldex_p = _vx_prev['calldex']
+                _putdex_p  = _vx_prev['putdex']
+                _taildex_p = _vx_prev['taildex']
+                try:
+                    _vhist = load_voldex_history()
+                    if not _vhist.empty and len(_vhist) >= 3 and _putdex_p and _calldex_p:
+                        _today_skew = _putdex_p - _calldex_p
+                        _hskew = (_vhist['putdex'] - _vhist['calldex']).dropna()
+                        if len(_hskew) >= 2:
+                            _skewtr_p = round(_today_skew - float(_hskew.tail(10).mean()), 2)
+                except Exception:
+                    pass
+
             _dec = tl.evaluate_signal(_spot, _regime, _hhi, _vp, _atm_iv,
-                                      _m0.get('exp_move_pts'))
+                                      _m0.get('exp_move_pts'),
+                                      voldex=_voldex_p, calldex=_calldex_p,
+                                      putdex=_putdex_p, taildex=_taildex_p,
+                                      skew_trend=_skewtr_p)
+            if _voldex_p is not None:
+                st.caption(f"📐 Segnali VolDex usati nell'anteprima: VolDex {_voldex_p:.1f}% · "
+                          f"CallDex {_calldex_p:.1f}% · PutDex {_putdex_p:.1f}% · "
+                          f"TailDex {_taildex_p:.1f}%"
+                          + (f" · Skew trend {_skewtr_p:+.2f}pt" if _skewtr_p is not None else ""))
             st.markdown("---")
             st.markdown("**🔍 Anteprima segnale corrente** "
                         "<span style='font-size:11px;color:#9CA3AF;'>(indicativa — "
@@ -1323,6 +1403,24 @@ with tab7:
                           if _atm_iv else "—")
             st.markdown(_dec.summary_html, unsafe_allow_html=True)
 
+            # Explicit option legs (what would be bought/sold)
+            if _dec.action == 'TRADE' and _dec.legs:
+                st.markdown("<span style='font-size:12px;'><b>Gambe dell'operazione "
+                            "(XSP):</b></span>", unsafe_allow_html=True)
+                _legrows = [{
+                    'Lato': l['side'], 'Tipo': l['type'],
+                    'Strike': f"{l['strike']:.0f}",
+                    'Premio (punti)': f"{l['premium_pts']:.2f}",
+                    'Premio ($)': f"${l['premium_usd']:.0f}",
+                } for l in _dec.legs]
+                _legrows.append({
+                    'Lato': '', 'Tipo': 'TOTALE', 'Strike': '',
+                    'Premio (punti)': f"{_dec.est_premium:.2f}",
+                    'Premio ($)': f"${_dec.est_premium*100:.0f}",
+                })
+                st.dataframe(pd.DataFrame(_legrows), use_container_width=True,
+                             hide_index=True)
+
             # Per-condition checklist + explanation
             if _dec.conditions:
                 _cccols = st.columns(2)
@@ -1333,10 +1431,14 @@ with tab7:
                         f"<span style='color:#6B7280;'>{_c['detail']}</span></span>",
                         unsafe_allow_html=True)
             if _dec.explanation:
-                _exp_color = '#10B981' if _dec.action == 'TRADE' else '#9CA3AF'
+                if _dec.action == 'TRADE':
+                    _exp_bg, _exp_border, _exp_text = '#ECFDF5', '#10B981', '#065F46'
+                else:
+                    _exp_bg, _exp_border, _exp_text = '#F3F4F6', '#9CA3AF', '#374151'
                 st.markdown(
-                    f"<div style='background:{_exp_color}12;border-left:3px solid {_exp_color};"
-                    f"border-radius:4px;padding:10px 14px;margin-top:8px;font-size:13px;'>"
+                    f"<div style='background:{_exp_bg};border-left:3px solid {_exp_border};"
+                    f"border-radius:4px;padding:10px 14px;margin-top:8px;font-size:13px;"
+                    f"color:{_exp_text};'>"
                     + _dec.explanation.replace(chr(10), '<br>') + "</div>",
                     unsafe_allow_html=True)
 
@@ -1358,7 +1460,33 @@ with tab7:
                     return "—"
                 return ""
             _show['P&L latente'] = _pos.apply(_live_pnl, axis=1)
+            # Add peak ratio reached (relevant for trailing-stop transparency)
+            if 'peak_ratio' in _pos.columns:
+                _show['Picco'] = _pos['peak_ratio'].apply(
+                    lambda v: f"{float(v):.2f}×" if pd.notna(v) and str(v).strip() != '' else "—")
             st.dataframe(_show, use_container_width=True, hide_index=True)
+            st.caption("**Regole di uscita:** profit target 2.5× · trailing stop "
+                       "(si arma a 1.5×, chiude se ripiega 25% dal picco) · uscita VolDex "
+                       "(vol salita +40% dall'entrata) · stop loss 50% · DTE floor 14g. "
+                       "La colonna *Picco* mostra il massimo raggiunto da ogni posizione.")
+
+            # Backfill: reconstruct legs for past trades missing them
+            _missing_legs = 0
+            if 'legs_json' in _pos.columns:
+                _missing_legs = int(_pos['legs_json'].apply(
+                    lambda x: not (isinstance(x, str) and x.strip())).sum())
+            else:
+                _missing_legs = len(_pos)
+            if _missing_legs > 0:
+                _bc1, _bc2 = st.columns([3, 1])
+                _bc1.caption(f"⚠️ {_missing_legs} trade passati non hanno il dettaglio "
+                             "delle gambe (registrati prima dell'aggiornamento).")
+                if _bc2.button("🔧 Ricostruisci gambe", key="backfill_legs"):
+                    _res = tl.backfill_legs()
+                    st.success(f"Ricostruite le gambe per {_res['filled']} trade "
+                               f"(saltati {_res['skipped']}). Sono STIME, non i dati "
+                               f"originali del momento dell'apertura.")
+                    st.rerun()
 
             # Per-trade decision rationale (why each trade was opened)
             if 'decision_note' in _pos.columns:
@@ -1370,6 +1498,26 @@ with tab7:
                             st.markdown(
                                 f"**Trade #{int(_r['id'])}** — {_r['open_date']} · "
                                 f"{_r['strategy']} · XSP {_r['xsp_strike']}")
+                            # Show explicit legs if available
+                            _lj = _r.get('legs_json')
+                            if isinstance(_lj, str) and _lj.strip():
+                                try:
+                                    import json as _json
+                                    _legs = _json.loads(_lj)
+                                    _is_recon = any(l.get('reconstructed') for l in _legs)
+                                    _lr = [{
+                                        'Lato': l['side'], 'Tipo': l['type'],
+                                        'Strike': f"{l['strike']:.0f}",
+                                        'Premio (punti)': f"{l['premium_pts']:.2f}",
+                                        'Premio ($)': f"${l['premium_usd']:.0f}",
+                                    } for l in _legs]
+                                    st.dataframe(pd.DataFrame(_lr),
+                                                 use_container_width=True, hide_index=True)
+                                    if _is_recon:
+                                        st.caption("⚠️ Gambe RICOSTRUITE (stime ricalcolate, "
+                                                   "non i dati originali dell'apertura).")
+                                except Exception:
+                                    pass
                             st.markdown(
                                 f"<div style='font-size:12px;color:#4B5563;"
                                 f"margin-bottom:10px;'>"
@@ -1392,8 +1540,32 @@ with tab7:
                                     margin=dict(t=10,b=30,l=50,r=10), showlegend=False)
                 st.plotly_chart(_efig, use_container_width=True)
 
-            st.download_button("⬇ Esporta CSV", _pos.to_csv(index=False).encode(),
+            _exp1, _exp2 = st.columns([2, 2])
+            _exp1.download_button("⬇ Esporta CSV", _pos.to_csv(index=False).encode(),
                                file_name="paper_trades.csv", mime="text/csv", key="dl_paper")
+            with _exp2:
+                with st.popover("🗄 Archivia e riparti pulito"):
+                    st.markdown("**Archivia lo storico e ricomincia da zero**")
+                    st.caption("Lo storico attuale viene salvato in un file "
+                               "`positions_archive_...csv` (nulla viene cancellato) e "
+                               "il paper trading riparte da 5.000 $ con zero posizioni. "
+                               "Utile per lasciarsi alle spalle le posizioni del vecchio bug "
+                               "e validare il sistema corretto da una linea netta.")
+                    _confirm = st.checkbox("Confermo: archivia e azzera lo storico",
+                                           key="confirm_archive")
+                    if st.button("🗄 Procedi", key="do_archive", disabled=not _confirm):
+                        _res = tl.archive_and_reset()
+                        if _res['archived']:
+                            st.success(f"Archiviate {_res['rows_archived']} posizioni in "
+                                       f"`{os.path.basename(_res['archive_path'])}`. "
+                                       "Storico azzerato — si riparte pulito.")
+                            st.rerun()
+                        else:
+                            st.info(_res.get('reason', 'Niente da archiviare.'))
+            _archives = tl.list_archives()
+            if _archives:
+                st.caption(f"📁 Archivi salvati: {len(_archives)} "
+                           f"(più recente: {_archives[0]})")
         else:
             st.info("Nessuna posizione ancora. Il motore automatico registrerà il primo "
                     "trade quando il segnale sarà favorevole (la maggior parte dei giorni "
@@ -1417,6 +1589,139 @@ with tab7:
         st.error("Modulo trading_lite.py non trovato nella root del progetto.")
     except Exception as _te:
         st.error(f"Errore: {_te}")
+        import traceback as _tb
+        st.code(_tb.format_exc())
+
+
+# ── Tab 8: VolDex Suite (replica indipendente, SPX) ───────────────────────────
+with tab8:
+    st.markdown("### 🌊 VolDex Suite — Implied Volatility ATM (replica SPX)")
+    st.caption(
+        "Replica indipendente della metodologia pubblicata da Nations Indexes "
+        "(VolDex®) e Nasdaq (VOLQ®): volatilità implicita ATM a 30 giorni, "
+        "calcolata con la formula closed-form di Brenner-Subrahmanyam su opzioni "
+        "esattamente at-the-money, interpolata su più scadenze. Qui applicata "
+        "all'indice SPX usando i dati già caricati dalla dashboard.")
+
+    with st.expander("ℹ️ Nota su trademark e differenze rispetto all'indice ufficiale",
+                     expanded=False):
+        st.markdown(
+            "<div style='color:#1A1A2E;font-size:13px;line-height:1.6;'>"
+            "<ul style='margin:0;padding-left:18px;'>"
+            "<li><b>Non è il prodotto Nations Indexes/Nasdaq licenziato.</b> "
+            "VolDex®, VOLQ®, CallDex®, PutDex® e TailDex® sono marchi registrati "
+            "dei rispettivi proprietari.</li>"
+            "<li>Questa è un'implementazione originale della <b>metodologia "
+            "pubblicata</b> (formula di Brenner-Subrahmanyam su strike ATM, pesati "
+            "con kernel triangolare, interpolati a 30 giorni), calcolata qui su "
+            "<b>SPX</b> invece che su NDX.</li>"
+            "<li>I prezzi usati sono <b>mid-quote</b> dal feed dati di questa "
+            "dashboard, non NBBO real-time come l'indice ufficiale.</li>"
+            "<li>I valori assoluti <b>non coincideranno</b> con il ticker "
+            "VOLQ/VolDex ufficiale — è una misura indipendente, stessa metodologia, "
+            "sottostante diverso.</li>"
+            "</ul></div>",
+            unsafe_allow_html=True)
+
+    try:
+        _has_data8 = ("data" in st.session_state and
+                      st.session_state["data"].get("raw_full") is not None)
+
+        if not _has_data8:
+            st.info("Premi **CARICA FULL CHAIN** per calcolare il VolDex corrente.")
+        else:
+            _dd8 = st.session_state["data"]
+            _spot8 = _dd8.get("spot", 0)
+            _raw8  = _dd8.get("raw_full")
+
+            _vx = compute_voldex(_raw8, _spot8)
+
+            if _vx.get('error'):
+                st.warning(f"⚠️ {_vx['error']}")
+            else:
+                # ── Headline metrics ────────────────────────────────────────────
+                _vc = st.columns(4)
+                _vc[0].metric("VolDex (ATM 30d)", f"{_vx['voldex']:.2f}%",
+                              help="Volatilità implicita ATM a 30 giorni — "
+                                   "ciò che i practitioner guardano per primo")
+                _vc[1].metric("CallDex (~16Δ call)",
+                              f"{_vx['calldex']:.2f}%" if _vx['calldex'] else "—",
+                              help="Costo normalizzato della call OTM ~1 dev. std")
+                _vc[2].metric("PutDex (~16Δ put)",
+                              f"{_vx['putdex']:.2f}%" if _vx['putdex'] else "—",
+                              help="Costo normalizzato della put OTM ~1 dev. std")
+                _vc[3].metric("TailDex (~10Δ put)",
+                              f"{_vx['taildex']:.2f}%" if _vx['taildex'] else "—",
+                              help="Costo della put più OTM — proxy di tail risk")
+
+                # Skew reading
+                if _vx['putdex'] and _vx['calldex']:
+                    _skew_pts = _vx['putdex'] - _vx['calldex']
+                    _skew_txt = (f"Skew Put−Call: **{_skew_pts:+.2f} punti**. "
+                                 + ("Skew tipico (put più care — copertura al ribasso "
+                                    "più richiesta)." if _skew_pts > 0 else
+                                    "Skew invertito — raro, da verificare."))
+                    st.caption(_skew_txt)
+
+                st.markdown("---")
+
+                # ── Save + historical chart ─────────────────────────────────────
+                _vcol1, _vcol2 = st.columns([3, 1])
+                with _vcol2:
+                    if st.button("💾 Salva snapshot di oggi", key="save_voldex"):
+                        save_voldex_snapshot(_vx)
+                        st.success("Salvato nello storico.")
+                        st.rerun()
+
+                _hist = load_voldex_history()
+                with _vcol1:
+                    st.caption(f"Storico: {len(_hist)} giorni salvati. "
+                               "Premi 'Salva snapshot' ogni volta che carichi la chain "
+                               "per far crescere la serie (oppure automatizza via "
+                               "GitHub Actions, vedi sotto).")
+
+                st.plotly_chart(voldex_history_chart(_hist), use_container_width=True)
+
+                if not _hist.empty:
+                    st.dataframe(_hist.tail(10).iloc[::-1], use_container_width=True,
+                                hide_index=True)
+                    st.download_button("⬇ Esporta storico CSV",
+                                       _hist.to_csv(index=False).encode(),
+                                       file_name="voldex_history.csv", mime="text/csv",
+                                       key="dl_voldex")
+
+                # ── Diagnostic table (transparency) ─────────────────────────────
+                with st.expander("🔍 Dettaglio calcolo per scadenza (trasparenza)",
+                                 expanded=False):
+                    st.caption(
+                        "Per ogni scadenza: forward price (via put-call parity), "
+                        "gli strike usati per il prezzo ATM sintetico, i pesi del "
+                        "kernel triangolare, e la volatilità implicita closed-form "
+                        "(Brenner-Subrahmanyam) per call e put.")
+                    _trows = []
+                    for _t in _vx['terms']:
+                        _trows.append({
+                            'Scadenza': _t['expiry'],
+                            'T (giorni)': f"{_t['T_days']:.1f}",
+                            'Forward': f"{_t['forward']:.1f}",
+                            'Strike usati': ', '.join(f"{s:.0f}" for s in _t['strikes']),
+                            'Pesi': ', '.join(f"{w:.2f}" for w in _t['weights']),
+                            'ATM Call': f"{_t['atm_call']:.2f}",
+                            'ATM Put': f"{_t['atm_put']:.2f}",
+                            'CFIV Call': f"{_t['cfiv_call']*100:.2f}%",
+                            'CFIV Put': f"{_t['cfiv_put']*100:.2f}%",
+                        })
+                    st.dataframe(pd.DataFrame(_trows), use_container_width=True,
+                                hide_index=True)
+
+                st.caption(
+                    "💡 Per accumulare lo storico in automatico, estendi il workflow "
+                    "`snapshot.yml` perché chiami anche `compute_voldex()` e "
+                    "`save_voldex_snapshot()` subito dopo aver scaricato la chain "
+                    "giornaliera, così come già fa per gli snapshot delle opzioni.")
+
+    except Exception as _vxe:
+        st.error(f"Errore nel calcolo VolDex: {_vxe}")
         import traceback as _tb
         st.code(_tb.format_exc())
 

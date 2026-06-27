@@ -51,7 +51,10 @@ def main() -> int:
     by_strike = dg.aggregate_by_strike(raw)
     ga = dg.compute_gex_analytics(raw, by_strike, spot) or {}
     m0 = dg.compute_0dte_metrics(raw, spot) or {}
-    regime = 'LONG' if ga.get('net_gex_total', 0) >= 0 else 'SHORT'
+    _reg_full = ga.get('regime')
+    regime = ('LONG' if (_reg_full and 'LONG' in _reg_full) else
+              'SHORT' if _reg_full else
+              ('LONG' if ga.get('net_gex_total', 0) >= 0 else 'SHORT'))
     hhi    = ga.get('hhi', 0.0)
     atm_iv = m0.get('atm_iv')
     em     = m0.get('exp_move_pts')

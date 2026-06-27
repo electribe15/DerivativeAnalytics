@@ -64,7 +64,7 @@ VP_BUY_BELOW         = 2.0
 DTE_TARGET           = 45
 PROFIT_TARGET_MULT   = 2.5     # full profit target — hard ceiling, always closes
 STOP_LOSS_PCT        = 50.0    # stop loss: close if premium falls to this % of entry
-MIN_CONFIDENCE       = 0.45
+MIN_CONFIDENCE       = 0.40    # lowered from 0.45 to slightly increase activity
 HOLD_DTE_FLOOR       = 14
 
 # ── Trailing stop (Option A) — lock in profit before it evaporates ──────────────

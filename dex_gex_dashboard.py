@@ -2293,6 +2293,31 @@ def compute_gex_analytics(raw_df: pd.DataFrame,
     impact_1pct   = abs(net_gex_total * 0.01)   # $ of delta to hedge per 1%
     impact_5pct   = abs(net_gex_total * 0.05)   # $ of delta to hedge per 5%
 
+    # ── Gamma flip (full chain) + flip-based regime ───────────────────────
+    # Standard-of-market definition: the regime is set by where SPOT sits
+    # relative to the gamma flip strike (the strike where per-strike net GEX
+    # changes sign), NOT by the raw sign of total net GEX. The raw-sum sign
+    # is unreliable for equity indices because put OI usually exceeds call OI,
+    # which biases the bare total toward negative regardless of spot position.
+    # Uses the same sign-change method as the 0DTE gex_flip.
+    gamma_flip = None
+    regime     = None
+    bs_sorted  = bs.sort_values('strike').reset_index(drop=True)
+    if 'net_gex' in bs_sorted.columns and len(bs_sorted) > 1:
+        sgn   = np.sign(bs_sorted['net_gex'].values)
+        flips = np.where(np.diff(sgn) != 0)[0]
+        if len(flips):
+            i = flips[0]
+            s1, g1 = float(bs_sorted['strike'].iloc[i]),   float(bs_sorted['net_gex'].iloc[i])
+            s2, g2 = float(bs_sorted['strike'].iloc[i+1]), float(bs_sorted['net_gex'].iloc[i+1])
+            gamma_flip = (s1 - g1 * (s2 - s1) / (g2 - g1)
+                          if g2 != g1 else (s1 + s2) / 2)
+    if gamma_flip is not None and spot:
+        regime = 'LONG γ' if spot >= gamma_flip else 'SHORT γ'
+    else:
+        # Fallback only when no flip can be located on the chain
+        regime = 'LONG γ' if net_gex_total >= 0 else 'SHORT γ'
+
     # ── Top 3 pinning candidates ──────────────────────────────────────────
     top3 = (bs.nlargest(3, 'net_gex', keep='all')['strike']
               .tolist() if len(bs) >= 3 else bs['strike'].tolist())
@@ -2306,6 +2331,8 @@ def compute_gex_analytics(raw_df: pd.DataFrame,
         'impact_5pct':    impact_5pct,
         'top3_strikes':   top3,
         'net_gex_total':  net_gex_total,
+        'gamma_flip':     gamma_flip,
+        'regime':         regime,
     }
 
 

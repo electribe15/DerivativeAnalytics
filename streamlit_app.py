@@ -205,12 +205,25 @@ def build_stat_metrics(raw_df, by_strike_df, spot):
     call_oi     = int(raw_df[raw_df["flag"] == "c"]["openInterest"].sum())
     put_oi      = int(raw_df[raw_df["flag"] == "p"]["openInterest"].sum())
     pcr         = put_oi / call_oi if call_oi else 0
-    regime      = "🟢 POSITIVE" if total_gex > 0 else "🔴 NEGATIVE"
+    # Flip-based regime (standard of market): set by spot vs the gamma flip
+    # strike, not by the raw sign of total GEX. Consistent with the 0DTE tab.
+    _ga = compute_gex_analytics(raw_df, by_strike_df, spot) or {}
+    _flip = _ga.get('gamma_flip')
+    _reg  = _ga.get('regime')
+    if _reg and 'LONG' in _reg:
+        regime, regime_pos = "🟢 LONG γ", True
+    elif _reg and 'SHORT' in _reg:
+        regime, regime_pos = "🔴 SHORT γ", False
+    else:
+        regime_pos = total_gex > 0
+        regime = "🟢 LONG γ" if regime_pos else "🔴 SHORT γ"
+    flip_str = f"${_flip:,.0f}" if _flip else "—"
     return {
         "Spot Price":      (f"${spot:.2f}",          ACCENT_YLW),
         "Total GEX":       (fmt_billions(total_gex),  ACCENT_GRN if total_gex > 0 else ACCENT_RED),
         "Total DEX":       (fmt_millions(total_dex),  ACCENT_BLU),
-        "GEX Regime (full chain)": (regime,           ACCENT_GRN if total_gex > 0 else ACCENT_RED),
+        "GEX Regime (full chain)": (regime,           ACCENT_GRN if regime_pos else ACCENT_RED),
+        "Gamma Flip":      (flip_str,                 ACCENT_YLW),
         "Peak GEX Strike": (str(peak_strike),         ACCENT_GRN),
         "Put/Call OI":     (f"{pcr:.2f}",             ACCENT_YLW),
         "Contracts":       (f"{len(raw_df):,}",       ACCENT_BLU),
@@ -1333,7 +1346,10 @@ with tab7:
             _spot = _dd.get("spot", 0)
             _ga = compute_gex_analytics(_dd.get("raw_full"), _dd.get("by_strike"), _spot) or {}
             _m0 = compute_0dte_metrics(_dd.get("raw_full"), _spot) or {}
-            _regime = 'LONG' if _ga.get('net_gex_total', 0) >= 0 else 'SHORT'
+            _regime_full = _ga.get('regime')
+            _regime = 'LONG' if (_regime_full and 'LONG' in _regime_full) else (
+                      'SHORT' if _regime_full else
+                      ('LONG' if _ga.get('net_gex_total', 0) >= 0 else 'SHORT'))
             _hhi = _ga.get('hhi', 0.0)
             _atm_iv = _m0.get('atm_iv')
             _vp = None

@@ -38,6 +38,6 @@ jobs:
         run: |
           git config user.name  "paper-engine-bot"
           git config user.email "actions@github.com"
-          git add paper_trades/ snapshots/ || true
+          git add paper_trades/ snapshots/ gex_history/ || true
           git diff --cached --quiet || git commit -m "paper-engine: $(date -u +%F)"
           git push || true

@@ -52,6 +52,14 @@ jobs:
                       print(f"VolDex saved: voldex={vx['voldex']} "
                             f"calldex={vx['calldex']} putdex={vx['putdex']} "
                             f"taildex={vx['taildex']}")
+
+                  # GEX/DEX derived-metrics history (Net GEX, flip, regime, HHI, P/C)
+                  try:
+                      bs = dg.aggregate_by_strike(raw)
+                      dg.save_gex_metrics_snapshot(raw, bs, spot)
+                      print('GEX metrics history updated')
+                  except Exception as ge:
+                      print(f'GEX metrics history failed: {ge}')
               else:
                   print('Chain fetch returned empty — no snapshot saved')
           except Exception as e:
@@ -63,6 +71,6 @@ jobs:
         run: |
           git config user.name  "snapshot-bot"
           git config user.email "actions@github.com"
-          git add snapshots/ voldex_history/ || true
+          git add snapshots/ voldex_history/ gex_history/ || true
           git diff --cached --quiet || git commit -m "snapshot: $(date -u +%F)"
           git push || true

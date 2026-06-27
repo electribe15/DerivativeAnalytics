@@ -513,9 +513,18 @@ st.markdown(
 stats = build_stat_metrics(raw_df, by_strike, spot)
 metric_cols = st.columns(len(stats))
 for col, (label, (value, _color)) in zip(metric_cols, stats.items()):
-    _help = (f"Somma su tutte le scadenze nel range selezionato (≤ {max_days}g). "
-             "Può differire dal 'Gamma Regime (0DTE)' in tab 0DTE, che misura "
-             "solo la scadenza odierna." if "GEX Regime" in label else None)
+    if "GEX Regime" in label:
+        _help = (f"Regime basato sulla posizione dello spot rispetto al gamma flip "
+                 f"(somma su scadenze ≤ {max_days}g). Se il GEX è negativo a tutti "
+                 "gli strike (mercato a senso unico), non esiste un flip e il regime "
+                 "segue il segno del GEX vicino allo spot. Può differire dal "
+                 "'Gamma Regime (0DTE)' della tab 0DTE.")
+    elif label == "Gamma Flip":
+        _help = ("Strike dove il GEX netto cambia segno (da SHORT sotto a LONG sopra). "
+                 "Mostra '—' quando non esiste un flip reale: il mercato è interamente "
+                 "in un solo regime (es. SHORT γ a tutti gli strike).")
+    else:
+        _help = None
     col.metric(label=label, value=value, help=_help)
 
 st.markdown("---")
@@ -1587,6 +1596,57 @@ with tab7:
         _pc[3].metric("Posizioni aperte", f"{_pm['n_open']}")
         st.caption("Obiettivo Fase 1: ≥ 20 trade chiusi, processo coerente. "
                    "Il profitto è secondario — conta validare che la logica funzioni in automatico.")
+
+        # ── SKIP analysis — is the selection logic too strict, and why? ───────
+        st.markdown("---")
+        st.markdown("**🔍 Analisi delle decisioni (perché entra o salta)**")
+        _sk = tl.skip_log_summary()
+        if _sk['total_days'] == 0:
+            st.caption("Ancora nessuna decisione registrata. Il motore automatico "
+                       "registra ogni giorno se ha fatto TRADE o SKIP e perché — "
+                       "questi dati servono a capire se i filtri aiutano o tagliano "
+                       "troppo. Si popolerà con i prossimi run automatici.")
+        else:
+            _sc = st.columns(3)
+            _sc[0].metric("Giorni valutati", f"{_sk['total_days']}")
+            _sc[1].metric("Trade", f"{_sk['n_trade']}",
+                          delta=f"{_sk['trade_rate']:.0f}% dei giorni")
+            _sc[2].metric("SKIP", f"{_sk['n_skip']}")
+            if _sk['skip_breakdown']:
+                st.caption("**Motivi dei SKIP** — se un motivo domina, è la leva su "
+                           "cui ragionare (es. troppi 'Conviction bassa' → soglia forse "
+                           "troppo alta; troppi 'IV troppo cara' → mercato sfavorevole, "
+                           "lo SKIP è corretto):")
+                _bd = pd.DataFrame(
+                    [{'Motivo': k, 'Giorni': v,
+                      '% sui SKIP': f"{v/_sk['n_skip']*100:.0f}%"}
+                     for k, v in sorted(_sk['skip_breakdown'].items(),
+                                        key=lambda x: -x[1])])
+                st.dataframe(_bd, use_container_width=True, hide_index=True)
+            _sklog = tl.load_skip_log()
+            if not _sklog.empty:
+                st.download_button("⬇ Esporta log decisioni",
+                                   _sklog.to_csv(index=False).encode(),
+                                   file_name="skip_log.csv", mime="text/csv",
+                                   key="dl_skiplog")
+
+        # ── Naive benchmark — does the smart system beat doing the dumb thing? ─
+        st.markdown("---")
+        st.markdown("**📏 Benchmark — il sistema batte la versione 'stupida'?**")
+        _bm = tl.compute_naive_benchmark(SNAPSHOT_DIR)
+        if not _bm.get('available'):
+            st.caption(f"⏳ {_bm.get('reason', 'Benchmark non ancora disponibile.')} "
+                       "Il confronto con una strategia long-vol naive (struttura fissa "
+                       "a cadenza regolare, senza segnali) è la verifica chiave: se il "
+                       "sistema sofisticato non batte quello stupido, i segnali "
+                       "VolDex/GEX non stanno aggiungendo valore.")
+        else:
+            st.caption(f"Serie snapshot pronta ({_bm['n_snapshots']} giorni, dal "
+                       f"{_bm['first']} al {_bm['last']}). {_bm['note']}")
+        st.info("💡 La domanda di validazione che conta non è *'ho guadagnato?'* ma "
+                "*'la mia logica di selezione aggiunge valore rispetto al caso e a una "
+                "strategia banale?'*. Per questo servono: abbastanza trade chiusi, il "
+                "log delle decisioni qui sopra, e il confronto con il benchmark.")
 
     except ImportError:
         st.error("Modulo trading_lite.py non trovato nella root del progetto.")

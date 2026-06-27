@@ -2294,28 +2294,59 @@ def compute_gex_analytics(raw_df: pd.DataFrame,
     impact_5pct   = abs(net_gex_total * 0.05)   # $ of delta to hedge per 5%
 
     # ── Gamma flip (full chain) + flip-based regime ───────────────────────
-    # Standard-of-market definition: the regime is set by where SPOT sits
-    # relative to the gamma flip strike (the strike where per-strike net GEX
-    # changes sign), NOT by the raw sign of total net GEX. The raw-sum sign
-    # is unreliable for equity indices because put OI usually exceeds call OI,
-    # which biases the bare total toward negative regardless of spot position.
-    # Uses the same sign-change method as the 0DTE gex_flip.
+    # The regime is set by where SPOT sits relative to the gamma flip, BUT a
+    # genuine flip only exists if net GEX is meaningfully positive on one side
+    # and negative on the other. In strong SHORT-gamma markets the per-strike
+    # GEX is negative at essentially every strike (no real flip) — in that
+    # case any "zero crossing" is spurious noise far from spot, so we must NOT
+    # invent a flip. We therefore decide the regime primarily from the sign of
+    # net GEX in the NEIGHBOURHOOD of spot (the strikes that actually matter
+    # for dealer hedging right now), and only report a gamma_flip when there
+    # is a real sign change near that neighbourhood.
     gamma_flip = None
     regime     = None
     bs_sorted  = bs.sort_values('strike').reset_index(drop=True)
-    if 'net_gex' in bs_sorted.columns and len(bs_sorted) > 1:
-        sgn   = np.sign(bs_sorted['net_gex'].values)
-        flips = np.where(np.diff(sgn) != 0)[0]
-        if len(flips):
-            i = flips[0]
-            s1, g1 = float(bs_sorted['strike'].iloc[i]),   float(bs_sorted['net_gex'].iloc[i])
-            s2, g2 = float(bs_sorted['strike'].iloc[i+1]), float(bs_sorted['net_gex'].iloc[i+1])
-            gamma_flip = (s1 - g1 * (s2 - s1) / (g2 - g1)
-                          if g2 != g1 else (s1 + s2) / 2)
+
+    near_gex_sign = None
+    if spot and 'net_gex' in bs_sorted.columns and not bs_sorted.empty:
+        # window: ±3% around spot (the operative zone)
+        band = bs_sorted[(bs_sorted['strike'] >= spot * 0.97) &
+                         (bs_sorted['strike'] <= spot * 1.03)]
+        if band.empty:
+            band = bs_sorted
+        near_sum = float(band['net_gex'].sum())
+        near_gex_sign = 1.0 if near_sum >= 0 else -1.0
+
+    # Look for a genuine flip: a sign change in per-strike net GEX where BOTH
+    # sides carry real magnitude (not isolated noise). Require the positive
+    # side to be a non-trivial fraction of total gross GEX.
+    if 'net_gex' in bs_sorted.columns and len(bs_sorted) > 1 and spot:
+        strikes = bs_sorted['strike'].to_numpy(dtype=float)
+        ng      = bs_sorted['net_gex'].to_numpy(dtype=float)
+        gross   = float(np.abs(ng).sum()) or 1.0
+        pos_frac = float(ng[ng > 0].sum()) / gross    # share that is positive
+        neg_frac = float(-ng[ng < 0].sum()) / gross   # share that is negative
+        # A real flip needs both sides to carry weight (≥15% each); otherwise
+        # the market is one-sided (pure LONG or pure SHORT gamma) and no flip.
+        if pos_frac >= 0.15 and neg_frac >= 0.15:
+            sgn = np.sign(ng)
+            cross_idx = np.where(np.diff(sgn) != 0)[0]
+            crossings = []
+            for i in cross_idx:
+                if ng[i+1] != ng[i]:
+                    x = strikes[i] - ng[i] * (strikes[i+1] - strikes[i]) / (ng[i+1] - ng[i])
+                else:
+                    x = (strikes[i] + strikes[i+1]) / 2
+                crossings.append(x)
+            if crossings:
+                gamma_flip = min(crossings, key=lambda x: abs(x - spot))
+
     if gamma_flip is not None and spot:
         regime = 'LONG γ' if spot >= gamma_flip else 'SHORT γ'
+    elif near_gex_sign is not None:
+        # No genuine flip → one-sided market → regime = sign of near-spot GEX
+        regime = 'LONG γ' if near_gex_sign > 0 else 'SHORT γ'
     else:
-        # Fallback only when no flip can be located on the chain
         regime = 'LONG γ' if net_gex_total >= 0 else 'SHORT γ'
 
     # ── Top 3 pinning candidates ──────────────────────────────────────────

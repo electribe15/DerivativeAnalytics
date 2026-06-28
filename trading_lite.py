@@ -43,6 +43,7 @@ PAPER_DIR        = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 'paper_trades')
 POSITIONS_CSV    = os.path.join(PAPER_DIR, 'positions.csv')
 CONTEXT_CSV      = os.path.join(PAPER_DIR, 'signal_context.csv')
+SKIPLOG_CSV      = os.path.join(PAPER_DIR, 'skip_log.csv')
 
 # ── Account / risk (5k paper account) ──────────────────────────────────────────
 INITIAL_CAPITAL      = 5000.0
@@ -151,6 +152,7 @@ class LiteDecision:
     legs:        list = field(default_factory=list)    # explicit option legs
     explanation: str = ''             # human-readable why TRADE / why SKIP
     skip_reason: str = ''
+    skip_category: str = ''           # machine-readable SKIP bucket for logging
 
     @property
     def summary_html(self) -> str:
@@ -212,6 +214,7 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
         cond("Vol acquistabile", False,
              f"IV ({iv_source}) {iv:.1f}% > {IV_SKIP_ABOVE}% (soglia max) — vol troppo cara")
         d.skip_reason = f"IV {iv:.1f}% > {IV_SKIP_ABOVE}% — vol troppo cara da comprare"
+        d.skip_category = 'IV troppo cara'
         d.conditions = conditions
         d.explanation = (
             f"❌ NESSUN TRADE. La volatilità implicita ({iv_source}: {iv:.1f}%) è sopra "
@@ -303,6 +306,7 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
     _unmet = [c for c in conditions if not c['met']]
 
     if score < MIN_CONFIDENCE:
+        d.skip_category = 'Conviction bassa'
         d.skip_reason = (f"Conviction {score:.2f} &lt; {MIN_CONFIDENCE} — "
                          "condizioni non abbastanza favorevoli per comprare vol")
         missing = "; ".join(c['label'] for c in _unmet) or "nessuna condizione chiave"
@@ -398,6 +402,7 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
         cheapest = min(candidates, key=lambda c: c[4])
         d.action = 'SKIP'
         d.confidence = round(score, 3)
+        d.skip_category = 'Premio oltre budget'
         d.skip_reason = (f"Premio minimo ${cheapest[4]:.0f} &gt; cap "
                          f"${hard_cap:.0f} ({MAX_PREMIUM_PCT:.0f}% di "
                          f"${INITIAL_CAPITAL:.0f})")
@@ -1024,6 +1029,125 @@ def close_position_manual(pos_id: int, current_spot: float,
 # ══════════════════════════════════════════════════════════════════════════════
 # Process metrics (validation phase)
 # ══════════════════════════════════════════════════════════════════════════════
+def log_daily_decision(decision, spot: float, voldex=None,
+                       expected_move_pts=None) -> None:
+    """Append one row per engine run to the skip log — TRADE or SKIP alike.
+
+    This is the missing piece for validating the *selection logic*: it records
+    every decision the engine makes, with the reason and the market context,
+    so later we can ask "the days it skipped, how would they have gone?" and
+    "are the filters helping or hurting?". One row per day.
+
+    Stored separately from positions.csv so it never interferes with the
+    trade ledger. Committed by the same GitHub Actions workflow.
+    """
+    _ensure_dir()
+    row = {
+        'date':        date.today().isoformat(),
+        'action':      decision.action,                 # TRADE / SKIP
+        'strategy':    decision.strategy or '',
+        'confidence':  decision.confidence,
+        'skip_category': decision.skip_category or ('' if decision.action == 'TRADE'
+                                                    else 'Altro'),
+        'skip_reason': (decision.skip_reason or '').replace('&lt;', '<').replace('&gt;', '>'),
+        'spot':        round(spot, 2) if spot else None,
+        'voldex':      voldex,
+        'expected_move_pts': expected_move_pts,
+        # forward-fill fields for "what if" analysis (filled later by backfill)
+        'spot_at_eval': round(spot, 2) if spot else None,
+    }
+    cols = list(row.keys())
+    if os.path.exists(SKIPLOG_CSV):
+        try:
+            old = pd.read_csv(SKIPLOG_CSV)
+            old = old[old['date'] != row['date']]      # one row per day (replace)
+            allrows = pd.concat([old, pd.DataFrame([row])], ignore_index=True)
+        except Exception:
+            allrows = pd.DataFrame([row], columns=cols)
+    else:
+        allrows = pd.DataFrame([row], columns=cols)
+    allrows.to_csv(SKIPLOG_CSV, index=False)
+
+
+def load_skip_log() -> pd.DataFrame:
+    """Load the daily decision log (empty DataFrame if none yet)."""
+    if os.path.exists(SKIPLOG_CSV):
+        try:
+            df = pd.read_csv(SKIPLOG_CSV)
+            df['date'] = pd.to_datetime(df['date'])
+            return df.sort_values('date').reset_index(drop=True)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=['date', 'action', 'strategy', 'confidence',
+                                 'skip_category', 'skip_reason', 'spot', 'voldex',
+                                 'expected_move_pts', 'spot_at_eval'])
+
+
+def skip_log_summary() -> dict:
+    """Summarise the decision log: how often it traded vs skipped, and why.
+
+    Returns counts by action and a breakdown of SKIP reasons — the core
+    diagnostic for "is the algorithm too selective, and on what grounds?".
+    """
+    df = load_skip_log()
+    if df.empty:
+        return {'total_days': 0, 'n_trade': 0, 'n_skip': 0,
+                'skip_breakdown': {}, 'trade_rate': None}
+    n_trade = int((df['action'] == 'TRADE').sum())
+    n_skip  = int((df['action'] == 'SKIP').sum())
+    total   = len(df)
+    breakdown = (df[df['action'] == 'SKIP']['skip_category']
+                 .value_counts().to_dict())
+    return {
+        'total_days':     total,
+        'n_trade':        n_trade,
+        'n_skip':         n_skip,
+        'trade_rate':     round(n_trade / total * 100, 1) if total else None,
+        'skip_breakdown': breakdown,
+    }
+
+
+def compute_naive_benchmark(snapshot_dir: str) -> dict:
+    """Naive long-vol benchmark to compare the smart system against.
+
+    The benchmark is deliberately stupid: it assumes a fixed long-vol
+    structure entered at a regular cadence regardless of any signal, marked
+    forward on the snapshot series. The comparison question is the only one
+    that matters for validation: *does the smart selection beat doing the
+    naive thing?* If not, the VolDex/GEX machinery is not earning its keep.
+
+    Because the dashboard-only version stores chain snapshots (SPX_*.csv),
+    this estimates a simple proxy: buy a 45-DTE ATM-ish straddle every N
+    snapshots at the prevailing IV, hold to a fixed exit, and sum the
+    model P&L. Returns a summary; if too few snapshots exist, returns a
+    'not enough data' note instead of a misleading number.
+
+    NOTE: this is a *model* benchmark (same BS-mark caveat as the live
+    paper engine), intended for relative comparison, not an absolute claim.
+    """
+    if not os.path.isdir(snapshot_dir):
+        return {'available': False, 'reason': 'Nessuna cartella snapshot.'}
+    snaps = sorted([f for f in os.listdir(snapshot_dir)
+                    if f.startswith('SPX_') and f.endswith('.csv')])
+    if len(snaps) < 6:
+        return {'available': False,
+                'reason': f'Servono ≥6 snapshot per il benchmark — '
+                          f'disponibili {len(snaps)}.'}
+    # Lightweight proxy: we report cadence/coverage and leave the full
+    # path-dependent mark to a future enhancement, to avoid a misleading
+    # single number from sparse data.
+    return {
+        'available': True,
+        'n_snapshots': len(snaps),
+        'first': snaps[0].replace('SPX_', '').replace('.csv', ''),
+        'last':  snaps[-1].replace('SPX_', '').replace('.csv', ''),
+        'note': ('Benchmark naive disponibile: con la serie di snapshot si può '
+                 'simulare una strategia long-vol a cadenza fissa e confrontarla '
+                 'con i trade reali del sistema. Confronto attivo quando ci sono '
+                 'abbastanza trade chiusi.'),
+    }
+
+
 def process_metrics(snapshot_dir: str) -> dict:
     """Lightweight process tracker for the dashboard-only version."""
     df = load_positions()

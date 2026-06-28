@@ -1558,9 +1558,21 @@ with tab7:
                           f"TailDex {_taildex_p:.1f}%"
                           + (f" · Skew trend {_skewtr_p:+.2f}pt" if _skewtr_p is not None else ""))
             st.markdown("---")
-            st.markdown("**🔍 Anteprima segnale corrente** "
-                        "<span style='font-size:11px;color:#9CA3AF;'>(indicativa — "
-                        "il motore decide alla chiusura)</span>", unsafe_allow_html=True)
+            _preview_banner = (
+                '<div style="background:#EFF6FF;border:1px solid #BFDBFE;'
+                'border-left:4px solid #3B82F6;border-radius:10px;padding:12px 16px;'
+                'margin-bottom:14px;">'
+                '<div style="color:#1D4ED8;font-size:12px;font-weight:700;'
+                'text-transform:uppercase;letter-spacing:0.7px;margin-bottom:3px;">'
+                '&#128269; Anteprima segnale &mdash; NON ancora eseguito</div>'
+                '<div style="color:#3B82F6;font-size:11.5px;line-height:1.4;">'
+                'Questa &egrave; una simulazione di cosa farebbe il sistema con i dati '
+                'attuali. <b>Non &egrave; una posizione aperta.</b> Le posizioni reali '
+                'le apre solo il motore automatico dopo la chiusura USA, e compaiono '
+                'nelle card "Posizioni" e nello "Storico" qui sotto.</div>'
+                '</div>'
+            )
+            st.markdown(_preview_banner, unsafe_allow_html=True)
             cards([
                 {'label': 'Regime GEX', 'value': _regime},
                 {'label': 'HHI', 'value': f"{_hhi:.4f}"},
@@ -1573,8 +1585,9 @@ with tab7:
 
             # Explicit option legs (what would be bought/sold)
             if _dec.action == 'TRADE' and _dec.legs:
-                st.markdown("<span style='font-size:12px;'><b>Gambe dell'operazione "
-                            "(XSP):</b></span>", unsafe_allow_html=True)
+                st.markdown("<span style='font-size:12px;color:#3B82F6;'>"
+                            "<b>Gambe che il sistema aprirebbe (XSP) &mdash; ipotetiche:"
+                            "</b></span>", unsafe_allow_html=True)
                 _legrows = [{
                     'Lato': l['side'], 'Tipo': l['type'],
                     'Strike': f"{l['strike']:.0f}",

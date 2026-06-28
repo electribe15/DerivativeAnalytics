@@ -563,19 +563,17 @@ def _render_metric_cards(items, per_row=4):
             _hlp = _metric_help(label)
             _title_attr = f' title="{_hlp}"' if _hlp else ''
             _help_mark = ' &#9432;' if _hlp else ''
-            _col.markdown(
-                f"""<div style="background:#FFFFFF;border:1px solid #E5E7EB;
-                    border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,0.06),
-                    0 4px 12px rgba(0,0,0,0.04);padding:14px 16px;
-                    min-height:78px;margin-bottom:12px;"{_title_attr}>
-                  <div style="color:#9CA3AF;font-size:10.5px;font-weight:600;
-                       text-transform:uppercase;letter-spacing:0.6px;
-                       margin-bottom:6px;line-height:1.25;">{label}{_help_mark}</div>
-                  <div style="color:#111827;font-size:19px;font-weight:700;
-                       line-height:1.2;word-break:break-word;
-                       font-family:'Inter',sans-serif;">{value}</div>
-                </div>""",
-                unsafe_allow_html=True)
+            _html = (
+                f'<div style="background:#FFFFFF;border:1px solid #E5E7EB;'
+                f'border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,0.06),0 4px 12px rgba(0,0,0,0.04);'
+                f'padding:14px 16px;min-height:78px;margin-bottom:12px;"{_title_attr}>'
+                f'<div style="color:#9CA3AF;font-size:10.5px;font-weight:600;text-transform:uppercase;'
+                f'letter-spacing:0.6px;margin-bottom:6px;line-height:1.25;">{label}{_help_mark}</div>'
+                f'<div style="color:#111827;font-size:19px;font-weight:700;line-height:1.2;'
+                f'word-break:break-word;font-family:\'Inter\',sans-serif;">{value}</div>'
+                f'</div>'
+            )
+            _col.markdown(_html, unsafe_allow_html=True)
 
 
 def cards(specs, per_row=5):
@@ -596,23 +594,19 @@ def cards(specs, per_row=5):
             hlp   = _s.get('help')
             _title_attr = f' title="{hlp}"' if hlp else ''
             _mark = ' &#9432;' if hlp else ''
-            _delta_html = (f"<div style='color:{dcol};font-size:11px;"
-                           f"font-weight:600;margin-top:4px;'>{delta}</div>"
+            _delta_html = (f"<div style='color:{dcol};font-size:11px;font-weight:600;margin-top:4px;'>{delta}</div>"
                            if delta else "")
-            _col.markdown(
-                f"""<div style="background:#FFFFFF;border:1px solid #E5E7EB;
-                    border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,0.06),
-                    0 4px 12px rgba(0,0,0,0.04);padding:14px 16px;
-                    min-height:78px;margin-bottom:12px;"{_title_attr}>
-                  <div style="color:#9CA3AF;font-size:10.5px;font-weight:600;
-                       text-transform:uppercase;letter-spacing:0.6px;
-                       margin-bottom:6px;line-height:1.25;">{label}{_mark}</div>
-                  <div style="color:#111827;font-size:19px;font-weight:700;
-                       line-height:1.2;word-break:break-word;
-                       font-family:'Inter',sans-serif;">{value}</div>
-                  {_delta_html}
-                </div>""",
-                unsafe_allow_html=True)
+            _html = (
+                f'<div style="background:#FFFFFF;border:1px solid #E5E7EB;'
+                f'border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,0.06),0 4px 12px rgba(0,0,0,0.04);'
+                f'padding:14px 16px;min-height:78px;margin-bottom:12px;"{_title_attr}>'
+                f'<div style="color:#9CA3AF;font-size:10.5px;font-weight:600;text-transform:uppercase;'
+                f'letter-spacing:0.6px;margin-bottom:6px;line-height:1.25;">{label}{_mark}</div>'
+                f'<div style="color:#111827;font-size:19px;font-weight:700;line-height:1.2;'
+                f'word-break:break-word;font-family:\'Inter\',sans-serif;">{value}</div>'
+                f'{_delta_html}</div>'
+            )
+            _col.markdown(_html, unsafe_allow_html=True)
 
 _render_metric_cards(list(stats.items()), per_row=4)
 

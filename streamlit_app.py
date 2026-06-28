@@ -577,6 +577,43 @@ def _render_metric_cards(items, per_row=4):
                 </div>""",
                 unsafe_allow_html=True)
 
+
+def cards(specs, per_row=5):
+    """Render a list of metric cards from dicts with keys:
+       label (str), value (str), delta (str, optional), delta_color
+       ('green'|'red'|'grey', optional), help (str, optional).
+    Values and titles wrap fully — never truncated. Use everywhere instead
+    of st.metric so all tabs render consistently on landscape and portrait."""
+    _dc = {'green': '#10B981', 'red': '#EF4444', 'grey': '#9CA3AF'}
+    for _i in range(0, len(specs), per_row):
+        _chunk = specs[_i:_i + per_row]
+        _cols = st.columns(len(_chunk))
+        for _col, _s in zip(_cols, _chunk):
+            label = _s.get('label', '')
+            value = _s.get('value', '—')
+            delta = _s.get('delta')
+            dcol  = _dc.get(_s.get('delta_color', 'grey'), '#9CA3AF')
+            hlp   = _s.get('help')
+            _title_attr = f' title="{hlp}"' if hlp else ''
+            _mark = ' &#9432;' if hlp else ''
+            _delta_html = (f"<div style='color:{dcol};font-size:11px;"
+                           f"font-weight:600;margin-top:4px;'>{delta}</div>"
+                           if delta else "")
+            _col.markdown(
+                f"""<div style="background:#FFFFFF;border:1px solid #E5E7EB;
+                    border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,0.06),
+                    0 4px 12px rgba(0,0,0,0.04);padding:14px 16px;
+                    min-height:78px;margin-bottom:12px;"{_title_attr}>
+                  <div style="color:#9CA3AF;font-size:10.5px;font-weight:600;
+                       text-transform:uppercase;letter-spacing:0.6px;
+                       margin-bottom:6px;line-height:1.25;">{label}{_mark}</div>
+                  <div style="color:#111827;font-size:19px;font-weight:700;
+                       line-height:1.2;word-break:break-word;
+                       font-family:'Inter',sans-serif;">{value}</div>
+                  {_delta_html}
+                </div>""",
+                unsafe_allow_html=True)
+
 _render_metric_cards(list(stats.items()), per_row=4)
 
 st.markdown("---")
@@ -669,47 +706,43 @@ with tab0:
     else:
         m = dte0_metrics
         # ── Metric cards — row 1 ──────────────────────────────────────────
-        mc = st.columns(6)
-        mc[0].metric("0DTE ATM IV",
-                     f"{m['atm_iv']*100:.1f}%" if m['atm_iv'] else "—")
-        mc[1].metric("Expected Move",
-                     f"±{m['exp_move_pts']:.1f} pts  ({m['exp_move_pct']:.2f}%)"
-                     if m['exp_move_pts'] else "—")
-        mc[2].metric("GEX Flip",
-                     f"${m['gex_flip']:.0f}" if m['gex_flip'] else "—")
-        mc[3].metric("Max Gamma Strike",
-                     f"${m['max_gex_strike']:.0f}" if m['max_gex_strike'] else "—")
-        mc[4].metric("Max Pain",
-                     f"${m['max_pain']:.0f}" if m.get('max_pain') else "—",
-                     help="Strike che minimizza il payout totale agli option buyer — livello di pinning atteso a scadenza")
-        mc[5].metric("Total 0DTE GEX",
-                     f"{'+'if m['total_gex']>=0 else ''}{m['total_gex']/1e9:.2f}B")
-
-        # ── Metric cards — row 2 ──────────────────────────────────────────
-        mc2 = st.columns(5)
         pc = m.get('pc_ratio')
-        pc_delta = f"{pc:.2f}" if pc else None
-        mc2[0].metric("P/C OI Ratio",
-                      f"{pc:.2f}" if pc else "—",
-                      delta=("↑ Lean PUT" if pc and pc > 1.2 else ("↓ Lean CALL" if pc and pc < 0.8 else "Neutro")) if pc else None,
-                      help="Put OI / Call OI. >1 = lean ribassista; <1 = lean rialzista")
-
         charm_daily = (m['charm_exp'] / 252 / 1e6) if m.get('charm_exp') else None
-        mc2[1].metric("Charm Exp (daily Δ)",
-                      f"${charm_daily:+.1f}M/day" if charm_daily else "—",
-                      help="Delta drift giornaliero dal solo passare del tempo (charm × OI × 100 × Spot / 252). Il dealer deve hedgiare questo delta ogni giorno anche senza movimenti di prezzo.")
-
         vanna_m = (m['vanna_exp'] / 1e6) if m.get('vanna_exp') else None
-        mc2[2].metric("Vanna Exp (per 1pt vol)",
-                      f"${vanna_m:+.1f}M" if vanna_m else "—",
-                      help="Variazione del delta-hedge quando la vol implicita si muove di 1 punto. Negativo = dealer deve comprare when vol spike (amplifica sell-off).")
-
         gross = (m['gross_gex'] / 1e9) if m.get('gross_gex') else None
-        mc2[3].metric("Gross GEX 0DTE",
-                      f"${gross:.2f}B" if gross else "—",
-                      help="GEX lordo (|call_gex| + |put_gex|) senza netting. Misura l'intensità totale del gamma hedging indipendentemente dal segno.")
-        mc2[4].metric("0DTE Contracts",
-                      f"{m['n_contracts']:,}")
+        cards([
+            {'label': '0DTE ATM IV',
+             'value': f"{m['atm_iv']*100:.1f}%" if m['atm_iv'] else "—"},
+            {'label': 'Expected Move',
+             'value': (f"±{m['exp_move_pts']:.1f} pts ({m['exp_move_pct']:.2f}%)"
+                       if m['exp_move_pts'] else "—")},
+            {'label': 'GEX Flip',
+             'value': f"${m['gex_flip']:.0f}" if m['gex_flip'] else "—"},
+            {'label': 'Max Gamma Strike',
+             'value': f"${m['max_gex_strike']:.0f}" if m['max_gex_strike'] else "—"},
+            {'label': 'Max Pain',
+             'value': f"${m['max_pain']:.0f}" if m.get('max_pain') else "—",
+             'help': 'Strike che minimizza il payout totale agli option buyer — pinning atteso a scadenza'},
+            {'label': 'Total 0DTE GEX',
+             'value': f"{'+'if m['total_gex']>=0 else ''}{m['total_gex']/1e9:.2f}B"},
+        ], per_row=6)
+        # ── Metric cards — row 2 ──────────────────────────────────────────
+        cards([
+            {'label': 'P/C OI Ratio', 'value': f"{pc:.2f}" if pc else "—",
+             'delta': (("↑ Lean PUT" if pc > 1.2 else ("↓ Lean CALL" if pc < 0.8 else "Neutro")) if pc else None),
+             'delta_color': ('red' if pc and pc > 1.2 else ('green' if pc and pc < 0.8 else 'grey')),
+             'help': 'Put OI / Call OI. >1 = lean ribassista; <1 = lean rialzista'},
+            {'label': 'Charm Exp (daily Δ)',
+             'value': f"${charm_daily:+.1f}M/day" if charm_daily else "—",
+             'help': 'Delta drift giornaliero dal solo passare del tempo (charm × OI × 100 × Spot / 252).'},
+            {'label': 'Vanna Exp (per 1pt vol)',
+             'value': f"${vanna_m:+.1f}M" if vanna_m else "—",
+             'help': 'Variazione del delta-hedge quando la vol implicita si muove di 1 punto. Negativo = dealer compra quando la vol sale.'},
+            {'label': 'Gross GEX 0DTE',
+             'value': f"${gross:.2f}B" if gross else "—",
+             'help': 'GEX lordo (|call_gex| + |put_gex|) senza netting. Intensità totale del gamma hedging.'},
+            {'label': '0DTE Contracts', 'value': f"{m['n_contracts']:,}"},
+        ], per_row=5)
 
         st.markdown("---")
 
@@ -1195,7 +1228,6 @@ with tab6:
             ).dropna()
 
         # ── Metric cards ──────────────────────────────────────────────────
-        mc = st.columns(6)
         last_yz  = float(rvol_df['Yang-Zhang'].iloc[-1])    if not rvol_df.empty and 'Yang-Zhang'    in rvol_df.columns else None
         last_yz21= float(rvol_df['Yang-Zhang 21d'].iloc[-1]) if not rvol_df.empty and 'Yang-Zhang 21d' in rvol_df.columns else None
         last_ewma= float(rvol_df['EWMA λ=0.94'].iloc[-1])   if not rvol_df.empty and 'EWMA λ=0.94'   in rvol_df.columns else None
@@ -1204,47 +1236,41 @@ with tab6:
         vol_premium     = (last_vix - last_yz)   if (last_vix and last_yz)   else None
         vol_premium_ewma= (last_vix - last_ewma) if (last_vix and last_ewma) else None
 
-        mc[0].metric("Intraday RVol",
-                     f"{intra_rv*100:.1f}%" if intra_rv else "—",
-                     help="RVol annualizzata sessione corrente (barre 5-min)")
-        mc[1].metric("EWMA λ=0.94  ★ più reattivo",
-                     f"{last_ewma:.1f}%" if last_ewma else "—",
-                     delta=(f"vs VIX {vol_premium_ewma:+.1f}%" if vol_premium_ewma else None),
-                     help="RiskMetrics EWMA: half-life ~11 giorni. "
-                          "Il più reattivo agli spike — segue il VIX entro 1-3 giorni")
-        mc[2].metric("Yang-Zhang 21d  (≈ VIX window)",
-                     f"{last_yz21:.1f}%" if last_yz21 else "—",
-                     help="Finestra 21 giorni (1 mese di trading) — confronto più corretto con il VIX 30d")
-        mc[3].metric("Yang-Zhang 126d",
-                     f"{last_yz:.1f}%" if last_yz else "—",
-                     help="Finestra 6 mesi — stima lenta, utile come livello strutturale")
-        mc[4].metric("VIX",
-                     f"{last_vix:.1f}%" if last_vix else "—")
-        mc[5].metric("Vol Premium  (VIX−EWMA)",
-                     (f"+{vol_premium_ewma:.1f}%" if vol_premium_ewma > 0
-                      else f"{vol_premium_ewma:.1f}%") if vol_premium_ewma is not None else "—",
-                     delta=f"{vol_premium_ewma:.1f}%" if vol_premium_ewma else None,
-                     help="VIX vs EWMA: il confronto più reattivo e corretto per "
-                          "valutare se il mercato sta pagando premium o discount sulla vol")
+        cards([
+            {'label': 'Intraday RVol', 'value': f"{intra_rv*100:.1f}%" if intra_rv else "—",
+             'help': 'RVol annualizzata sessione corrente (barre 5-min)'},
+            {'label': 'EWMA λ=0.94 ★ più reattivo', 'value': f"{last_ewma:.1f}%" if last_ewma else "—",
+             'delta': (f"vs VIX {vol_premium_ewma:+.1f}%" if vol_premium_ewma else None),
+             'delta_color': ('red' if vol_premium_ewma and vol_premium_ewma > 0 else 'green'),
+             'help': 'RiskMetrics EWMA: half-life ~11 giorni. Il più reattivo agli spike.'},
+            {'label': 'Yang-Zhang 21d (≈ VIX window)', 'value': f"{last_yz21:.1f}%" if last_yz21 else "—",
+             'help': 'Finestra 21 giorni — confronto più corretto con il VIX 30d'},
+            {'label': 'Yang-Zhang 126d', 'value': f"{last_yz:.1f}%" if last_yz else "—",
+             'help': 'Finestra 6 mesi — stima lenta, livello strutturale'},
+            {'label': 'VIX', 'value': f"{last_vix:.1f}%" if last_vix else "—"},
+            {'label': 'Vol Premium (VIX−EWMA)',
+             'value': ((f"+{vol_premium_ewma:.1f}%" if vol_premium_ewma > 0 else f"{vol_premium_ewma:.1f}%")
+                       if vol_premium_ewma is not None else "—"),
+             'delta': f"{vol_premium_ewma:.1f}%" if vol_premium_ewma else None,
+             'delta_color': ('green' if vol_premium_ewma and vol_premium_ewma > 0 else 'red'),
+             'help': 'VIX vs EWMA: valuta se il mercato paga premium o discount sulla vol'},
+        ], per_row=6)
 
         st.markdown("---")
 
         # Row 2: HAR forecast + regime + YZ-5d
-        mc2 = st.columns(3)
-        mc2[0].metric("HAR-RV Forecast (1d)",
-                      f"{har_forecast:.1f}%" if har_forecast else "—",
-                      help=(f"HAR-RV Corsi 2009. "
-                            + (f"68% CI [{har_result.get('ci_68_lo',0):.1f}–"
-                               f"{har_result.get('ci_68_hi',0):.1f}%]  R²={har_r2:.2f}"
-                               if har_r2 else "")),
-                      delta=(f"vs EWMA {(har_forecast-last_ewma):+.1f}%"
-                             if har_forecast and last_ewma else None))
-        mc2[1].metric(f"{regime_icon} Vol Regime",
-                      vol_regime, delta=f"z = {vol_z:+.2f}",
-                      help="Z-score rolling 1Y RVol YZ-126d. |z|>1.5 = HIGH/LOW")
-        mc2[2].metric("Yang-Zhang 5d",
-                      f"{last_yz5:.1f}%" if last_yz5 else "—",
-                      help="Finestra 5 giorni — vol settimanale corrente")
+        cards([
+            {'label': 'HAR-RV Forecast (1d)', 'value': f"{har_forecast:.1f}%" if har_forecast else "—",
+             'delta': (f"vs EWMA {(har_forecast-last_ewma):+.1f}%" if har_forecast and last_ewma else None),
+             'delta_color': 'grey',
+             'help': ('HAR-RV Corsi 2009. ' + (f"68% CI [{har_result.get('ci_68_lo',0):.1f}–"
+                      f"{har_result.get('ci_68_hi',0):.1f}%] R²={har_r2:.2f}" if har_r2 else ""))},
+            {'label': f"{regime_icon} Vol Regime", 'value': vol_regime,
+             'delta': f"z = {vol_z:+.2f}", 'delta_color': 'grey',
+             'help': 'Z-score rolling 1Y RVol YZ-126d. |z|>1.5 = HIGH/LOW'},
+            {'label': 'Yang-Zhang 5d', 'value': f"{last_yz5:.1f}%" if last_yz5 else "—",
+             'help': 'Finestra 5 giorni — vol settimanale corrente'},
+        ], per_row=3)
 
         st.markdown("---")
 
@@ -1272,11 +1298,12 @@ with tab6:
                 st.markdown("**HAR-RV Out-of-Sample (60/40 split)**")
                 har_bt = backtest_har_oos(ohlc_spx)
                 if har_bt:
-                    bmc = st.columns(4)
-                    bmc[0].metric("RMSE (oos)", f"{har_bt['rmse']:.2f}%")
-                    bmc[1].metric("MAE (oos)",  f"{har_bt['mae']:.2f}%")
-                    bmc[2].metric("Dir. Acc.",  f"{har_bt['dir_acc']*100:.1f}%")
-                    bmc[3].metric("R² oos",     f"{har_bt['r2_oos']:.3f}")
+                    cards([
+                        {'label': 'RMSE (oos)', 'value': f"{har_bt['rmse']:.2f}%"},
+                        {'label': 'MAE (oos)',  'value': f"{har_bt['mae']:.2f}%"},
+                        {'label': 'Dir. Acc.',  'value': f"{har_bt['dir_acc']*100:.1f}%"},
+                        {'label': 'R² oos',     'value': f"{har_bt['r2_oos']:.3f}"},
+                    ], per_row=4)
                     beat = "✅ batte" if har_bt['vs_mean'] else "❌ non batte"
                     st.caption(f"N oos = {har_bt['n_oos']} sessioni  ·  "
                                f"Benchmark RMSE (mean): {har_bt['bench_rmse']:.2f}%  ·  "
@@ -1430,18 +1457,21 @@ with tab7:
         _cap_color = ('#10B981' if _cs['is_safe'] and not _cs['danger_zone']
                       else '#F59E0B' if _cs['is_safe'] else '#EF4444')
         _total_equity = _cs['account_value'] + _unreal['total_unrealized']
-        _cc = st.columns(5)
-        _cc[0].metric("Capitale paper", f"${_cs['account_value']:,.0f}",
-                      help="5.000 $ iniziali + P&L realizzato dei trade chiusi")
-        _cc[1].metric("P&L realizzato", f"${_cs['cumulative_pnl']:+,.0f}",
-                      help="Somma dei trade chiusi")
-        _cc[2].metric("P&L latente (aperte)",
-                      f"${_unreal['total_unrealized']:+,.0f}" if _has_data else "—",
-                      help="Valore attuale delle posizioni aperte (richiede chain caricata)")
-        _cc[3].metric("Equity totale",
-                      f"${_total_equity:,.0f}" if _has_data else f"${_cs['account_value']:,.0f}",
-                      help="Capitale + P&L latente")
-        _cc[4].metric("Posizioni", f"{_cs['n_open']} aperte / {_cs['n_closed']} chiuse")
+        cards([
+            {'label': 'Capitale paper', 'value': f"${_cs['account_value']:,.0f}",
+             'help': '5.000 $ iniziali + P&L realizzato dei trade chiusi'},
+            {'label': 'P&L realizzato', 'value': f"${_cs['cumulative_pnl']:+,.0f}",
+             'delta_color': ('green' if _cs['cumulative_pnl'] >= 0 else 'red'),
+             'help': 'Somma dei trade chiusi'},
+            {'label': 'P&L latente (aperte)',
+             'value': f"${_unreal['total_unrealized']:+,.0f}" if _has_data else "—",
+             'delta_color': ('green' if _has_data and _unreal['total_unrealized'] >= 0 else 'red'),
+             'help': 'Valore attuale delle posizioni aperte (richiede chain caricata)'},
+            {'label': 'Equity totale',
+             'value': f"${_total_equity:,.0f}" if _has_data else f"${_cs['account_value']:,.0f}",
+             'help': 'Capitale + P&L latente'},
+            {'label': 'Posizioni', 'value': f"{_cs['n_open']} aperte / {_cs['n_closed']} chiuse"},
+        ], per_row=5)
 
         if not _cs['is_safe']:
             st.error(f"🚨 Hard stop: drawdown {_cs['drawdown_pct']:.0f}% ha superato il 50%.")
@@ -1537,13 +1567,14 @@ with tab7:
             st.markdown("**🔍 Anteprima segnale corrente** "
                         "<span style='font-size:11px;color:#9CA3AF;'>(indicativa — "
                         "il motore decide alla chiusura)</span>", unsafe_allow_html=True)
-            _sc = st.columns(4)
-            _sc[0].metric("Regime GEX", _regime)
-            _sc[1].metric("HHI", f"{_hhi:.4f}")
-            _sc[2].metric("Vol Premium", f"{_vp:+.1f}%" if _vp is not None else "—")
-            _sc[3].metric("ATM IV",
-                          f"{(_atm_iv*100 if _atm_iv and _atm_iv<1 else _atm_iv):.1f}%"
-                          if _atm_iv else "—")
+            cards([
+                {'label': 'Regime GEX', 'value': _regime},
+                {'label': 'HHI', 'value': f"{_hhi:.4f}"},
+                {'label': 'Vol Premium', 'value': f"{_vp:+.1f}%" if _vp is not None else "—"},
+                {'label': 'ATM IV',
+                 'value': (f"{(_atm_iv*100 if _atm_iv and _atm_iv<1 else _atm_iv):.1f}%"
+                           if _atm_iv else "—")},
+            ], per_row=4)
             st.markdown(_dec.summary_html, unsafe_allow_html=True)
 
             # Explicit option legs (what would be bought/sold)
@@ -1718,13 +1749,14 @@ with tab7:
         st.markdown("---")
         st.markdown("**📊 Metriche di processo (fase di validazione)**")
         _pm = tl.process_metrics(SNAPSHOT_DIR)
-        _pc = st.columns(4)
-        _pc[0].metric("Snapshot raccolti", f"{_pm['snapshots']}")
-        _pc[1].metric("Trade chiusi", f"{_pm['n_closed']}/{_pm['sample_target']}",
-                      delta=f"{_pm['sample_pct']:.0f}%")
-        _pc[2].metric("Win rate",
-                      f"{_pm['win_rate']*100:.0f}%" if _pm['win_rate'] is not None else "—")
-        _pc[3].metric("Posizioni aperte", f"{_pm['n_open']}")
+        cards([
+            {'label': 'Snapshot raccolti', 'value': f"{_pm['snapshots']}"},
+            {'label': 'Trade chiusi', 'value': f"{_pm['n_closed']}/{_pm['sample_target']}",
+             'delta': f"{_pm['sample_pct']:.0f}%", 'delta_color': 'grey'},
+            {'label': 'Win rate',
+             'value': f"{_pm['win_rate']*100:.0f}%" if _pm['win_rate'] is not None else "—"},
+            {'label': 'Posizioni aperte', 'value': f"{_pm['n_open']}"},
+        ], per_row=4)
         st.caption("Obiettivo Fase 1: ≥ 20 trade chiusi, processo coerente. "
                    "Il profitto è secondario — conta validare che la logica funzioni in automatico.")
 
@@ -1738,11 +1770,12 @@ with tab7:
                        "questi dati servono a capire se i filtri aiutano o tagliano "
                        "troppo. Si popolerà con i prossimi run automatici.")
         else:
-            _sc = st.columns(3)
-            _sc[0].metric("Giorni valutati", f"{_sk['total_days']}")
-            _sc[1].metric("Trade", f"{_sk['n_trade']}",
-                          delta=f"{_sk['trade_rate']:.0f}% dei giorni")
-            _sc[2].metric("SKIP", f"{_sk['n_skip']}")
+            cards([
+                {'label': 'Giorni valutati', 'value': f"{_sk['total_days']}"},
+                {'label': 'Trade', 'value': f"{_sk['n_trade']}",
+                 'delta': f"{_sk['trade_rate']:.0f}% dei giorni", 'delta_color': 'grey'},
+                {'label': 'SKIP', 'value': f"{_sk['n_skip']}"},
+            ], per_row=3)
             if _sk['skip_breakdown']:
                 st.caption("**Motivi dei SKIP** — se un motivo domina, è la leva su "
                            "cui ragionare (es. troppi 'Conviction bassa' → soglia forse "
@@ -1834,19 +1867,19 @@ with tab8:
                 st.warning(f"⚠️ {_vx['error']}")
             else:
                 # ── Headline metrics ────────────────────────────────────────────
-                _vc = st.columns(4)
-                _vc[0].metric("VolDex (ATM 30d)", f"{_vx['voldex']:.2f}%",
-                              help="Volatilità implicita ATM a 30 giorni — "
-                                   "ciò che i practitioner guardano per primo")
-                _vc[1].metric("CallDex (~16Δ call)",
-                              f"{_vx['calldex']:.2f}%" if _vx['calldex'] else "—",
-                              help="Costo normalizzato della call OTM ~1 dev. std")
-                _vc[2].metric("PutDex (~16Δ put)",
-                              f"{_vx['putdex']:.2f}%" if _vx['putdex'] else "—",
-                              help="Costo normalizzato della put OTM ~1 dev. std")
-                _vc[3].metric("TailDex (~10Δ put)",
-                              f"{_vx['taildex']:.2f}%" if _vx['taildex'] else "—",
-                              help="Costo della put più OTM — proxy di tail risk")
+                cards([
+                    {'label': 'VolDex (ATM 30d)', 'value': f"{_vx['voldex']:.2f}%",
+                     'help': 'Volatilità implicita ATM a 30 giorni — ciò che i practitioner guardano per primo'},
+                    {'label': 'CallDex (~16Δ call)',
+                     'value': f"{_vx['calldex']:.2f}%" if _vx['calldex'] else "—",
+                     'help': 'Costo normalizzato della call OTM ~1 dev. std'},
+                    {'label': 'PutDex (~16Δ put)',
+                     'value': f"{_vx['putdex']:.2f}%" if _vx['putdex'] else "—",
+                     'help': 'Costo normalizzato della put OTM ~1 dev. std'},
+                    {'label': 'TailDex (~10Δ put)',
+                     'value': f"{_vx['taildex']:.2f}%" if _vx['taildex'] else "—",
+                     'help': 'Costo della put più OTM — proxy di tail risk'},
+                ], per_row=4)
 
                 # Skew reading
                 if _vx['putdex'] and _vx['calldex']:

@@ -71,8 +71,14 @@ div[data-testid="metric-container"] label, div[data-testid="stMetric"] label {
 }
 div[data-testid="metric-container"] [data-testid="stMetricValue"],
 div[data-testid="stMetric"] [data-testid="stMetricValue"] {
-    color: #111827 !important; font-size: 22px !important; font-weight: 700;
+    color: #111827 !important; font-size: 20px !important; font-weight: 700;
     font-family: 'Inter', sans-serif !important;
+    white-space: normal !important; overflow: visible !important;
+    text-overflow: clip !important;
+}
+div[data-testid="metric-container"] [data-testid="stMetricLabel"],
+div[data-testid="stMetric"] [data-testid="stMetricLabel"] {
+    white-space: normal !important; overflow: visible !important;
 }
 
 /* ── Tabs ────────────────────────────────────────────── */
@@ -530,21 +536,29 @@ st.markdown(
 
 # ── Metric cards ──────────────────────────────────────────────────────────────
 stats = build_stat_metrics(raw_df, by_strike, spot)
-metric_cols = st.columns(len(stats))
-for col, (label, (value, _color)) in zip(metric_cols, stats.items()):
+
+def _metric_help(label):
     if "GEX Regime" in label:
-        _help = (f"Regime basato sulla posizione dello spot rispetto al gamma flip "
-                 f"(somma su scadenze ≤ {max_days}g). Se il GEX è negativo a tutti "
-                 "gli strike (mercato a senso unico), non esiste un flip e il regime "
-                 "segue il segno del GEX vicino allo spot. Può differire dal "
-                 "'Gamma Regime (0DTE)' della tab 0DTE.")
-    elif label == "Gamma Flip":
-        _help = ("Strike dove il GEX netto cambia segno (da SHORT sotto a LONG sopra). "
-                 "Mostra '—' quando non esiste un flip reale: il mercato è interamente "
-                 "in un solo regime (es. SHORT γ a tutti gli strike).")
-    else:
-        _help = None
-    col.metric(label=label, value=value, help=_help)
+        return (f"Regime basato sulla posizione dello spot rispetto al gamma flip "
+                f"(somma su scadenze ≤ {max_days}g). Se il GEX è negativo a tutti "
+                "gli strike (mercato a senso unico), non esiste un flip e il regime "
+                "segue il segno del GEX vicino allo spot. Può differire dal "
+                "'Gamma Regime (0DTE)' della tab 0DTE.")
+    if label == "Gamma Flip":
+        return ("Strike dove il GEX netto cambia segno (da SHORT sotto a LONG sopra). "
+                "Mostra '—' quando non esiste un flip reale: il mercato è interamente "
+                "in un solo regime (es. SHORT γ a tutti gli strike).")
+    return None
+
+# Render in rows of at most _PER_ROW cards so each card stays wide enough to show
+# its full value on landscape/desktop (a single 9-column row truncates to "$73…").
+_PER_ROW = 5
+_items = list(stats.items())
+for _i in range(0, len(_items), _PER_ROW):
+    _chunk = _items[_i:_i + _PER_ROW]
+    _cols = st.columns(len(_chunk))
+    for _col, (label, (value, _color)) in zip(_cols, _chunk):
+        _col.metric(label=label, value=value, help=_metric_help(label))
 
 st.markdown("---")
 

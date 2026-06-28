@@ -539,30 +539,45 @@ stats = build_stat_metrics(raw_df, by_strike, spot)
 
 def _metric_help(label):
     if "GEX Regime" in label:
-        return (f"Regime basato sulla posizione dello spot rispetto al gamma flip "
-                f"(somma su scadenze ≤ {max_days}g). Se il GEX è negativo a tutti "
-                "gli strike (mercato a senso unico), non esiste un flip e il regime "
-                "segue il segno del GEX vicino allo spot. Può differire dal "
-                "'Gamma Regime (0DTE)' della tab 0DTE.")
+        return ("Regime basato su spot vs gamma flip. Se il GEX è negativo a tutti "
+                "gli strike non esiste un flip e il regime segue il segno del GEX "
+                "vicino allo spot. Può differire dal Gamma Regime (0DTE).")
     if label == "Gamma Flip":
-        return ("Strike dove il GEX netto cambia segno (da SHORT sotto a LONG sopra). "
-                "Mostra '—' quando non esiste un flip reale: il mercato è interamente "
-                "in un solo regime (es. SHORT γ a tutti gli strike).")
+        return ("Strike dove il GEX netto cambia segno. '—' = nessun flip reale "
+                "(mercato interamente in un solo regime).")
     return None
 
-# Render in rows of at most _PER_ROW cards so each card stays wide enough to show
-# its full value on landscape/desktop (a single 9-column row truncates to "$73…").
-_PER_ROW = 5
-_items = list(stats.items())
-for _i in range(0, len(_items), _PER_ROW):
-    _chunk = _items[_i:_i + _PER_ROW]
-    _cols = st.columns(len(_chunk))
-    for _col, (label, (value, _color)) in zip(_cols, _chunk):
-        _col.metric(label=label, value=value, help=_metric_help(label))
+def _render_metric_cards(items, per_row=4):
+    """Custom HTML metric cards: full value always visible (wraps, never
+    truncated), unlike st.metric which clips long values to '$73…' on narrow
+    columns. Title shown in full with a tooltip when a help text exists."""
+    for _i in range(0, len(items), per_row):
+        _chunk = items[_i:_i + per_row]
+        _cols = st.columns(len(_chunk))
+        for _col, (label, val) in zip(_cols, _chunk):
+            # val may be (value, color) tuple or plain string
+            if isinstance(val, (tuple, list)):
+                value = val[0]
+            else:
+                value = val
+            _hlp = _metric_help(label)
+            _title_attr = f' title="{_hlp}"' if _hlp else ''
+            _help_mark = ' &#9432;' if _hlp else ''
+            _col.markdown(
+                f"""<div style="background:#FFFFFF;border:1px solid #E5E7EB;
+                    border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,0.06),
+                    0 4px 12px rgba(0,0,0,0.04);padding:14px 16px;
+                    min-height:78px;margin-bottom:12px;"{_title_attr}>
+                  <div style="color:#9CA3AF;font-size:10.5px;font-weight:600;
+                       text-transform:uppercase;letter-spacing:0.6px;
+                       margin-bottom:6px;line-height:1.25;">{label}{_help_mark}</div>
+                  <div style="color:#111827;font-size:19px;font-weight:700;
+                       line-height:1.2;word-break:break-word;
+                       font-family:'Inter',sans-serif;">{value}</div>
+                </div>""",
+                unsafe_allow_html=True)
 
-st.markdown("---")
-
-st.markdown("---")
+_render_metric_cards(list(stats.items()), per_row=4)
 
 st.markdown("---")
 
@@ -799,49 +814,43 @@ with tab1:
     gex_analytics = compute_gex_analytics(raw_df, by_strike, spot)
     if gex_analytics:
         ga = gex_analytics
-        am = st.columns(5)
-        am[0].metric(
-            "GEX Center of Mass",
-            f"${ga['center_of_mass']:,.0f}",
-            help="Strike baricentro del GEX lordo — il livello di maggior attrazione gravitazionale per il prezzo (più informativo del flip)")
-        am[1].metric(
-            "HHI Concentrazione",
-            f"{ga['hhi']:.4f}",
-            delta="Alta" if ga['hhi'] > 0.05 else "Bassa",
-            help="Herfindahl-Hirschman Index del GEX per strike. >0.05 = GEX concentrato (pinning forte). <0.01 = distribuito (pinning debole)")
-        am[2].metric(
-            "Impact 1% Move",
-            f"${ga['impact_1pct']/1e6:.0f}M Δ",
-            help="$ di delta da hedgiare se il mercato si muove dell'1%. Misura la pressione di hedging concreta dei dealer")
-        am[3].metric(
-            "Impact 5% Move",
-            f"${ga['impact_5pct']/1e6:.0f}M Δ",
-            help="$ di delta da hedgiare per un movimento del 5%")
-        am[4].metric(
-            "Flip Zone",
-            f"[{ga['flip_zone_lo']:,.0f} – {ga['flip_zone_hi']:,.0f}]",
-            help="Zona di ambiguità del regime: strikes dove il GEX è < 10% del picco. All'interno di questa banda il regime è instabile")
+        _hhi_tag = ("<span style='color:#10B981;font-size:11px;'>&#8593; Bassa</span>"
+                    if ga['hhi'] <= 0.05 else
+                    "<span style='color:#EF4444;font-size:11px;'>&#8593; Alta</span>")
+        _an_cards = [
+            ("GEX Center of Mass", f"${ga['center_of_mass']:,.0f}"),
+            ("HHI Concentrazione", f"{ga['hhi']:.4f}<br>{_hhi_tag}"),
+            ("Impact 1% Move", f"${ga['impact_1pct']/1e6:.0f}M Δ"),
+            ("Impact 5% Move", f"${ga['impact_5pct']/1e6:.0f}M Δ"),
+            ("Flip Zone", f"[{ga['flip_zone_lo']:,.0f} – {ga['flip_zone_hi']:,.0f}]"),
+        ]
+        _render_metric_cards(_an_cards, per_row=5)
 
         # ── Day-over-day changes + GEX percentile ──
         dod = compute_dod_changes(raw_full, spot, cur_tick)
         pct = compute_gex_percentile(raw_full, cur_tick)
         if dod or pct.get('percentile') is not None:
-            dd = st.columns(5)
+            _dod_cards = []
             if dod:
-                dd[0].metric("Δ Net GEX vs " + dod['prev_date'][5:],
-                             f"{dod['d_net_gex']/1e9:+.2f}B",
-                             delta=f"{dod['d_gex_pct']:+.1f}%" if dod.get('d_gex_pct') else None)
-                dd[1].metric("Δ Total OI",
-                             f"{dod['d_total_oi']/1e3:+.0f}k",
-                             delta=f"{dod['d_oi_pct']:+.1f}%" if dod.get('d_oi_pct') else None)
-                dd[2].metric("Δ Spot", f"{dod['d_spot']:+.1f} pts")
+                _g = ("<span style='color:#10B981;font-size:11px;'>&#8593; "
+                      f"{dod['d_gex_pct']:+.1f}%</span>" if dod.get('d_gex_pct') and dod['d_gex_pct'] >= 0
+                      else (f"<span style='color:#EF4444;font-size:11px;'>&#8595; "
+                            f"{dod['d_gex_pct']:+.1f}%</span>" if dod.get('d_gex_pct') else ""))
+                _o = ("<span style='color:#10B981;font-size:11px;'>&#8593; "
+                      f"{dod['d_oi_pct']:+.1f}%</span>" if dod.get('d_oi_pct') and dod['d_oi_pct'] >= 0
+                      else (f"<span style='color:#EF4444;font-size:11px;'>&#8595; "
+                            f"{dod['d_oi_pct']:+.1f}%</span>" if dod.get('d_oi_pct') else ""))
+                _dod_cards.append(("Δ Net GEX vs " + dod['prev_date'][5:],
+                                   f"{dod['d_net_gex']/1e9:+.2f}B" + (f"<br>{_g}" if _g else "")))
+                _dod_cards.append(("Δ Total OI",
+                                   f"{dod['d_total_oi']/1e3:+.0f}k" + (f"<br>{_o}" if _o else "")))
+                _dod_cards.append(("Δ Spot", f"{dod['d_spot']:+.1f} pts"))
             if pct.get('percentile') is not None:
-                dd[3].metric("GEX Percentile (storico)",
-                             f"{pct['percentile']:.0f}°",
-                             help=f"Net GEX corrente vs {pct['n_history']} snapshot storici")
+                _dod_cards.append(("GEX Percentile (storico)", f"{pct['percentile']:.0f}°"))
             elif pct.get('n_history') is not None:
-                dd[3].metric("GEX Percentile", "—",
-                             help=f"Servono ≥5 snapshot (attuali: {pct['n_history']})")
+                _dod_cards.append(("GEX Percentile", "—"))
+            if _dod_cards:
+                _render_metric_cards(_dod_cards, per_row=5)
             st.markdown("---")
 
         # ── GEX Flip per scadenza (term structure) ──

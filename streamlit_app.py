@@ -985,14 +985,21 @@ with tab1:
     try:
         _m0_hc = compute_0dte_metrics(raw_df, spot) or {}
         _checks = signal_health_check(raw_df, by_strike, spot, _m0_hc)
+        # High-contrast palette: (bg, border, text) per level — dark text always
+        _hc_style = {
+            'ok':   ('#ECFDF5', '#10B981', '#065F46', '✓'),
+            'warn': ('#FEF3C7', '#F59E0B', '#92400E', '⚠️'),
+            'info': ('#EFF6FF', '#3B82F6', '#1E40AF', 'ℹ️'),
+        }
         for _ck in _checks:
-            _lvl = _ck['level']
-            if _lvl == 'ok':
-                st.success("✓ " + _ck['message'])
-            elif _lvl == 'warn':
-                st.warning("⚠️ " + _ck['message'])
-            else:
-                st.info("ℹ️ " + _ck['message'])
+            _bg, _bd, _tx, _ic = _hc_style.get(_ck['level'], _hc_style['info'])
+            _msg = _ck['message'].replace('<', '&lt;').replace('>', '&gt;')
+            st.markdown(
+                f'<div style="background:{_bg};border-left:4px solid {_bd};'
+                f'border-radius:8px;padding:11px 14px;margin-bottom:9px;">'
+                f'<span style="color:{_tx};font-size:13px;line-height:1.45;">'
+                f'{_ic} {_msg}</span></div>',
+                unsafe_allow_html=True)
     except Exception as e:
         st.caption(f"Check non disponibile: {e}")
 

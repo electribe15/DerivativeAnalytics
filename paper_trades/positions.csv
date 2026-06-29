@@ -1,2 +1,9 @@
-id,open_date,mode,strategy,signal_spot,xsp_spot,xsp_strike,dte_target,entry_iv,entry_premium,n_contracts,confidence,status,close_date,exit_premium,pnl_usd,exit_reason,regime,vol_premium,hhi
+id,open_date,mode,strategy,signal_spot,xsp_spot,xsp_strike,dte_target,entry_iv,entry_premium,n_contracts,confidence,status,close_date,exit_premium,pnl_usd,exit_reason,regime,vol_premium,hhi,decision_note,legs_json,voldex,calldex,putdex,taildex,skew_trend,peak_ratio
+1,2026-06-29,long_vol,long_put,7440.43,744.043,705,45,33.87,2.13,1,0.463,OPEN,,,,,SHORT,3.440272096044083,0.001717867568724834,"✅ TRADE: Long Put (tail, OTM). Punteggio di convinzione 0.46, sopra la soglia minima di 0.4. Le condizioni favorevoli si sono allineate.
 
+✓ Condizioni che hanno guidato la decisione: IV economica; Regime SHORT gamma; Niente pinning forte.
+
+Gambe dell'operazione (su XSP):
+BUY 1x PUT 705 @ 2.13 (~$213)
+
+Strategia scelta perché singola put OTM — la struttura più economica e a rischio definito; esposizione asimmetrica al ribasso, premio contenuto. Scadenza 45 giorni, premio totale 2.13 punti (~$213, 4% del capitale). Perdita massima limitata al premio pagato.","[{""side"": ""BUY"", ""type"": ""PUT"", ""strike"": 705, ""qty"": 1, ""premium_pts"": 2.13, ""premium_usd"": 213.0}]",14.24,11.75,18.83,20.81,-0.64,1.0

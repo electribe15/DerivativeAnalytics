@@ -2003,6 +2003,7 @@ with tab8:
 # ── Tab 9: Short Vol (sistema speculare, conto separato) ───────────────────────
 with tab9:
     import short_vol_lite as sv
+    import dex_gex_dashboard as dg
     st.markdown("### 📉 Short Vol — sistema speculare")
     st.caption("Sistema simulato che VENDE volatilità con strutture a rischio "
                "definito (credit spread, iron condor) quando le condizioni sono "

@@ -2419,13 +2419,18 @@ def compute_0dte_gamma_schedule(dte0_raw: pd.DataFrame,
 
 
 def gex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10,
-                  strike_lo=None, strike_hi=None):
+                  strike_lo=None, strike_hi=None, key_levels=None):
     """GEX by strike bar chart.
 
     Renders ALL strikes in by_strike_df and uses xaxis.range to set the
     initial zoom window.  This way the chart is never empty regardless of
     the delta range selected: the user can always zoom out to see the full
     picture.
+
+    key_levels (optional): dict of {label: strike} drawn as horizontal-ish
+    reference lines with labels — e.g. {'Call Resistance': 7800,
+    'Put Support': 7300, 'Gamma Flip': 7445}. Turns the chart into an
+    annotated map of the operative levels.
     """
     import plotly.graph_objects as go
 
@@ -2447,6 +2452,24 @@ def gex_bar_chart(by_strike_df, spot, ticker, window_pct=0.10,
     fig.add_vline(x=spot, line_color=ACCENT_YLW, line_dash='dash',
                   annotation_text=f' Spot ${spot:.1f}',
                   annotation_font_color=ACCENT_YLW)
+
+    # Key levels as labelled vertical lines (strikes are on the x-axis here)
+    if key_levels:
+        _lvl_clr = {'Call Resistance': '#EF4444', 'Put Support': '#10B981',
+                    'Gamma Flip': '#A78BFA', 'Pivot': '#A78BFA'}
+        for _name, _lvl in key_levels.items():
+            if _lvl is None:
+                continue
+            try:
+                _lv = float(_lvl)
+            except Exception:
+                continue
+            fig.add_vline(x=_lv, line_color=_lvl_clr.get(_name, '#9CA3AF'),
+                          line_dash='dot', line_width=1.4,
+                          annotation_text=f' {_name} {_lv:.0f}',
+                          annotation_font_color=_lvl_clr.get(_name, '#9CA3AF'),
+                          annotation_font_size=9)
+
     layout = base_layout(f'GEX by Strike — {ticker}')
     layout['xaxis'].update(range=[lo, hi])
     layout.update(yaxis_title='GEX ($M)', xaxis_title='Strike')
@@ -5006,3 +5029,126 @@ def signal_health_check(raw_df: pd.DataFrame, by_strike_df: pd.DataFrame,
         out.append({'level': 'ok', 'message':
             'Segnali coerenti: nessuna divergenza sospetta rilevata.'})
     return out
+
+
+def compute_term_structure_slope(voldex_result: dict) -> dict:
+    """Derive the volatility term-structure slope from a compute_voldex() result.
+
+    Compares short-dated implied vol (~7-12d) with longer-dated (~25-45d).
+    - Contango  (short < long): normal, calm regime → safe to sell vol
+    - Backwardation (short > long): acute stress / panic in progress → do NOT
+      sell vol (a crash may be underway or imminent)
+
+    Returns {'slope': long-short in vol pts, 'state': 'contango'|'backwardation'
+    |'flat'|None, 'short_iv', 'long_iv'}. Robust to sparse term tables.
+    """
+    out = {'slope': None, 'state': None, 'short_iv': None, 'long_iv': None}
+    if not voldex_result or not voldex_result.get('terms'):
+        return out
+    terms = [t for t in voldex_result['terms']
+             if t.get('T_days') and t.get('variance') is not None and t['T_days'] > 0]
+    if len(terms) < 2:
+        return out
+
+    def _iv_pct(t):
+        # annualised vol from total variance: sqrt(variance / T_years)
+        T = t['T_days'] / 365.0
+        return 100.0 * np.sqrt(max(t["variance"], 0.0) / T) if T > 0 else None
+
+    # nearest term to ~9 days = short; nearest to ~30 days = long
+    short_t = min(terms, key=lambda t: abs(t['T_days'] - 9))
+    long_t  = min(terms, key=lambda t: abs(t['T_days'] - 30))
+    if short_t['T_days'] == long_t['T_days']:
+        # fall back to the two extremes if they collapse to the same term
+        terms_sorted = sorted(terms, key=lambda t: t['T_days'])
+        short_t, long_t = terms_sorted[0], terms_sorted[-1]
+        if short_t['T_days'] == long_t['T_days']:
+            return out
+
+    short_iv = _iv_pct(short_t)
+    long_iv  = _iv_pct(long_t)
+    if short_iv is None or long_iv is None:
+        return out
+    slope = long_iv - short_iv      # positive = contango, negative = backwardation
+    if slope > 0.5:
+        state = 'contango'
+    elif slope < -0.5:
+        state = 'backwardation'
+    else:
+        state = 'flat'
+    out.update({'slope': round(slope, 2), 'state': state,
+                'short_iv': round(short_iv, 2), 'long_iv': round(long_iv, 2)})
+    return out
+
+
+def compute_key_levels(by_strike_df: pd.DataFrame, spot: float,
+                       gamma_flip=None) -> dict:
+    """Identify the operative GEX levels for an annotated map (MenthorQ-style,
+    own nomenclature):
+
+      - Call Resistance: strike of the largest POSITIVE net-GEX above spot
+        (the main upside gamma wall — dealers sell into it, capping rallies).
+      - Put Support: strike of the largest |net-GEX| on the negative side
+        below spot (the main downside gamma floor).
+      - Gamma Flip: passed through (spot vs flip defines the regime).
+
+    All derived from data already computed — no new inputs.
+    """
+    out = {'call_resistance': None, 'put_support': None, 'gamma_flip': gamma_flip}
+    if by_strike_df is None or by_strike_df.empty or 'net_gex' not in by_strike_df.columns:
+        return out
+    df = by_strike_df.copy()
+    above = df[df['strike'] > spot]
+    below = df[df['strike'] < spot]
+    # Call resistance: biggest positive GEX wall above spot
+    pos_above = above[above['net_gex'] > 0]
+    if not pos_above.empty:
+        out['call_resistance'] = float(pos_above.loc[pos_above['net_gex'].idxmax(), 'strike'])
+    elif not above.empty:
+        out['call_resistance'] = float(above.loc[above['net_gex'].abs().idxmax(), 'strike'])
+    # Put support: biggest |GEX| below spot
+    if not below.empty:
+        out['put_support'] = float(below.loc[below['net_gex'].abs().idxmax(), 'strike'])
+    return out
+
+
+def gex_regime_narrative(spot: float, gamma_flip, regime: str,
+                         net_gex_total: float, key_levels: dict) -> str:
+    """Generate a plain-language one-paragraph summary of where price sits in
+    the GEX structure — the auto-commentary that turns numbers into a read.
+
+    Uses only computed values; states the regime, the operative levels, and
+    the stabilisation threshold. Deliberately factual, no predictions.
+    """
+    parts = []
+    net_b = net_gex_total / 1e9 if net_gex_total is not None else None
+    reg_txt = ('regime SHORT γ (dealer che amplificano i movimenti — volatilità in '
+               'aumento)' if regime and 'SHORT' in regime else
+               'regime LONG γ (dealer che smorzano i movimenti — volatilità contenuta)'
+               if regime and 'LONG' in regime else 'regime indeterminato')
+    if net_b is not None:
+        parts.append(f"SPX a ${spot:,.0f}, Net GEX {net_b:+.2f}B — {reg_txt}.")
+    else:
+        parts.append(f"SPX a ${spot:,.0f} — {reg_txt}.")
+
+    cr = key_levels.get('call_resistance')
+    ps = key_levels.get('put_support')
+    if ps:
+        parts.append(f"Supporto put (pavimento gamma) verso {ps:,.0f}: una rottura "
+                     f"sotto accelererebbe la volatilità al ribasso.")
+    if cr:
+        parts.append(f"Resistenza call (muro gamma) verso {cr:,.0f}.")
+
+    if gamma_flip:
+        if spot < gamma_flip:
+            parts.append(f"Soglia di stabilizzazione: sopra {gamma_flip:,.0f} (gamma "
+                         f"flip) il regime tornerebbe positivo e i movimenti si "
+                         f"smorzerebbero. Ora il prezzo è sotto, quindi fragile.")
+        else:
+            parts.append(f"Il prezzo è sopra il gamma flip ({gamma_flip:,.0f}): finché "
+                         f"resta sopra, i dealer tendono a stabilizzare. Sotto quel "
+                         f"livello il regime diventerebbe fragile.")
+    else:
+        parts.append("Nessun gamma flip netto individuato: il mercato è interamente "
+                     "in un solo regime sugli strike vicini al prezzo.")
+    return " ".join(parts)

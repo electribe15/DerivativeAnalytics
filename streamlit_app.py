@@ -157,6 +157,8 @@ try:
         load_gex_metrics_history,
         gex_metrics_history_chart,
         cumulative_gex_chart,
+        compute_key_levels,
+        gex_regime_narrative,
         signal_health_check,
         compute_0dte_gamma_schedule,
         save_daily_snapshot,
@@ -675,7 +677,7 @@ dte0_metrics = compute_0dte_metrics(raw_full, spot)
 has_0dte     = bool(dte0_metrics)
 
 # ── Tabs — 0DTE is always first and shown by default ─────────────────────────
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "⚡ 0DTE",
     "📊 GEX / DEX",
     "📐 Range & Skew",
@@ -683,8 +685,9 @@ tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📈 Volatilità",
     "🔥 Open Interest",
     "📉 Realized Vol",
-    "🤖 Paper Trading",
+    "🤖 Long Vol Strat",
     "🌊 VolDex",
+    "📉 Short Vol Strat",
 ])
 
 # ── Tab 0: 0DTE ───────────────────────────────────────────────────────────────
@@ -946,11 +949,41 @@ with tab1:
         st.plotly_chart(empty_fig(str(e)), use_container_width=True)
 
     st.markdown("---")
+
+    # ── Key levels + auto-narrative (MenthorQ-style read, own nomenclature) ──
+    _ga_kl = gex_analytics or {}
+    _klv = compute_key_levels(by_strike, spot, _ga_kl.get('gamma_flip'))
+    _gex_levels = {
+        'Call Resistance': _klv.get('call_resistance'),
+        'Put Support': _klv.get('put_support'),
+        'Gamma Flip': _klv.get('gamma_flip'),
+    }
+    try:
+        _narr = gex_regime_narrative(spot, _ga_kl.get('gamma_flip'),
+                                     _ga_kl.get('regime'),
+                                     _ga_kl.get('net_gex_total'), _klv)
+        _is_short = _ga_kl.get('regime') and 'SHORT' in _ga_kl.get('regime')
+        _nbg = '#FEF3C7' if _is_short else '#ECFDF5'
+        _ntx = '#92400E' if _is_short else '#065F46'
+        _nbd = '#F59E0B' if _is_short else '#10B981'
+        st.markdown(
+            f'<div style="background:{_nbg};border-left:4px solid {_nbd};'
+            f'border-radius:8px;padding:12px 15px;margin-bottom:14px;">'
+            f'<div style="color:{_ntx};font-size:11px;font-weight:700;'
+            f'text-transform:uppercase;letter-spacing:0.6px;margin-bottom:4px;">'
+            f'🗺️ Lettura della struttura GEX</div>'
+            f'<span style="color:{_ntx};font-size:13px;line-height:1.5;">{_narr}'
+            f'</span></div>',
+            unsafe_allow_html=True)
+    except Exception:
+        pass
+
     col_l, col_r = st.columns(2)
     with col_l:
         try:
             st.plotly_chart(gex_bar_chart(by_strike, spot, cur_tick,
-                                          strike_lo=strike_lo, strike_hi=strike_hi),
+                                          strike_lo=strike_lo, strike_hi=strike_hi,
+                                          key_levels=_gex_levels),
                             use_container_width=True)
         except Exception as e:
             st.plotly_chart(empty_fig(str(e)), use_container_width=True)
@@ -1965,6 +1998,218 @@ with tab8:
         st.error(f"Errore nel calcolo VolDex: {_vxe}")
         import traceback as _tb
         st.code(_tb.format_exc())
+
+
+# ── Tab 9: Short Vol (sistema speculare, conto separato) ───────────────────────
+with tab9:
+    import short_vol_lite as sv
+    st.markdown("### 📉 Short Vol — sistema speculare")
+    st.caption("Sistema simulato che VENDE volatilità con strutture a rischio "
+               "definito (credit spread, iron condor) quando le condizioni sono "
+               "opposte al long-vol: vol cara + regime LONG gamma + niente stress. "
+               "Conto separato da $5.000, indipendente dal long-vol.")
+
+    # Banner che chiarisce la relazione coi due sistemi
+    st.markdown(
+        '<div style="background:#FEF3C7;border-left:4px solid #F59E0B;'
+        'border-radius:8px;padding:11px 14px;margin-bottom:14px;">'
+        '<span style="color:#92400E;font-size:12.5px;line-height:1.45;">'
+        '⚖️ <b>Sistema complementare al long-vol.</b> Guadagna nei periodi calmi in '
+        'cui il long-vol brucia theta, e perde negli shock in cui il long-vol esplode. '
+        'I due conti sono separati e si validano in modo indipendente.</span></div>',
+        unsafe_allow_html=True)
+
+    # Account summary
+    _has_data_sv = ("data" in st.session_state and
+                    st.session_state["data"].get("raw_full") is not None)
+    _spot_sv = st.session_state["data"].get("spot") if _has_data_sv else None
+    _iv_sv = None
+    if _has_data_sv:
+        try:
+            _m0_sv = compute_0dte_metrics(st.session_state["data"].get("raw_full"),
+                                          _spot_sv) or {}
+            _iv_sv = (_m0_sv.get('atm_iv') or 0.18) * 100
+        except Exception:
+            _iv_sv = 18.0
+
+    _sv_acc = sv.account_summary(_spot_sv, _iv_sv)
+    cards([
+        {'label': 'Capitale Short', 'value': f"${_sv_acc['capital']:,.0f}"},
+        {'label': 'P&L realizzato',
+         'value': f"${_sv_acc['realized']:+,.0f}",
+         'delta_color': 'green' if _sv_acc['realized'] >= 0 else 'red'},
+        {'label': 'P&L latente (aperte)',
+         'value': f"${_sv_acc['unrealized']:+,.0f}",
+         'delta_color': 'green' if _sv_acc['unrealized'] >= 0 else 'red'},
+        {'label': 'Equity totale', 'value': f"${_sv_acc['equity']:,.0f}"},
+        {'label': 'Posizioni',
+         'value': f"{_sv_acc['n_open']} aperte / {_sv_acc['n_closed']} chiuse"},
+    ], per_row=5)
+
+    st.markdown("---")
+
+    # Live signal preview
+    if _has_data_sv:
+        _dd_sv = st.session_state["data"]
+        try:
+            _raw_sv = _dd_sv.get("raw_full")
+            _bs_sv = dg.aggregate_by_strike(_raw_sv)
+            _ga_sv = dg.compute_gex_analytics(_raw_sv, _bs_sv, _spot_sv) or {}
+            _reg_full_sv = _ga_sv.get('regime')
+            _regime_sv = ('LONG' if (_reg_full_sv and 'LONG' in _reg_full_sv) else
+                          'SHORT' if _reg_full_sv else
+                          ('LONG' if _ga_sv.get('net_gex_total', 0) >= 0 else 'SHORT'))
+            _hhi_sv = _ga_sv.get('hhi', 0.0)
+            # vol premium + voldex
+            _vp_sv = None
+            _voldex_sv = _calldex_sv = _putdex_sv = _taildex_sv = None
+            try:
+                _vx_sv = dg.compute_voldex(_raw_sv, _spot_sv)
+                if _vx_sv:
+                    _voldex_sv = _vx_sv.get('voldex')
+                    _calldex_sv = _vx_sv.get('calldex')
+                    _putdex_sv = _vx_sv.get('putdex')
+                    _taildex_sv = _vx_sv.get('taildex')
+            except Exception:
+                pass
+            _atm_iv_sv = _m0_sv.get('atm_iv') if _has_data_sv else None
+            _em_sv = _m0_sv.get('exp_move_pts') if _has_data_sv else None
+            try:
+                _vph = dg.load_voldex_history()
+                if _vph is not None and len(_vph) >= 3 and _putdex_sv and _calldex_sv:
+                    _recent = _vph.tail(10)
+                    _sk_now = _putdex_sv - _calldex_sv
+                    _sk_avg = (_recent['putdex'] - _recent['calldex']).mean()
+                    _skew_trend_sv = _sk_now - _sk_avg
+                else:
+                    _skew_trend_sv = None
+            except Exception:
+                _skew_trend_sv = None
+
+            # Term structure state for crash-protection filter
+            _term_sv = None
+            _term_state_sv = None
+            try:
+                if _vx_sv:
+                    _term_sv = dg.compute_term_structure_slope(_vx_sv)
+                    _term_state_sv = _term_sv.get('state') if _term_sv else None
+            except Exception:
+                pass
+
+            st.markdown(
+                '<div style="background:#EFF6FF;border-left:4px solid #3B82F6;'
+                'border-radius:10px;padding:12px 16px;margin-bottom:14px;">'
+                '<div style="color:#1D4ED8;font-size:12px;font-weight:700;'
+                'text-transform:uppercase;letter-spacing:0.7px;margin-bottom:3px;">'
+                '&#128269; Anteprima segnale Short Vol &mdash; NON ancora eseguito</div>'
+                '<div style="color:#3B82F6;font-size:11.5px;line-height:1.4;">'
+                'Simulazione di cosa farebbe il sistema short-vol con i dati attuali. '
+                '<b>Non &egrave; una posizione aperta.</b> Le posizioni reali le apre '
+                'il motore automatico dopo la chiusura USA.</div></div>',
+                unsafe_allow_html=True)
+
+            _dec_sv = sv.evaluate_signal(_spot_sv, _regime_sv, _hhi_sv, _vp_sv,
+                                         _atm_iv_sv, _em_sv, voldex=_voldex_sv,
+                                         calldex=_calldex_sv, putdex=_putdex_sv,
+                                         taildex=_taildex_sv, skew_trend=_skew_trend_sv,
+                                         term_state=_term_state_sv)
+
+            cards([
+                {'label': 'Regime GEX', 'value': _regime_sv,
+                 'delta': 'favorevole' if _regime_sv == 'LONG' else 'sfavorevole',
+                 'delta_color': 'green' if _regime_sv == 'LONG' else 'red'},
+                {'label': 'HHI (pinning)', 'value': f"{_hhi_sv:.4f}"},
+                {'label': 'VolDex', 'value': f"{_voldex_sv:.1f}%" if _voldex_sv else "—"},
+                {'label': 'Skew trend',
+                 'value': (f"{_skew_trend_sv:+.2f}pt" if _skew_trend_sv is not None else "—")},
+                {'label': 'Term structure',
+                 'value': ({'contango': '📈 Contango', 'backwardation': '📉 Backwardation',
+                            'flat': '➖ Flat'}.get(_term_state_sv, '—')),
+                 'delta': (f"{_term_sv['slope']:+.1f}pt" if _term_sv and _term_sv.get('slope') is not None else None),
+                 'delta_color': ('green' if _term_state_sv == 'contango'
+                                 else 'red' if _term_state_sv == 'backwardation' else 'grey')},
+            ], per_row=5)
+
+            st.markdown(_dec_sv.summary_html, unsafe_allow_html=True)
+
+            if _dec_sv.action == 'TRADE' and _dec_sv.legs:
+                st.markdown("<span style='font-size:12px;color:#3B82F6;'>"
+                            "<b>Gambe che il sistema venderebbe (XSP) &mdash; "
+                            "ipotetiche, rischio definito:</b></span>",
+                            unsafe_allow_html=True)
+                _legrows_sv = [{
+                    'Lato': l['side'], 'Tipo': l['type'],
+                    'Strike': f"{l['strike']:.0f}",
+                } for l in _dec_sv.legs]
+                st.dataframe(pd.DataFrame(_legrows_sv), use_container_width=True,
+                             hide_index=True)
+                cards([
+                    {'label': 'Credito incassato',
+                     'value': f"${_dec_sv.credit_usd:.0f}", 'delta_color': 'green'},
+                    {'label': 'Perdita massima',
+                     'value': f"${_dec_sv.max_loss_usd:.0f}", 'delta_color': 'red'},
+                ], per_row=2)
+
+            if _dec_sv.conditions:
+                _cc_sv = st.columns(2)
+                for _i, _c in enumerate(_dec_sv.conditions):
+                    _icon = "✅" if _c['met'] else "❌"
+                    _cc_sv[_i % 2].markdown(
+                        f"<span style='font-size:12px;'>{_icon} <b>{_c['label']}</b><br>"
+                        f"<span style='color:#6B7280;'>{_c['detail']}</span></span>",
+                        unsafe_allow_html=True)
+
+            if _dec_sv.explanation:
+                _exp_bg = '#ECFDF5' if _dec_sv.action == 'TRADE' else '#F3F4F6'
+                _exp_tx = '#065F46' if _dec_sv.action == 'TRADE' else '#374151'
+                st.markdown(
+                    f"<div style='background:{_exp_bg};border-radius:8px;padding:11px 14px;"
+                    f"margin-top:10px;'><span style='color:{_exp_tx};font-size:12.5px;"
+                    f"line-height:1.45;'>{_dec_sv.explanation}</span></div>",
+                    unsafe_allow_html=True)
+        except Exception as _sve:
+            st.error(f"Errore anteprima short-vol: {_sve}")
+    else:
+        st.info("Carica la full chain per vedere l'anteprima del segnale short-vol.")
+
+    # Positions + decision log
+    st.markdown("---")
+    st.markdown("**📋 Storico posizioni short-vol**")
+    _svpos = sv.load_positions()
+    if _svpos.empty:
+        st.caption("Nessuna posizione short-vol ancora. Le aprirà il motore automatico "
+                   "quando le condizioni saranno favorevoli.")
+    else:
+        _show_cols = ['id', 'open_date', 'status', 'strategy', 'credit',
+                      'max_loss', 'entry_iv', 'close_reason', 'pnl_usd']
+        _show = _svpos[[c for c in _show_cols if c in _svpos.columns]]
+        st.dataframe(_show, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("**🔍 Analisi delle decisioni short-vol**")
+    _sk_sv = sv.skip_log_summary()
+    if _sk_sv['total_days'] == 0:
+        st.caption("Ancora nessuna decisione registrata. Si popolerà con i run "
+                   "automatici del motore.")
+    else:
+        cards([
+            {'label': 'Giorni valutati', 'value': f"{_sk_sv['total_days']}"},
+            {'label': 'Trade', 'value': f"{_sk_sv['n_trade']}",
+             'delta': f"{_sk_sv['trade_rate']:.0f}% dei giorni"},
+            {'label': 'SKIP', 'value': f"{_sk_sv['n_skip']}"},
+        ], per_row=3)
+        if _sk_sv['skip_breakdown']:
+            st.caption("**Motivi dei SKIP:**")
+            _bd_sv = pd.DataFrame(
+                [{'Motivo': k, 'Giorni': v}
+                 for k, v in sorted(_sk_sv['skip_breakdown'].items(),
+                                    key=lambda x: -x[1])])
+            st.dataframe(_bd_sv, use_container_width=True, hide_index=True)
+
+    st.info("💡 Lo short-vol va validato in modo indipendente dal long-vol, su un "
+            "periodo che includa almeno un episodio di stress: è lì che si vede se "
+            "le strutture a rischio definito proteggono davvero. Non confrontare i "
+            "P&L dei due sistemi su periodi troppo brevi.")
 
 
 # ── Footer ────────────────────────────────────────────────────────────────────

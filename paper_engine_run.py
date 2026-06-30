@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import dex_gex_dashboard as dg
 import trading_lite as tl
+import short_vol_lite as sv
 
 
 def log(msg: str):
@@ -90,6 +91,7 @@ def main() -> int:
 
     # ── 3b. VolDex suite — same chain, no extra fetch needed ──────────────────
     voldex = calldex = putdex = taildex = skew_trend = None
+    vx = None
     try:
         vx = dg.compute_voldex(raw, spot)
         if vx.get('error'):
@@ -153,6 +155,51 @@ def main() -> int:
             log(f"Signal TRADE but cannot open: {why}")
     else:
         log("SKIP — no action (correct most days for long-vol)")
+
+    # ── 5b. SHORT-VOL system (separate account, runs in parallel) ─────────────
+    try:
+        sv_events = sv.mark_and_manage(spot, iv_now)
+        for ev in sv_events:
+            log(f"[SHORT] Position #{ev['id']} closed: {ev['reason']} "
+                f"P&L ${ev['pnl_usd']:+.0f}")
+        if not sv_events:
+            log("[SHORT] No open positions hit exit conditions")
+
+        sv_term = dg.compute_term_structure_slope(vx) if vx else None
+        sv_term_state = sv_term.get('state') if sv_term else None
+        sv_decision = sv.evaluate_signal(spot, regime, hhi, vp, atm_iv, em,
+                                         voldex=voldex, calldex=calldex,
+                                         putdex=putdex, taildex=taildex,
+                                         skew_trend=skew_trend,
+                                         term_state=sv_term_state)
+        log(f"[SHORT] Decision: {sv_decision.action} {sv_decision.strategy} "
+            f"conf={sv_decision.confidence} {sv_decision.skip_reason}")
+        try:
+            sv.log_daily_decision(sv_decision, spot, voldex=voldex,
+                                  expected_move_pts=em)
+        except Exception as e:
+            log(f"[SHORT] Skip-log write failed (non-fatal): {e}")
+
+        if sv_decision.action == 'TRADE':
+            # one open position at a time for the short-vol account
+            _svdf = sv.load_positions()
+            _sv_open = len(_svdf[_svdf['status'] == 'OPEN']) if not _svdf.empty else 0
+            if _sv_open == 0:
+                _svrow = sv.open_paper_position(sv_decision, spot, iv_now)
+                log(f"[SHORT] OPENED #{_svrow.get('id')}: {sv_decision.strategy} "
+                    f"credito ${sv_decision.credit_usd:.0f} "
+                    f"perdita max ${sv_decision.max_loss_usd:.0f}")
+            else:
+                log(f"[SHORT] Signal TRADE but {_sv_open} position(s) already open")
+        else:
+            log("[SHORT] SKIP — no action")
+
+        sv_acc = sv.account_summary(spot, iv_now)
+        log(f"[SHORT] Account: equity ${sv_acc['equity']:.0f} "
+            f"(realizzato ${sv_acc['realized']:+.0f}) open={sv_acc['n_open']} "
+            f"closed={sv_acc['n_closed']}")
+    except Exception as e:
+        log(f"[SHORT] short-vol block failed (non-fatal): {e}")
 
     # ── 6. Summary ────────────────────────────────────────────────────────────
     cs = tl.capital_status()

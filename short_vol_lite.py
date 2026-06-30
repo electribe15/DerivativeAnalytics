@@ -65,14 +65,97 @@ TAIL_BLOCK_SPREAD    = 2.5     # se (taildex-putdex) > 2.5 → coda prezzata →
 # invertita (backwardation = panico in corso). Bloccare la vendita in queste
 # finestre evita i colpi alla fonte, al costo di saltare alcune giornate.
 EVENT_BLOCK_DAYS_BEFORE = 1    # niente nuove vendite se un evento macro è entro N giorni
-# Eventi macro ricorrenti ad alto impatto sull'indice. Date specifiche note
-# vanno aggiunte qui (formato 'YYYY-MM-DD'). FOMC/CPI/NFP cambiano ogni mese,
-# quindi si aggiornano periodicamente. Lista vuota = filtro eventi inattivo.
+
+# Date macro ufficiali 2026 — usate come FALLBACK se il feed live BLS non è
+# raggiungibile. CPI/NFP normalmente arrivano dal feed .ics auto-aggiornante
+# (vedi get_macro_event_dates); questa lista garantisce che il filtro funzioni
+# anche offline. FOMC è sempre da qui (la Fed non ha un .ics).
+# Fonti: Federal Reserve (FOMC), BLS (CPI/NFP). Da verificare una volta l'anno.
 MACRO_EVENT_DATES = [
-    # Esempio: '2026-07-30',  # FOMC
-    # Aggiornare con le date reali di FOMC, CPI, NFP, OPEX trimestrali
+    # ── FOMC 2026 (giorno dell'annuncio) ──
+    '2026-01-28', '2026-03-18', '2026-04-29', '2026-06-17',
+    '2026-07-29', '2026-09-16', '2026-10-28', '2026-12-09',
+    # ── FOMC 2027 (calendario tentativo Fed, giorno dell'annuncio) ──
+    '2027-01-27', '2027-03-17', '2027-04-28', '2027-06-09',
+    '2027-07-28', '2027-09-15', '2027-10-27', '2027-12-08',
+    # ── CPI 2026 (BLS, mese di riferimento → data rilascio) ──
+    '2026-02-13', '2026-03-11', '2026-04-10', '2026-05-12', '2026-06-10',
+    '2026-07-14', '2026-08-12', '2026-09-11', '2026-10-14', '2026-11-10',
+    '2026-12-10',
+    # ── NFP / Employment Situation 2026 (BLS, primo venerdì tipico) ──
+    '2026-01-09', '2026-02-06', '2026-03-06', '2026-04-03', '2026-05-08',
+    '2026-06-05', '2026-07-02', '2026-08-07', '2026-09-04', '2026-10-02',
+    '2026-11-06', '2026-12-04',
 ]
 BLOCK_ON_BACKWARDATION = True  # niente vendite se la term structure è invertita
+
+# ── Auto-update da fonte ufficiale BLS (.ics) ───────────────────────────────────
+# Il BLS pubblica un calendario in formato iCalendar standard che si aggiorna da
+# solo man mano che escono i mesi futuri. CPI e NFP (Employment Situation) si
+# leggono da lì → niente aggiornamento annuale manuale per questi due.
+# FOMC non ha un .ics equivalente, ma sono solo 8 date/anno note con largo
+# anticipo, quindi restano nella lista statica MACRO_EVENT_DATES sopra.
+BLS_ICS_URL = 'https://www.bls.gov/schedule/news_release/bls.ics'
+_ICS_CACHE = {'fetched': None, 'cpi': [], 'nfp': []}
+_ICS_CACHE_TTL_HOURS = 24       # rifetch al massimo una volta al giorno
+
+
+def _fetch_bls_dates(force: bool = False) -> dict:
+    """Fetch + parse the official BLS iCalendar feed, extracting Consumer Price
+    Index and Employment Situation (NFP) release dates. Cached for 24h. On any
+    failure returns the cached value (possibly empty) so the caller falls back
+    to the static MACRO_EVENT_DATES. Robust by design: the filter must never
+    break because an external fetch failed."""
+    import datetime as _dt
+    now = _dt.datetime.now()
+    if (not force and _ICS_CACHE['fetched']
+            and (now - _ICS_CACHE['fetched']).total_seconds() < _ICS_CACHE_TTL_HOURS * 3600):
+        return _ICS_CACHE
+    try:
+        import requests
+        resp = requests.get(BLS_ICS_URL, timeout=15)
+        resp.raise_for_status()
+        text = resp.text
+        cpi, nfp = [], []
+        cur_date, cur_sum = None, None
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith('DTSTART'):
+                # format: DTSTART;TZID=US-Eastern:20260213T083000
+                part = line.split(':', 1)[-1]
+                if len(part) >= 8 and part[:8].isdigit():
+                    cur_date = f"{part[:4]}-{part[4:6]}-{part[6:8]}"
+            elif line.startswith('SUMMARY'):
+                cur_sum = line.split(':', 1)[-1].strip()
+            elif line.startswith('END:VEVENT'):
+                if cur_date and cur_sum:
+                    if cur_sum.startswith('Consumer Price Index'):
+                        cpi.append(cur_date)
+                    elif cur_sum.startswith('Employment Situation'):
+                        nfp.append(cur_date)
+                cur_date, cur_sum = None, None
+        if cpi or nfp:
+            _ICS_CACHE.update({'fetched': now, 'cpi': sorted(set(cpi)),
+                               'nfp': sorted(set(nfp))})
+    except Exception:
+        # silent fallback — keep whatever is cached (may be empty)
+        pass
+    return _ICS_CACHE
+
+
+def get_macro_event_dates(use_live: bool = True) -> list:
+    """Return the full macro-event date list. FOMC always from the static list;
+    CPI/NFP from the live BLS feed when available, else from the static list.
+    This is the single source of truth used by the event filter."""
+    _fomc = ['2026-01-28', '2026-03-18', '2026-04-29', '2026-06-17',
+             '2026-07-29', '2026-09-16', '2026-10-28', '2026-12-09',
+             '2027-01-27', '2027-03-17', '2027-04-28', '2027-06-09',
+             '2027-07-28', '2027-09-15', '2027-10-27', '2027-12-08']
+    if use_live:
+        live = _fetch_bls_dates()
+        if live['cpi'] or live['nfp']:
+            return sorted(set(_fomc + live['cpi'] + live['nfp']))
+    return sorted(set(MACRO_EVENT_DATES))
 
 # Risk-free + dividend (match dashboard)
 R_FREE               = 0.053221
@@ -168,18 +251,51 @@ class ShortVolDecision:
 def _days_to_next_event(today: date = None) -> Optional[int]:
     """Days until the nearest upcoming macro event, or None if none configured
     / none upcoming. Used to block new short-vol sales right before events."""
-    if not MACRO_EVENT_DATES:
+    info = next_macro_event(today)
+    return info['days'] if info else None
+
+
+def next_macro_event(today: date = None) -> Optional[dict]:
+    """Return {'date', 'days', 'label'} for the nearest upcoming macro event,
+    or None. Uses the live BLS feed for CPI/NFP when available (auto-updating,
+    no annual maintenance), falling back to the static list. FOMC always from
+    the static schedule. Labels inferred from the official 2026 schedules."""
+    dates = get_macro_event_dates(use_live=True)
+    if not dates:
         return None
     today = today or date.today()
-    upcoming = []
-    for s in MACRO_EVENT_DATES:
+    _fomc = {'2026-01-28', '2026-03-18', '2026-04-29', '2026-06-17',
+             '2026-07-29', '2026-09-16', '2026-10-28', '2026-12-09',
+             '2027-01-27', '2027-03-17', '2027-04-28', '2027-06-09',
+             '2027-07-28', '2027-09-15', '2027-10-27', '2027-12-08'}
+    # CPI dates come from the live feed; classify by membership in the cache
+    _live = _fetch_bls_dates()
+    _cpi_set = set(_live.get('cpi', []))
+    best = None
+    for s in dates:
         try:
             ev = date.fromisoformat(s)
-            if ev >= today:
-                upcoming.append((ev - today).days)
         except Exception:
             continue
-    return min(upcoming) if upcoming else None
+        if ev < today:
+            continue
+        days = (ev - today).days
+        if s in _fomc:
+            label = 'FOMC'
+        elif s in _cpi_set:
+            label = 'CPI'
+        else:
+            label = 'CPI/NFP' if s not in _fomc else 'FOMC'
+            # refine: if in static CPI months use CPI, else NFP
+            label = 'NFP'
+            _static_cpi = {'2026-02-13', '2026-03-11', '2026-04-10', '2026-05-12',
+                           '2026-06-10', '2026-07-14', '2026-08-12', '2026-09-11',
+                           '2026-10-14', '2026-11-10', '2026-12-10'}
+            if s in _cpi_set or s in _static_cpi:
+                label = 'CPI'
+        if best is None or days < best['days']:
+            best = {'date': s, 'days': days, 'label': label}
+    return best
 
 
 def evaluate_signal(spot: float, regime: str, hhi: float,
@@ -206,18 +322,19 @@ def evaluate_signal(spot: float, regime: str, hhi: float,
     d = ShortVolDecision()
 
     # ── Crash-protection block A: imminent macro event ────────────────────
-    _ev_days = _days_to_next_event()
-    if _ev_days is not None and _ev_days <= EVENT_BLOCK_DAYS_BEFORE:
+    _ev = next_macro_event()
+    if _ev is not None and _ev['days'] <= EVENT_BLOCK_DAYS_BEFORE:
         d.skip_category = 'Evento macro imminente'
-        d.skip_reason = (f"Evento macro entro {_ev_days}g — niente vendite vol "
-                         "a ridosso di eventi ad alto impatto")
+        _when = 'oggi' if _ev['days'] == 0 else f"tra {_ev['days']}g"
+        d.skip_reason = (f"{_ev['label']} {_when} ({_ev['date']}) — niente vendite "
+                         "vol a ridosso di eventi ad alto impatto")
         d.conditions = [{'label': 'Nessun evento imminente', 'met': False,
-                         'detail': f"Evento macro tra {_ev_days} giorni — rischio "
-                                   "di gap, lo short-vol si astiene"}]
+                         'detail': f"{_ev['label']} {_when} — rischio di gap, "
+                                   "lo short-vol si astiene"}]
         d.explanation = (
-            f"❌ NESSUN TRADE. Un evento macro ad alto impatto è previsto entro "
-            f"{_ev_days} giorno/i. Vendere vol a ridosso di FOMC/CPI/NFP espone a "
-            f"gap improvvisi: il sistema si astiene fino a evento passato.")
+            f"❌ NESSUN TRADE. Evento macro ad alto impatto ({_ev['label']}) {_when} "
+            f"({_ev['date']}). Vendere vol a ridosso di FOMC/CPI/NFP espone a gap "
+            f"improvvisi: il sistema si astiene fino a evento passato.")
         return d
 
     # ── Crash-protection block B: backwardation (panic in progress) ───────

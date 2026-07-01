@@ -1,3 +1,4 @@
 date,action,strategy,confidence,skip_category,skip_reason,spot,voldex,expected_move_pts,spot_at_eval
 2026-06-29,TRADE,long_put,0.463,,,7440.43,14.24,158.74971761083492,7440.43
 2026-06-30,SKIP,,0.028,Conviction bassa,Conviction 0.03 < 0.4 — condizioni non abbastanza favorevoli per comprare vol,7499.36,13.43,52.62706164069028,7499.36
+2026-07-01,SKIP,,0.382,Conviction bassa,Conviction 0.38 < 0.4 — condizioni non abbastanza favorevoli per comprare vol,7483.23,13.21,109.74172923424537,7483.23

@@ -1,5 +1,5 @@
 id,open_date,mode,strategy,signal_spot,xsp_spot,xsp_strike,dte_target,entry_iv,entry_premium,n_contracts,confidence,status,close_date,exit_premium,pnl_usd,exit_reason,regime,vol_premium,hhi,decision_note,legs_json,voldex,calldex,putdex,taildex,skew_trend,peak_ratio
-1,2026-06-29,long_vol,long_put,7440.43,744.043,705,45,33.87,2.13,1,0.463,OPEN,,,,,SHORT,3.440272096044083,0.0017178675687248,"✅ TRADE: Long Put (tail, OTM). Punteggio di convinzione 0.46, sopra la soglia minima di 0.4. Le condizioni favorevoli si sono allineate.
+1,2026-06-29,long_vol,long_put,7440.43,744.043,705,45,33.87,2.13,1,0.463,CLOSED,2026-07-02,1.05,-117.3,Stop loss — premio a 49% dell'entry,SHORT,3.440272096044083,0.0017178675687248,"✅ TRADE: Long Put (tail, OTM). Punteggio di convinzione 0.46, sopra la soglia minima di 0.4. Le condizioni favorevoli si sono allineate.
 
 ✓ Condizioni che hanno guidato la decisione: IV economica; Regime SHORT gamma; Niente pinning forte.
 

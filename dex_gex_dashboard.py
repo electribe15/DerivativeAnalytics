@@ -5152,3 +5152,223 @@ def gex_regime_narrative(spot: float, gamma_flip, regime: str,
         parts.append("Nessun gamma flip netto individuato: il mercato è interamente "
                      "in un solo regime sugli strike vicini al prezzo.")
     return " ".join(parts)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Premium / IV snapshot history — "specchietto premi" (premi + vol per scadenza)
+# ══════════════════════════════════════════════════════════════════════════════
+PREMIUM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'premium_history')
+
+PREMIUM_MAX_MONTHS  = 6       # salva solo scadenze entro ~6 mesi
+PREMIUM_BAND_DOWN   = 0.25    # salva strike da -25% dallo spot (copre skew ribassista)
+PREMIUM_BAND_UP     = 0.15    # ... a +15% sopra lo spot
+
+
+def _premium_csv_for(day: str) -> str:
+    """One CSV per day keeps each snapshot small and the date-picker simple:
+    the set of available comparison dates is just the set of files present."""
+    return os.path.join(PREMIUM_DIR, f'premium_{day}.csv')
+
+
+def save_premium_snapshot(raw_df: pd.DataFrame, spot: float,
+                          atm_iv: float = None) -> str:
+    """Persist today's premium + IV grid for SPX: for each expiry within
+    PREMIUM_MAX_MONTHS, the strikes within ±PREMIUM_SD_RANGE standard
+    deviations of spot, with mid premium and implied vol for both call and
+    put. One row per (expiry, strike). Written as a dated CSV so the compare
+    date-picker only ever offers days that actually have data.
+
+    Robust by design: any failure returns '' and the caller carries on — a
+    missing premium snapshot must never break the daily run.
+    """
+    try:
+        if raw_df is None or raw_df.empty or not spot:
+            return ''
+        df = raw_df.copy()
+        # mid price (fallback to lastPrice if bid/ask missing)
+        if 'mid' not in df.columns:
+            if 'bid' in df.columns and 'ask' in df.columns:
+                df['mid'] = (df['bid'].fillna(0) + df['ask'].fillna(0)) / 2.0
+                # where mid is 0/NaN, fall back to lastPrice
+                _bad = (df['mid'].isna()) | (df['mid'] <= 0)
+                if 'lastPrice' in df.columns:
+                    df.loc[_bad, 'mid'] = df.loc[_bad, 'lastPrice']
+            elif 'lastPrice' in df.columns:
+                df['mid'] = df['lastPrice']
+            else:
+                return ''
+
+        # T_days per expiry (add if missing)
+        if 'T_days' not in df.columns:
+            _today = pd.Timestamp(date.today())
+            df['T_days'] = (pd.to_datetime(df['expiry']) - _today).dt.days
+
+        # keep expiries within the horizon window
+        max_days = int(PREMIUM_MAX_MONTHS * 30.4)
+        df = df[(df['T_days'] > 0) & (df['T_days'] <= max_days)]
+        if df.empty:
+            return ''
+
+        rows = []
+        # fixed percentage band around spot (covers the downside skew wider)
+        lo = spot * (1.0 - PREMIUM_BAND_DOWN)
+        hi = spot * (1.0 + PREMIUM_BAND_UP)
+        for expiry, grp in df.groupby('expiry'):
+            T_days = float(grp['T_days'].iloc[0])
+            band = grp[(grp['strike'] >= lo) & (grp['strike'] <= hi)]
+            if band.empty:
+                continue
+            for strike, sgrp in band.groupby('strike'):
+                calls = sgrp[sgrp['optionType'] == 'call']
+                puts  = sgrp[sgrp['optionType'] == 'put']
+                row = {
+                    'expiry': expiry, 'T_days': round(T_days, 1),
+                    'strike': float(strike),
+                    'call_mid': round(float(calls['mid'].iloc[0]), 2) if not calls.empty else None,
+                    'call_iv':  round(float(calls['impliedVolatility'].iloc[0]), 4) if not calls.empty and pd.notna(calls['impliedVolatility'].iloc[0]) else None,
+                    'put_mid':  round(float(puts['mid'].iloc[0]), 2) if not puts.empty else None,
+                    'put_iv':   round(float(puts['impliedVolatility'].iloc[0]), 4) if not puts.empty and pd.notna(puts['impliedVolatility'].iloc[0]) else None,
+                }
+                rows.append(row)
+
+        if not rows:
+            return ''
+        out = pd.DataFrame(rows)
+        out.insert(0, 'spot', round(spot, 2))
+        out.insert(0, 'date', date.today().isoformat())
+        os.makedirs(PREMIUM_DIR, exist_ok=True)
+        path = _premium_csv_for(date.today().isoformat())
+        out.to_csv(path, index=False)
+        return path
+    except Exception:
+        return ''
+
+
+def list_premium_dates() -> list:
+    """Return the sorted list of dates that have a saved premium snapshot —
+    exactly the days the compare date-picker should offer."""
+    if not os.path.isdir(PREMIUM_DIR):
+        return []
+    days = []
+    for fn in os.listdir(PREMIUM_DIR):
+        if fn.startswith('premium_') and fn.endswith('.csv'):
+            days.append(fn[len('premium_'):-len('.csv')])
+    return sorted(days)
+
+
+def load_premium_snapshot(day: str) -> pd.DataFrame:
+    """Load one day's premium/IV grid (empty DataFrame if absent)."""
+    path = _premium_csv_for(day)
+    if os.path.exists(path):
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=['date', 'spot', 'expiry', 'T_days', 'strike',
+                                 'call_mid', 'call_iv', 'put_mid', 'put_iv'])
+
+
+def build_premium_comparison(day_today: str, day_ref: str) -> pd.DataFrame:
+    """Join two snapshots (today vs a chosen reference date) on (expiry, strike)
+    and compute the deltas — the heart of the specchietto: for each cell, the
+    premium and IV now vs then, and whether they rose or fell.
+
+    Returns a tidy DataFrame ready to display, sorted by expiry then strike.
+    Only rows present in BOTH snapshots are kept (so a change can be computed).
+    """
+    a = load_premium_snapshot(day_today)
+    b = load_premium_snapshot(day_ref)
+    if a.empty or b.empty:
+        return pd.DataFrame()
+    keys = ['expiry', 'strike']
+    cols = ['call_mid', 'call_iv', 'put_mid', 'put_iv']
+    merged = a.merge(b[keys + cols], on=keys, suffixes=('', '_ref'), how='inner')
+    if merged.empty:
+        return merged
+    for c in cols:
+        merged[f'{c}_chg'] = merged[c] - merged[f'{c}_ref']
+    merged = merged.sort_values(['T_days', 'strike']).reset_index(drop=True)
+    return merged
+
+
+def sunny_money_chart(snapshot_df: pd.DataFrame, expiry: str, mode: str,
+                      compare_df: pd.DataFrame = None, spot: float = None,
+                      highlight_strikes: list = None):
+    """Sunny-Money-style bar chart: one bar per strike for a single expiry.
+
+    mode:
+      'vol_call' / 'vol_put'   — implied vol per strike (the skew/smile)
+      'prem_call' / 'prem_put' — premium per strike
+      'diff_vol_call' / 'diff_vol_put'   — IV change vs compare_df (yellow bars)
+      'diff_prem_call' / 'diff_prem_put' — premium % change vs compare_df
+
+    compare_df is required only for the 'diff_*' modes. highlight_strikes are
+    drawn red/green (like the coloured bars in Sunny Money) to mark levels of
+    interest. Mirrors the reference tool's four view modes.
+    """
+    import plotly.graph_objects as go
+    sub = snapshot_df[snapshot_df['expiry'] == expiry].copy().sort_values('strike')
+    if sub.empty:
+        return empty_fig("Nessun dato per questa scadenza")
+
+    is_diff = mode.startswith('diff_')
+    is_vol = 'vol' in mode
+    is_call = mode.endswith('_call')
+    side = 'call' if is_call else 'put'
+
+    # Build y-values per mode
+    if not is_diff:
+        col = f'{side}_iv' if is_vol else f'{side}_mid'
+        y = sub[col].astype(float)
+        if is_vol:
+            y = y * 100.0            # IV in %
+        ylab = 'Volatilità implicita (%)' if is_vol else 'Premio (punti)'
+        bar_color = ACCENT_YLW if is_vol else ('#3B82F6' if is_call else '#8B5CF6')
+    else:
+        if compare_df is None or compare_df.empty:
+            return empty_fig("Serve una data di confronto")
+        merged = sub.merge(
+            compare_df[compare_df['expiry'] == expiry][['strike', f'{side}_iv', f'{side}_mid']],
+            on='strike', suffixes=('', '_ref'), how='inner').sort_values('strike')
+        if merged.empty:
+            return empty_fig("Nessuno strike in comune con la data di confronto")
+        sub = merged
+        if is_vol:
+            y = (merged[f'{side}_iv'].astype(float) - merged[f'{side}_iv_ref'].astype(float)) * 100.0
+            ylab = 'Δ Volatilità (punti %)'
+        else:
+            base = merged[f'{side}_mid_ref'].astype(float).replace(0, np.nan)
+            y = (merged[f'{side}_mid'].astype(float) - merged[f'{side}_mid_ref'].astype(float)) / base * 100.0
+            ylab = 'Δ Premio (%)'
+        bar_color = '#EAB308'       # Sunny-Money yellow for differentials
+
+    strikes = sub['strike'].astype(float).tolist()
+    yv = y.tolist()
+
+    # Per-bar colours: highlights override, else base colour
+    hl = set(highlight_strikes or [])
+    colors = []
+    for i, k in enumerate(strikes):
+        if k in hl:
+            colors.append(ACCENT_GRN)
+        else:
+            colors.append(bar_color)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=strikes, y=yv, marker_color=colors,
+                         text=[f"{v:.2f}" if abs(v) >= 0.01 else "" for v in yv],
+                         textposition='outside', textfont=dict(size=8),
+                         name=ylab))
+    if spot:
+        fig.add_vline(x=spot, line_color='#111827', line_dash='dash',
+                      annotation_text=f' spot {spot:.0f}', annotation_font_size=9)
+    _mode_names = {
+        'vol_call': 'Volatilità CALL', 'vol_put': 'Volatilità PUT',
+        'prem_call': 'Premi CALL', 'prem_put': 'Premi PUT',
+        'diff_vol_call': 'Diff. Vol CALL', 'diff_vol_put': 'Diff. Vol PUT',
+        'diff_prem_call': 'Diff. Premi CALL', 'diff_prem_put': 'Diff. Premi PUT',
+    }
+    layout = base_layout(f"{_mode_names.get(mode, mode)} — {expiry}")
+    layout.update(yaxis_title=ylab, xaxis_title='Strike', showlegend=False)
+    fig.update_layout(**layout)
+    return fig

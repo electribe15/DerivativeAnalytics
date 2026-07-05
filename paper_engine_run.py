@@ -85,9 +85,18 @@ def main() -> int:
     # GEX/DEX derived-metrics history (Net GEX, flip, regime, HHI, P/C)
     try:
         dg.save_gex_metrics_snapshot(raw, by_strike, spot)
-        log("GEX metrics history updated")
     except Exception as e:
-        log(f"GEX metrics history save failed (non-fatal): {e}")
+        log(f"GEX metrics snapshot failed (non-fatal): {e}")
+
+    # Premium/IV snapshot — the "specchietto premi" daily history
+    try:
+        _pp = dg.save_premium_snapshot(raw, spot, atm_iv)
+        if _pp:
+            log(f"Premium snapshot saved: {os.path.basename(_pp)}")
+        else:
+            log("Premium snapshot not saved (no eligible expiries)")
+    except Exception as e:
+        log(f"Premium snapshot failed (non-fatal): {e}")
 
     # ── 3b. VolDex suite — same chain, no extra fetch needed ──────────────────
     voldex = calldex = putdex = taildex = skew_trend = None

@@ -677,7 +677,7 @@ dte0_metrics = compute_0dte_metrics(raw_full, spot)
 has_0dte     = bool(dte0_metrics)
 
 # ── Tabs — 0DTE is always first and shown by default ─────────────────────────
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     "⚡ 0DTE",
     "📊 GEX / DEX",
     "📐 Range & Skew",
@@ -688,6 +688,7 @@ tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "🤖 Long Vol Strat",
     "🌊 VolDex",
     "📉 Short Vol Strat",
+    "💵 Specchietto Premi",
 ])
 
 # ── Tab 0: 0DTE ───────────────────────────────────────────────────────────────
@@ -2131,6 +2132,19 @@ with tab9:
                                  else 'red' if _term_state_sv == 'backwardation' else 'grey')},
             ], per_row=5)
 
+            # Next macro event card (FOMC/CPI/NFP from official 2026 calendar)
+            _nev = sv.next_macro_event()
+            if _nev:
+                _ev_block = _nev['days'] <= sv.EVENT_BLOCK_DAYS_BEFORE
+                _when_txt = 'oggi' if _nev['days'] == 0 else f"tra {_nev['days']}g"
+                cards([
+                    {'label': 'Prossimo evento macro',
+                     'value': f"{_nev['label']} {_when_txt}",
+                     'delta': (f"⛔ blocca vendite ({_nev['date']})" if _ev_block
+                               else f"libero ({_nev['date']})"),
+                     'delta_color': 'red' if _ev_block else 'green'},
+                ], per_row=1)
+
             st.markdown(_dec_sv.summary_html, unsafe_allow_html=True)
 
             if _dec_sv.action == 'TRADE' and _dec_sv.legs:
@@ -2211,6 +2225,125 @@ with tab9:
             "periodo che includa almeno un episodio di stress: è lì che si vede se "
             "le strutture a rischio definito proteggono davvero. Non confrontare i "
             "P&L dei due sistemi su periodi troppo brevi.")
+
+
+# ── Tab 10: Specchietto Premi (premi + vol per scadenza, confronto storico) ────
+with tab10:
+    import dex_gex_dashboard as dg
+    st.markdown("### 💵 Specchietto Premi — stile Sunny Money")
+    st.caption("Volatilità e premi (call/put) per strike, quattro scadenze insieme. "
+               "Modalità differenziale per confrontare con una data storica: serve a "
+               "capire se stai per comprare qualcosa già caro o vendere qualcosa già "
+               "sottoprezzato.")
+
+    _prem_dates = dg.list_premium_dates()
+
+    if not _prem_dates:
+        st.info("📭 Nessuno snapshot premi ancora salvato. Lo storico si costruisce "
+                "in avanti: il motore serale (o lo snapshot automatico) salva ogni "
+                "giorno i premi/volatilità di SPX (strike da −25% a +15% dallo spot, "
+                "scadenze entro ~6 mesi). Torna tra qualche giorno.")
+    else:
+        _day_today = _prem_dates[-1]
+        _snap = dg.load_premium_snapshot(_day_today)
+        if _snap.empty:
+            st.warning("Snapshot di oggi vuoto.")
+        else:
+            _spot_now = float(_snap['spot'].iloc[0]) if 'spot' in _snap.columns else None
+
+            # ── Control bar (stile Sunny Money) ───────────────────────────
+            st.markdown(f"**📅 Oggi:** `{_day_today}`" +
+                        (f"  ·  **Spot SPX:** `{_spot_now:.2f}`" if _spot_now else "") +
+                        f"  ·  **Snapshot disponibili:** {len(_prem_dates)}")
+
+            _r1 = st.columns([1.3, 1, 1, 1, 1.2])
+            with _r1[0]:
+                _mode_view = st.selectbox(
+                    "Modalità",
+                    ['Volatilità', 'Premi', 'Differenziale Vol', 'Differenza Premi'],
+                    key="sm_mode")
+            with _r1[1]:
+                _side_view = st.selectbox("Lato", ['Call', 'Put'], key="sm_side")
+
+            # strike range controls (default = full saved range)
+            _all_strikes = sorted(_snap['strike'].unique())
+            _k_min, _k_max = float(_all_strikes[0]), float(_all_strikes[-1])
+            _step_guess = int(_all_strikes[1] - _all_strikes[0]) if len(_all_strikes) > 1 else 50
+            with _r1[2]:
+                _k_start = st.number_input("Strike iniziale", value=int(_k_min),
+                                           step=_step_guess, key="sm_kstart")
+            with _r1[3]:
+                _k_end = st.number_input("Strike finale", value=int(_k_max),
+                                         step=_step_guess, key="sm_kend")
+            with _r1[4]:
+                _k_int = st.number_input("Intervallo strike", value=int(_step_guess),
+                                         min_value=int(_step_guess), step=int(_step_guess),
+                                         key="sm_kint")
+
+            # reference-date picker only for differential modes
+            _is_diff = _mode_view in ('Differenziale Vol', 'Differenza Premi')
+            _cmp_snap = None
+            if _is_diff:
+                _ref_opts = [d for d in _prem_dates if d != _day_today][::-1]
+                if not _ref_opts:
+                    st.warning("Serve almeno un secondo giorno salvato per la modalità "
+                               "differenziale. Per ora è disponibile solo oggi.")
+                else:
+                    _day_ref = st.selectbox("Confronta con data memorizzata:",
+                                            options=_ref_opts, key="sm_refdate")
+                    _cmp_snap = dg.load_premium_snapshot(_day_ref)
+
+            # map UI selection → chart mode string
+            _side_l = 'call' if _side_view == 'Call' else 'put'
+            _mode_map = {
+                'Volatilità': f'vol_{_side_l}',
+                'Premi': f'prem_{_side_l}',
+                'Differenziale Vol': f'diff_vol_{_side_l}',
+                'Differenza Premi': f'diff_prem_{_side_l}',
+            }
+            _chart_mode = _mode_map[_mode_view]
+
+            # apply strike range + interval filter to what we plot
+            def _filter_strikes(df):
+                if df is None or df.empty:
+                    return df
+                d = df[(df['strike'] >= _k_start) & (df['strike'] <= _k_end)].copy()
+                if _k_int > _step_guess:
+                    # keep strikes on the chosen interval grid
+                    d = d[((d['strike'] - _k_start) % _k_int == 0)]
+                return d
+
+            _snap_f = _filter_strikes(_snap)
+            _cmp_f = _filter_strikes(_cmp_snap) if _cmp_snap is not None else None
+
+            if _is_diff and (_cmp_f is None or _cmp_f.empty):
+                st.info("Seleziona una data di confronto valida per vedere i differenziali.")
+            else:
+                # four nearest expiries in a 2×2 grid (like Sunny Money)
+                _exps = sorted(_snap_f['expiry'].unique(),
+                               key=lambda e: _snap_f[_snap_f['expiry']==e]['T_days'].iloc[0])
+                _exps = _exps[:4]
+                if not _exps:
+                    st.warning("Nessuno strike nel range selezionato.")
+                else:
+                    _grid = st.columns(2)
+                    for _i, _exp in enumerate(_exps):
+                        _tdays = int(_snap_f[_snap_f['expiry']==_exp]['T_days'].iloc[0])
+                        with _grid[_i % 2]:
+                            st.markdown(f"**{_exp}** · {_tdays}g"
+                                        + (f" · spot {_spot_now:.0f}" if _spot_now else ""))
+                            try:
+                                _fig = dg.sunny_money_chart(
+                                    _snap_f, _exp, _chart_mode,
+                                    compare_df=_cmp_f, spot=_spot_now)
+                                st.plotly_chart(_fig, use_container_width=True,
+                                                key=f"sm_{_exp}_{_i}")
+                            except Exception as _sme:
+                                st.caption(f"Errore grafico: {_sme}")
+
+        st.info("💡 In modalità differenziale, le barre mostrano quanto vol/premi sono "
+                "cambiati rispetto alla data scelta. Se una struttura che vorresti "
+                "aprire è già molto mossa a tuo sfavore, probabilmente sei in ritardo.")
 
 
 # ── Footer ────────────────────────────────────────────────────────────────────

@@ -2230,7 +2230,7 @@ with tab9:
 # ── Tab 10: Specchietto Premi (premi + vol per scadenza, confronto storico) ────
 with tab10:
     import dex_gex_dashboard as dg
-    st.markdown("### 💵 Specchietto Premi — stile Sunny Money")
+    st.markdown("### 💵 Premiums vs Vol")
     st.caption("Volatilità e premi (call/put) per strike, quattro scadenze insieme. "
                "Modalità differenziale per confrontare con una data storica: serve a "
                "capire se stai per comprare qualcosa già caro o vendere qualcosa già "
@@ -2251,7 +2251,7 @@ with tab10:
         else:
             _spot_now = float(_snap['spot'].iloc[0]) if 'spot' in _snap.columns else None
 
-            # ── Control bar (stile Sunny Money) ───────────────────────────
+            # ── Control bar ───────────────────────────────────────────────
             st.markdown(f"**📅 Oggi:** `{_day_today}`" +
                         (f"  ·  **Spot SPX:** `{_spot_now:.2f}`" if _spot_now else "") +
                         f"  ·  **Snapshot disponibili:** {len(_prem_dates)}")
@@ -2319,7 +2319,7 @@ with tab10:
             if _is_diff and (_cmp_f is None or _cmp_f.empty):
                 st.info("Seleziona una data di confronto valida per vedere i differenziali.")
             else:
-                # four nearest expiries in a 2×2 grid (like Sunny Money)
+                # four nearest expiries in a 2×2 grid
                 _exps = sorted(_snap_f['expiry'].unique(),
                                key=lambda e: _snap_f[_snap_f['expiry']==e]['T_days'].iloc[0])
                 _exps = _exps[:4]
@@ -2333,7 +2333,7 @@ with tab10:
                             st.markdown(f"**{_exp}** · {_tdays}g"
                                         + (f" · spot {_spot_now:.0f}" if _spot_now else ""))
                             try:
-                                _fig = dg.sunny_money_chart(
+                                _fig = dg.premium_bar_chart(
                                     _snap_f, _exp, _chart_mode,
                                     compare_df=_cmp_f, spot=_spot_now)
                                 st.plotly_chart(_fig, use_container_width=True,

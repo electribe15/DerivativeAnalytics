@@ -5291,10 +5291,10 @@ def build_premium_comparison(day_today: str, day_ref: str) -> pd.DataFrame:
     return merged
 
 
-def sunny_money_chart(snapshot_df: pd.DataFrame, expiry: str, mode: str,
+def premium_bar_chart(snapshot_df: pd.DataFrame, expiry: str, mode: str,
                       compare_df: pd.DataFrame = None, spot: float = None,
                       highlight_strikes: list = None):
-    """Sunny-Money-style bar chart: one bar per strike for a single expiry.
+    """Bar chart: one bar per strike for a single expiry.
 
     mode:
       'vol_call' / 'vol_put'   — implied vol per strike (the skew/smile)
@@ -5303,8 +5303,9 @@ def sunny_money_chart(snapshot_df: pd.DataFrame, expiry: str, mode: str,
       'diff_prem_call' / 'diff_prem_put' — premium % change vs compare_df
 
     compare_df is required only for the 'diff_*' modes. highlight_strikes are
-    drawn red/green (like the coloured bars in Sunny Money) to mark levels of
-    interest. Mirrors the reference tool's four view modes.
+    drawn red/green to mark levels of interest. Four view modes: current
+    volatility, current premium, and the differential of each versus a chosen
+    historical date.
     """
     import plotly.graph_objects as go
     sub = snapshot_df[snapshot_df['expiry'] == expiry].copy().sort_values('strike')
@@ -5340,7 +5341,7 @@ def sunny_money_chart(snapshot_df: pd.DataFrame, expiry: str, mode: str,
             base = merged[f'{side}_mid_ref'].astype(float).replace(0, np.nan)
             y = (merged[f'{side}_mid'].astype(float) - merged[f'{side}_mid_ref'].astype(float)) / base * 100.0
             ylab = 'Δ Premio (%)'
-        bar_color = '#EAB308'       # Sunny-Money yellow for differentials
+        bar_color = '#EAB308'       # yellow for differentials
 
     strikes = sub['strike'].astype(float).tolist()
     yv = y.tolist()

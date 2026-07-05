@@ -60,6 +60,20 @@ jobs:
                       print('GEX metrics history updated')
                   except Exception as ge:
                       print(f'GEX metrics history failed: {ge}')
+
+                  # Premium/IV snapshot — specchietto premi daily history
+                  try:
+                      _atm = None
+                      try:
+                          _m0 = dg.compute_0dte_metrics(raw, spot) or {}
+                          _atm = _m0.get('atm_iv')
+                      except Exception:
+                          pass
+                      _pp = dg.save_premium_snapshot(raw, spot, _atm)
+                      print(f'Premium snapshot saved: {_pp}' if _pp
+                            else 'Premium snapshot not saved')
+                  except Exception as pe:
+                      print(f'Premium snapshot failed: {pe}')
               else:
                   print('Chain fetch returned empty — no snapshot saved')
           except Exception as e:
@@ -71,6 +85,6 @@ jobs:
         run: |
           git config user.name  "snapshot-bot"
           git config user.email "actions@github.com"
-          git add snapshots/ voldex_history/ gex_history/ || true
+          git add snapshots/ voldex_history/ gex_history/ premium_history/ || true
           git diff --cached --quiet || git commit -m "snapshot: $(date -u +%F)"
           git push || true

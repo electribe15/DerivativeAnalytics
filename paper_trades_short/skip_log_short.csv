@@ -1,2 +1,3 @@
 date,action,strategy,confidence,skip_category,skip_reason,spot,voldex,credit,max_loss
 2026-07-06,SKIP,,0.27,Conviction bassa,Conviction 0.27 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7537.43,12.48,,
+2026-07-07,SKIP,,0.0,Conviction bassa,Conviction 0.00 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7503.85,12.9,,

@@ -7,3 +7,11 @@ Gambe dell'operazione (su XSP):
 BUY 1x PUT 705 @ 2.13 (~$213)
 
 Strategia scelta perché singola put OTM — la struttura più economica e a rischio definito; esposizione asimmetrica al ribasso, premio contenuto. Scadenza 45 giorni, premio totale 2.13 punti (~$213, 4% del capitale). Perdita massima limitata al premio pagato.","[{""side"": ""BUY"", ""type"": ""PUT"", ""strike"": 705, ""qty"": 1, ""premium_pts"": 2.13, ""premium_usd"": 213.0}]",14.24,11.75,18.83,20.81,-0.64,1.0
+2,2026-07-07,long_vol,long_put,7503.85,750.385,725,45,48.83,3.55,1,0.638,OPEN,,,,,SHORT,1.5386589386484246,0.0018223654847152153,"✅ TRADE: Long Put (tail, OTM). Punteggio di convinzione 0.64, sopra la soglia minima di 0.4. Le condizioni favorevoli si sono allineate.
+
+✓ Condizioni che hanno guidato la decisione: IV economica; Vol Premium basso; Regime SHORT gamma; Niente pinning forte.
+
+Gambe dell'operazione (su XSP):
+BUY 1x PUT 725 @ 3.55 (~$355)
+
+Strategia scelta perché singola put OTM — la struttura più economica e a rischio definito; esposizione asimmetrica al ribasso, premio contenuto. Scadenza 45 giorni, premio totale 3.55 punti (~$355, 7% del capitale). Perdita massima limitata al premio pagato.","[{""side"": ""BUY"", ""type"": ""PUT"", ""strike"": 725, ""qty"": 1, ""premium_pts"": 3.55, ""premium_usd"": 355.0}]",12.9,10.75,17.42,19.46,-0.26,1.0

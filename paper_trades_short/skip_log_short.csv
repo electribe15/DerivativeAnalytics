@@ -2,3 +2,4 @@ date,action,strategy,confidence,skip_category,skip_reason,spot,voldex,credit,max
 2026-07-06,SKIP,,0.27,Conviction bassa,Conviction 0.27 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7537.43,12.48,,
 2026-07-07,SKIP,,0.0,Conviction bassa,Conviction 0.00 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7503.85,12.9,,
 2026-07-08,SKIP,,0.0,Stress in arrivo (skew),"Skew in forte espansione (+1.67pt) — stress in arrivo, vendere vol ora è pericoloso",7482.71,13.68,,
+2026-07-09,SKIP,,0.37,Conviction bassa,Conviction 0.37 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7543.64,12.54,,

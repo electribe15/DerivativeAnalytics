@@ -87,27 +87,33 @@ div[data-baseweb="tab-list"] {
     border-bottom: none; gap: 2px;
     box-shadow: 0 1px 4px rgba(0,0,0,0.06);
 }
-/* Unselected tabs: grey text. Broad selectors so the rule survives Streamlit
-   DOM changes — target the tab button and every descendant text node. */
-div[data-baseweb="tab-list"] button[data-baseweb="tab"] {
+/* Every tab button + all descendants: dark grey, unless selected.
+   Uses the widest possible selectors to survive Streamlit DOM changes. */
+.stTabs [role="tab"],
+.stTabs [role="tab"] *,
+div[data-baseweb="tab-list"] [role="tab"],
+div[data-baseweb="tab-list"] [role="tab"] * {
+    color: #374151 !important;
+    -webkit-text-fill-color: #374151 !important;
     font-family: 'Inter', sans-serif !important;
-    font-size: 13px !important; font-weight: 500; border-radius: 7px; padding: 6px 14px;
+    font-weight: 500 !important;
 }
-div[data-baseweb="tab-list"] button[data-baseweb="tab"],
-div[data-baseweb="tab-list"] button[data-baseweb="tab"] *,
-div[data-baseweb="tab-list"] button[aria-selected="false"],
-div[data-baseweb="tab-list"] button[aria-selected="false"] * {
-    color: #374151 !important; -webkit-text-fill-color: #374151 !important;
+.stTabs [role="tab"] {
+    font-size: 13px !important; border-radius: 7px !important; padding: 6px 14px !important;
 }
-/* Selected tab: white text on the purple gradient. */
-div[data-baseweb="tab-list"] button[data-baseweb="tab"][aria-selected="true"] {
+/* Selected tab: purple gradient background, white text. */
+.stTabs [role="tab"][aria-selected="true"],
+div[data-baseweb="tab-list"] [role="tab"][aria-selected="true"] {
     background: linear-gradient(135deg, #6C63FF 0%, #8B5CF6 100%) !important;
     border: none !important;
     box-shadow: 0 2px 8px rgba(108,99,255,0.4);
 }
-div[data-baseweb="tab-list"] button[aria-selected="true"],
-div[data-baseweb="tab-list"] button[aria-selected="true"] * {
-    color: #FFFFFF !important; -webkit-text-fill-color: #FFFFFF !important;
+.stTabs [role="tab"][aria-selected="true"],
+.stTabs [role="tab"][aria-selected="true"] *,
+div[data-baseweb="tab-list"] [role="tab"][aria-selected="true"],
+div[data-baseweb="tab-list"] [role="tab"][aria-selected="true"] * {
+    color: #FFFFFF !important;
+    -webkit-text-fill-color: #FFFFFF !important;
 }
 
 /* ── Typography ──────────────────────────────────────── */
@@ -463,7 +469,9 @@ with st.sidebar:
         value=st.session_state.get("_ar_enabled", False),
         key="_ar_toggle",
         help="Aggiorna le barre intraday e il prezzo automaticamente ogni 20 minuti, "
-             "senza ri-scaricare il chain delle opzioni.",
+             "senza ri-scaricare il chain delle opzioni. NOTA: a ogni aggiornamento "
+             "la pagina si ricarica e torna alla prima tab — tienilo spento se stai "
+             "lavorando su una tab specifica.",
     )
     st.session_state["_ar_enabled"] = _ar_on
 
@@ -2354,21 +2362,25 @@ with tab10:
                                             key="pv_refdate")
                     _cmp_snap = dg.load_premium_snapshot(_day_ref)
 
-            # ── Row 2: compact strike filters (always visible) ────────────
+            # ── Row 2: strike filters (always visible, with titles) ───────
+            st.markdown("**⚙️ Filtri strike**")
             _all_strikes = sorted(_snap['strike'].unique())
             _k_min, _k_max = int(_all_strikes[0]), int(_all_strikes[-1])
             _step_guess = int(_all_strikes[1] - _all_strikes[0]) if len(_all_strikes) > 1 else 50
             _f1, _f2, _f3 = st.columns(3)
             with _f1:
-                _k_start = st.number_input("Strike da", value=_k_min,
-                                           step=_step_guess, key="pv_kstart")
+                _k_start = st.number_input("Strike iniziale", value=_k_min,
+                                           step=_step_guess, key="pv_kstart",
+                                           help="Primo strike da mostrare")
             with _f2:
-                _k_end = st.number_input("Strike a", value=_k_max,
-                                         step=_step_guess, key="pv_kend")
+                _k_end = st.number_input("Strike finale", value=_k_max,
+                                         step=_step_guess, key="pv_kend",
+                                         help="Ultimo strike da mostrare")
             with _f3:
-                _k_int = st.number_input("Intervallo", value=_step_guess,
+                _k_int = st.number_input("Intervallo strike", value=_step_guess,
                                          min_value=_step_guess, step=_step_guess,
-                                         key="pv_kint")
+                                         key="pv_kint",
+                                         help="Passo tra uno strike e l'altro")
 
             _side_l = 'call' if _side_view == 'Call' else 'put'
             _chart_mode = {'Volatilità': f'vol_{_side_l}', 'Premi': f'prem_{_side_l}',

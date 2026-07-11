@@ -5359,6 +5359,7 @@ def premium_bar_chart(snapshot_df: pd.DataFrame, expiry: str, mode: str,
     fig.add_trace(go.Bar(x=strikes, y=yv, marker_color=colors,
                          text=[f"{v:.2f}" if abs(v) >= 0.01 else "" for v in yv],
                          textposition='outside', textfont=dict(size=8),
+                         cliponaxis=False,
                          name=ylab))
     if spot:
         fig.add_vline(x=spot, line_color='#111827', line_dash='dash',
@@ -5372,6 +5373,16 @@ def premium_bar_chart(snapshot_df: pd.DataFrame, expiry: str, mode: str,
     layout = base_layout(f"{_mode_names.get(mode, mode)} — {expiry}")
     layout.update(yaxis_title=ylab, xaxis_title='Strike', showlegend=False)
     fig.update_layout(**layout)
+
+    # Explicit Y range with headroom so the outside labels are never clipped
+    _yvals = [v for v in yv if v is not None and np.isfinite(v)]
+    if _yvals:
+        _ymin, _ymax = min(_yvals), max(_yvals)
+        _pad = max((_ymax - _ymin) * 0.15, abs(_ymax) * 0.12, 0.5)
+        if _ymin >= 0:
+            fig.update_yaxes(range=[0, _ymax + _pad])          # premi/vol: parte da 0
+        else:
+            fig.update_yaxes(range=[_ymin - _pad, _ymax + _pad])  # differenziali: attorno a 0
     return fig
 
 

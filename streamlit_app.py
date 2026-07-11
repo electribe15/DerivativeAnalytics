@@ -87,14 +87,27 @@ div[data-baseweb="tab-list"] {
     border-bottom: none; gap: 2px;
     box-shadow: 0 1px 4px rgba(0,0,0,0.06);
 }
-button[data-baseweb="tab"] {
-    color: #6B7280 !important; font-family: 'Inter', sans-serif !important;
+/* Unselected tabs: grey text. Broad selectors so the rule survives Streamlit
+   DOM changes — target the tab button and every descendant text node. */
+div[data-baseweb="tab-list"] button[data-baseweb="tab"] {
+    font-family: 'Inter', sans-serif !important;
     font-size: 13px !important; font-weight: 500; border-radius: 7px; padding: 6px 14px;
 }
-button[data-baseweb="tab"][aria-selected="true"] {
+div[data-baseweb="tab-list"] button[data-baseweb="tab"],
+div[data-baseweb="tab-list"] button[data-baseweb="tab"] *,
+div[data-baseweb="tab-list"] button[aria-selected="false"],
+div[data-baseweb="tab-list"] button[aria-selected="false"] * {
+    color: #374151 !important; -webkit-text-fill-color: #374151 !important;
+}
+/* Selected tab: white text on the purple gradient. */
+div[data-baseweb="tab-list"] button[data-baseweb="tab"][aria-selected="true"] {
     background: linear-gradient(135deg, #6C63FF 0%, #8B5CF6 100%) !important;
-    color: #FFFFFF !important; border: none !important;
+    border: none !important;
     box-shadow: 0 2px 8px rgba(108,99,255,0.4);
+}
+div[data-baseweb="tab-list"] button[aria-selected="true"],
+div[data-baseweb="tab-list"] button[aria-selected="true"] * {
+    color: #FFFFFF !important; -webkit-text-fill-color: #FFFFFF !important;
 }
 
 /* ── Typography ──────────────────────────────────────── */
@@ -168,6 +181,9 @@ try:
         generate_morning_brief,
         fetch_price_history,
         fetch_intraday_history,
+        compute_value_area,
+        value_area_position,
+        value_area_chart,
         fetch_ohlc_history,
         fetch_vix_history,
         compute_rvol_all,
@@ -1196,6 +1212,62 @@ with tab4:
                         use_container_width=True)
     except Exception as e:
         st.plotly_chart(empty_fig(str(e)), use_container_width=True)
+
+    # ── Market Profile / Value Area (VA-80) ───────────────────────────────
+    st.markdown("---")
+    st.markdown("#### 📊 Market Profile / Value Area (VA-80)")
+    st.caption("La value area contiene l'80% del volume della sessione. POC = "
+               "livello più scambiato. Il rapporto tra prezzo e VA definisce il "
+               "bias direzionale (usato dal Ralendar).")
+    if intraday is None or (hasattr(intraday, 'empty') and intraday.empty):
+        st.info("Dati intraday non disponibili — la value area richiede le barre "
+                "intraday (Yahoo). Riprova a mercato aperto o ricarica.")
+    else:
+        try:
+            _va = compute_value_area(intraday)
+            if _va.get('va_high') is None:
+                st.info("Value area non calcolabile con i dati intraday attuali.")
+            else:
+                _vp = value_area_position(spot, _va)
+                _zone_label = {
+                    'above_va': '🔴 Sopra la Value Area', 'upper_va': '🟠 Bordo alto VA',
+                    'inside_va': '🔵 Dentro la Value Area', 'lower_va': '🟢 Bordo basso VA',
+                    'below_va': '🟢 Sotto la Value Area',
+                }.get(_vp['zone'], '—')
+                _bias_label = {
+                    'delta_negativo': 'bias delta NEGATIVO',
+                    'delta_positivo': 'bias delta POSITIVO',
+                    'neutro': 'nessun bias direzionale',
+                }.get(_vp['bias_hint'], '—')
+                cards([
+                    {'label': 'POC', 'value': f"{_va['poc']:.0f}"},
+                    {'label': 'VA-High (VA-80)', 'value': f"{_va['va_high']:.0f}"},
+                    {'label': 'VA-Low', 'value': f"{_va['va_low']:.0f}"},
+                    {'label': 'Copertura', 'value': f"{_va['va_pct']*100:.0f}%"},
+                    {'label': 'Metodo', 'value': _va['method'].upper()},
+                ], per_row=5)
+                _cvl, _cvr = st.columns([2, 1])
+                with _cvl:
+                    st.plotly_chart(value_area_chart(_va, spot, cur_tick),
+                                    use_container_width=True)
+                with _cvr:
+                    _bias_color = ('#FEE2E2' if 'negativo' in _vp['bias_hint']
+                                   else '#DCFCE7' if 'positivo' in _vp['bias_hint']
+                                   else '#F3F4F6')
+                    _bias_txt = ('#991B1B' if 'negativo' in _vp['bias_hint']
+                                 else '#166534' if 'positivo' in _vp['bias_hint']
+                                 else '#374151')
+                    st.markdown(
+                        f'<div style="background:{_bias_color};border-radius:10px;'
+                        f'padding:14px 16px;margin-top:8px;">'
+                        f'<div style="color:{_bias_txt};font-size:13px;font-weight:700;'
+                        f'margin-bottom:6px;">{_zone_label}</div>'
+                        f'<div style="color:{_bias_txt};font-size:12px;line-height:1.5;">'
+                        f'Spot {spot:.0f} · {_bias_label}.<br>'
+                        f'Distanza dal POC: {_vp["distance_pct"]:+.2f}%</div></div>',
+                        unsafe_allow_html=True)
+        except Exception as e:
+            st.caption(f"Errore value area: {e}")
 
 # ── Tab 5: Open Interest ──────────────────────────────────────────────────────
 with tab5:
@@ -2231,10 +2303,9 @@ with tab9:
 with tab10:
     import dex_gex_dashboard as dg
     st.markdown("### 💵 Premiums vs Vol")
-    st.caption("Volatilità e premi (call/put) per strike, quattro scadenze insieme. "
-               "Modalità differenziale per confrontare con una data storica: serve a "
-               "capire se stai per comprare qualcosa già caro o vendere qualcosa già "
-               "sottoprezzato.")
+    st.caption("Volatilità e premi (call/put) per strike, una scadenza alla volta. "
+               "Le modalità differenziali confrontano con una data storica: servono a "
+               "capire se stai per comprare caro o vendere sottoprezzato.")
 
     _prem_dates = dg.list_premium_dates()
 
@@ -2250,100 +2321,91 @@ with tab10:
             st.warning("Snapshot di oggi vuoto.")
         else:
             _spot_now = float(_snap['spot'].iloc[0]) if 'spot' in _snap.columns else None
+            st.markdown(f"**📅 Oggi:** `{_day_today}`"
+                        + (f"  ·  **Spot:** `{_spot_now:.0f}`" if _spot_now else "")
+                        + f"  ·  **Snapshot:** {len(_prem_dates)}")
 
-            # ── Control bar ───────────────────────────────────────────────
-            st.markdown(f"**📅 Oggi:** `{_day_today}`" +
-                        (f"  ·  **Spot SPX:** `{_spot_now:.2f}`" if _spot_now else "") +
-                        f"  ·  **Snapshot disponibili:** {len(_prem_dates)}")
-
-            _r1 = st.columns([1.3, 1, 1, 1, 1.2])
-            with _r1[0]:
-                _mode_view = st.selectbox(
-                    "Modalità",
+            # ── Row 1: expiry + mode + side (the essentials) ──────────────
+            _exps_all = sorted(_snap['expiry'].unique(),
+                               key=lambda e: _snap[_snap['expiry']==e]['T_days'].iloc[0])
+            _exp_lab = {e: f"{e}  ({int(_snap[_snap['expiry']==e]['T_days'].iloc[0])}g)"
+                        for e in _exps_all}
+            _c1, _c2, _c3 = st.columns([1.4, 1.4, 0.9])
+            with _c1:
+                _sel_exp = st.selectbox("Scadenza", options=_exps_all,
+                                        format_func=lambda e: _exp_lab[e], key="pv_exp")
+            with _c2:
+                _mode_view = st.selectbox("Modalità",
                     ['Volatilità', 'Premi', 'Differenziale Vol', 'Differenza Premi'],
-                    key="sm_mode")
-            with _r1[1]:
-                _side_view = st.selectbox("Lato", ['Call', 'Put'], key="sm_side")
+                    key="pv_mode")
+            with _c3:
+                _side_view = st.selectbox("Lato", ['Call', 'Put'], key="pv_side")
 
-            # strike range controls (default = full saved range)
-            _all_strikes = sorted(_snap['strike'].unique())
-            _k_min, _k_max = float(_all_strikes[0]), float(_all_strikes[-1])
-            _step_guess = int(_all_strikes[1] - _all_strikes[0]) if len(_all_strikes) > 1 else 50
-            with _r1[2]:
-                _k_start = st.number_input("Strike iniziale", value=int(_k_min),
-                                           step=_step_guess, key="sm_kstart")
-            with _r1[3]:
-                _k_end = st.number_input("Strike finale", value=int(_k_max),
-                                         step=_step_guess, key="sm_kend")
-            with _r1[4]:
-                _k_int = st.number_input("Intervallo strike", value=int(_step_guess),
-                                         min_value=int(_step_guess), step=int(_step_guess),
-                                         key="sm_kint")
-
-            # reference-date picker only for differential modes
+            # ── Reference date (only for differential modes) ──────────────
             _is_diff = _mode_view in ('Differenziale Vol', 'Differenza Premi')
             _cmp_snap = None
             if _is_diff:
                 _ref_opts = [d for d in _prem_dates if d != _day_today][::-1]
                 if not _ref_opts:
                     st.warning("Serve almeno un secondo giorno salvato per la modalità "
-                               "differenziale. Per ora è disponibile solo oggi.")
+                               "differenziale.")
                 else:
-                    _day_ref = st.selectbox("Confronta con data memorizzata:",
-                                            options=_ref_opts, key="sm_refdate")
+                    _day_ref = st.selectbox("📅 Confronta con:", options=_ref_opts,
+                                            key="pv_refdate")
                     _cmp_snap = dg.load_premium_snapshot(_day_ref)
 
-            # map UI selection → chart mode string
-            _side_l = 'call' if _side_view == 'Call' else 'put'
-            _mode_map = {
-                'Volatilità': f'vol_{_side_l}',
-                'Premi': f'prem_{_side_l}',
-                'Differenziale Vol': f'diff_vol_{_side_l}',
-                'Differenza Premi': f'diff_prem_{_side_l}',
-            }
-            _chart_mode = _mode_map[_mode_view]
+            # ── Row 2: compact strike filters (always visible) ────────────
+            _all_strikes = sorted(_snap['strike'].unique())
+            _k_min, _k_max = int(_all_strikes[0]), int(_all_strikes[-1])
+            _step_guess = int(_all_strikes[1] - _all_strikes[0]) if len(_all_strikes) > 1 else 50
+            _f1, _f2, _f3 = st.columns(3)
+            with _f1:
+                _k_start = st.number_input("Strike da", value=_k_min,
+                                           step=_step_guess, key="pv_kstart")
+            with _f2:
+                _k_end = st.number_input("Strike a", value=_k_max,
+                                         step=_step_guess, key="pv_kend")
+            with _f3:
+                _k_int = st.number_input("Intervallo", value=_step_guess,
+                                         min_value=_step_guess, step=_step_guess,
+                                         key="pv_kint")
 
-            # apply strike range + interval filter to what we plot
+            _side_l = 'call' if _side_view == 'Call' else 'put'
+            _chart_mode = {'Volatilità': f'vol_{_side_l}', 'Premi': f'prem_{_side_l}',
+                           'Differenziale Vol': f'diff_vol_{_side_l}',
+                           'Differenza Premi': f'diff_prem_{_side_l}'}[_mode_view]
+
             def _filter_strikes(df):
                 if df is None or df.empty:
                     return df
                 d = df[(df['strike'] >= _k_start) & (df['strike'] <= _k_end)].copy()
                 if _k_int > _step_guess:
-                    # keep strikes on the chosen interval grid
                     d = d[((d['strike'] - _k_start) % _k_int == 0)]
                 return d
 
             _snap_f = _filter_strikes(_snap)
             _cmp_f = _filter_strikes(_cmp_snap) if _cmp_snap is not None else None
 
+            # ── One big chart for the selected expiry ─────────────────────
             if _is_diff and (_cmp_f is None or _cmp_f.empty):
-                st.info("Seleziona una data di confronto valida per vedere i differenziali.")
+                st.info("Seleziona una data di confronto valida per i differenziali.")
             else:
-                # four nearest expiries in a 2×2 grid
-                _exps = sorted(_snap_f['expiry'].unique(),
-                               key=lambda e: _snap_f[_snap_f['expiry']==e]['T_days'].iloc[0])
-                _exps = _exps[:4]
-                if not _exps:
-                    st.warning("Nessuno strike nel range selezionato.")
-                else:
-                    _grid = st.columns(2)
-                    for _i, _exp in enumerate(_exps):
-                        _tdays = int(_snap_f[_snap_f['expiry']==_exp]['T_days'].iloc[0])
-                        with _grid[_i % 2]:
-                            st.markdown(f"**{_exp}** · {_tdays}g"
-                                        + (f" · spot {_spot_now:.0f}" if _spot_now else ""))
-                            try:
-                                _fig = dg.premium_bar_chart(
-                                    _snap_f, _exp, _chart_mode,
-                                    compare_df=_cmp_f, spot=_spot_now)
-                                st.plotly_chart(_fig, use_container_width=True,
-                                                key=f"sm_{_exp}_{_i}")
-                            except Exception as _sme:
-                                st.caption(f"Errore grafico: {_sme}")
+                _msub = _snap_f[_snap_f['expiry']==_sel_exp]
+                _tdays = int(_msub['T_days'].iloc[0]) if not _msub.empty else 0
+                st.markdown(f"#### {_sel_exp} · {_tdays}g · {_mode_view} {_side_view}"
+                            + (f"  ·  spot {_spot_now:.0f}" if _spot_now else ""))
+                try:
+                    _fig = dg.premium_bar_chart(_snap_f, _sel_exp, _chart_mode,
+                                                compare_df=_cmp_f, spot=_spot_now)
+                    _fig.update_layout(height=460)
+                    st.plotly_chart(_fig, use_container_width=True, key="pv_main")
+                except Exception as _e:
+                    st.caption(f"Errore grafico: {_e}")
 
-        st.info("💡 In modalità differenziale, le barre mostrano quanto vol/premi sono "
-                "cambiati rispetto alla data scelta. Se una struttura che vorresti "
-                "aprire è già molto mossa a tuo sfavore, probabilmente sei in ritardo.")
+                if _is_diff:
+                    st.caption("💡 Le barre mostrano quanto vol/premi sono cambiati "
+                               f"rispetto al {_day_ref}. Se ciò che vorresti aprire è "
+                               "già molto mosso a sfavore, forse sei in ritardo.")
 
 
 # ── Footer ────────────────────────────────────────────────────────────────────

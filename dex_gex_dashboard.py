@@ -5373,3 +5373,149 @@ def premium_bar_chart(snapshot_df: pd.DataFrame, expiry: str, mode: str,
     layout.update(yaxis_title=ylab, xaxis_title='Strike', showlegend=False)
     fig.update_layout(**layout)
     return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Market Profile / Value Area (VA-80) — from intraday OHLCV
+# ══════════════════════════════════════════════════════════════════════════════
+def compute_value_area(intraday_df: pd.DataFrame, value_pct: float = 0.80,
+                       n_bins: int = 100, use_volume: bool = True) -> dict:
+    """Compute the Market-Profile Value Area from intraday bars.
+
+    Builds a price histogram (volume-weighted if volume is available, else
+    TPO/time-based by counting bars), finds the POC (Point of Control, the
+    most-traded price level), then expands symmetrically around it — adding
+    the richer of the two adjacent levels at each step, standard MP method —
+    until `value_pct` (default 80%) of the total is enclosed. The band edges
+    are VA-High and VA-Low.
+
+    Returns {'poc', 'va_high', 'va_low', 'va_pct', 'profile': (levels, weights),
+    'method'} or an empty dict if data is insufficient.
+
+    The 'VA-80' referenced operationally is va_high (upper edge of the 80% area).
+    """
+    out = {'poc': None, 'va_high': None, 'va_low': None, 'va_pct': value_pct,
+           'profile': None, 'method': None}
+    if intraday_df is None or intraday_df.empty:
+        return out
+    df = intraday_df.copy()
+    need = {'high', 'low', 'close'}
+    if not need.issubset(set(df.columns)):
+        return out
+
+    lo, hi = float(df['low'].min()), float(df['high'].max())
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return out
+
+    edges = np.linspace(lo, hi, n_bins + 1)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    weights = np.zeros(n_bins)
+
+    has_vol = ('volume' in df.columns and df['volume'].fillna(0).sum() > 0)
+    method = 'volume' if (use_volume and has_vol) else 'tpo'
+
+    # Distribute each bar's weight across the price bins it spans (hi..lo)
+    for _, row in df.iterrows():
+        b_lo, b_hi = float(row['low']), float(row['high'])
+        if not np.isfinite(b_lo) or not np.isfinite(b_hi) or b_hi < b_lo:
+            continue
+        w = float(row['volume']) if method == 'volume' else 1.0
+        if w <= 0:
+            w = 1.0 if method == 'volume' else 1.0
+        i_lo = max(0, np.searchsorted(edges, b_lo, side='right') - 1)
+        i_hi = min(n_bins - 1, np.searchsorted(edges, b_hi, side='right') - 1)
+        span = max(1, i_hi - i_lo + 1)
+        weights[i_lo:i_hi + 1] += w / span
+
+    total = weights.sum()
+    if total <= 0:
+        return out
+
+    poc_i = int(np.argmax(weights))
+    # Expand around POC until value_pct of total is enclosed
+    lo_i = hi_i = poc_i
+    acc = weights[poc_i]
+    target = total * value_pct
+    while acc < target and (lo_i > 0 or hi_i < n_bins - 1):
+        left = weights[lo_i - 1] if lo_i > 0 else -1
+        right = weights[hi_i + 1] if hi_i < n_bins - 1 else -1
+        if right >= left:
+            hi_i += 1
+            acc += weights[hi_i]
+        else:
+            lo_i -= 1
+            acc += weights[lo_i]
+
+    out.update({
+        'poc': round(float(centers[poc_i]), 2),
+        'va_high': round(float(centers[hi_i]), 2),
+        'va_low': round(float(centers[lo_i]), 2),
+        'va_pct': round(acc / total, 3),
+        'profile': (centers.tolist(), weights.tolist()),
+        'method': method,
+    })
+    return out
+
+
+def value_area_position(spot: float, va: dict) -> dict:
+    """Classify where spot sits relative to the value area — the input the
+    Ralendar needs for its directional bias (above VA-high → delta negative,
+    near/at VA edges → delta positive).
+
+    Returns {'zone', 'bias_hint', 'distance_pct'} where zone is one of
+    'above_va' | 'upper_va' | 'inside_va' | 'lower_va' | 'below_va'.
+    """
+    out = {'zone': None, 'bias_hint': None, 'distance_pct': None}
+    if not va or va.get('va_high') is None or not spot:
+        return out
+    vah, val, poc = va['va_high'], va['va_low'], va['poc']
+    rng = max(vah - val, 1e-9)
+    if spot > vah:
+        zone, bias = 'above_va', 'delta_negativo'
+    elif spot >= vah - 0.15 * rng:
+        zone, bias = 'upper_va', 'delta_negativo'
+    elif spot <= val:
+        zone, bias = 'below_va', 'delta_positivo'
+    elif spot <= val + 0.15 * rng:
+        zone, bias = 'lower_va', 'delta_positivo'
+    else:
+        zone, bias = 'inside_va', 'neutro'
+    out.update({'zone': zone, 'bias_hint': bias,
+                'distance_pct': round((spot - poc) / poc * 100, 2) if poc else None})
+    return out
+
+
+def value_area_chart(va: dict, spot: float = None, ticker: str = 'SPX'):
+    """Horizontal market-profile histogram with POC, VA-High, VA-Low and spot —
+    the visual for the value area used by the Ralendar's directional bias."""
+    import plotly.graph_objects as go
+    if not va or not va.get('profile'):
+        return empty_fig("Value area non disponibile")
+    centers, weights = va['profile']
+    fig = go.Figure()
+    # horizontal bars: price on y, weight on x
+    _colors = []
+    for c in centers:
+        if va['va_low'] <= c <= va['va_high']:
+            _colors.append('#3B82F6')     # inside value area
+        else:
+            _colors.append('#CBD5E1')     # outside
+    fig.add_trace(go.Bar(y=centers, x=weights, orientation='h',
+                         marker_color=_colors, name='Profilo'))
+    # POC / VA lines
+    for _lvl, _lab, _clr in [(va['poc'], 'POC', '#F59E0B'),
+                             (va['va_high'], 'VA-High', '#10B981'),
+                             (va['va_low'], 'VA-Low', '#EF4444')]:
+        if _lvl is not None:
+            fig.add_hline(y=_lvl, line_color=_clr, line_dash='dash',
+                          annotation_text=f' {_lab} {_lvl:.0f}',
+                          annotation_font_color=_clr, annotation_font_size=9)
+    if spot:
+        fig.add_hline(y=spot, line_color='#111827', line_width=2,
+                      annotation_text=f' spot {spot:.0f}',
+                      annotation_font_size=9)
+    layout = base_layout(f'Market Profile / Value Area — {ticker}')
+    layout.update(xaxis_title='Volume/TPO', yaxis_title='Prezzo',
+                  showlegend=False)
+    fig.update_layout(**layout)
+    return fig

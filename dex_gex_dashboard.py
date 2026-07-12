@@ -5221,13 +5221,28 @@ def save_premium_snapshot(raw_df: pd.DataFrame, spot: float,
             for strike, sgrp in band.groupby('strike'):
                 calls = sgrp[sgrp['optionType'] == 'call']
                 puts  = sgrp[sgrp['optionType'] == 'put']
+
+                def _iv_decimal(_grp):
+                    """Barchart delivers IV in percent (e.g. 29.0 = 29%). Store it
+                    in decimal form (0.29) so the whole codebase agrees; guard
+                    against a source that already sends decimals."""
+                    if _grp.empty:
+                        return None
+                    v = _grp['impliedVolatility'].iloc[0]
+                    if pd.isna(v):
+                        return None
+                    v = float(v)
+                    if v > 3.0:          # clearly a percentage → normalise
+                        v = v / 100.0
+                    return round(v, 4)
+
                 row = {
                     'expiry': expiry, 'T_days': round(T_days, 1),
                     'strike': float(strike),
                     'call_mid': round(float(calls['mid'].iloc[0]), 2) if not calls.empty else None,
-                    'call_iv':  round(float(calls['impliedVolatility'].iloc[0]), 4) if not calls.empty and pd.notna(calls['impliedVolatility'].iloc[0]) else None,
+                    'call_iv':  _iv_decimal(calls),
                     'put_mid':  round(float(puts['mid'].iloc[0]), 2) if not puts.empty else None,
-                    'put_iv':   round(float(puts['impliedVolatility'].iloc[0]), 4) if not puts.empty and pd.notna(puts['impliedVolatility'].iloc[0]) else None,
+                    'put_iv':   _iv_decimal(puts),
                 }
                 rows.append(row)
 
@@ -5318,11 +5333,19 @@ def premium_bar_chart(snapshot_df: pd.DataFrame, expiry: str, mode: str,
     side = 'call' if is_call else 'put'
 
     # Build y-values per mode
+    def _as_decimal_iv(s):
+        """Legacy snapshots may hold IV in percent (29.0) instead of decimal
+        (0.29). Normalise defensively so old files still render correctly."""
+        s = s.astype(float)
+        med = s.dropna().median() if s.notna().any() else 0
+        return s / 100.0 if med > 3.0 else s
+
     if not is_diff:
         col = f'{side}_iv' if is_vol else f'{side}_mid'
-        y = sub[col].astype(float)
         if is_vol:
-            y = y * 100.0            # IV in %
+            y = _as_decimal_iv(sub[col]) * 100.0     # decimal → percent for display
+        else:
+            y = sub[col].astype(float)
         ylab = 'Volatilità implicita (%)' if is_vol else 'Premio (punti)'
         bar_color = ACCENT_YLW if is_vol else ('#3B82F6' if is_call else '#8B5CF6')
     else:
@@ -5335,7 +5358,8 @@ def premium_bar_chart(snapshot_df: pd.DataFrame, expiry: str, mode: str,
             return empty_fig("Nessuno strike in comune con la data di confronto")
         sub = merged
         if is_vol:
-            y = (merged[f'{side}_iv'].astype(float) - merged[f'{side}_iv_ref'].astype(float)) * 100.0
+            y = (_as_decimal_iv(merged[f'{side}_iv'])
+                 - _as_decimal_iv(merged[f'{side}_iv_ref'])) * 100.0
             ylab = 'Δ Volatilità (punti %)'
         else:
             base = merged[f'{side}_mid_ref'].astype(float).replace(0, np.nan)
@@ -5530,3 +5554,35 @@ def value_area_chart(va: dict, spot: float = None, ticker: str = 'SPX'):
                   showlegend=False)
     fig.update_layout(**layout)
     return fig
+
+
+def relevant_strike_range(snapshot_df: pd.DataFrame, expiry: str = None,
+                          spot: float = None, min_premium: float = 0.05,
+                          pad_pct: float = 0.03) -> tuple:
+    """Suggest a sensible default strike window for the premium charts.
+
+    Far-OTM strikes carry near-zero premium and add nothing but empty space, so
+    the default view should start where the data is actually meaningful. Keeps
+    strikes where either side has a premium above `min_premium`, then pads the
+    window slightly around spot.
+
+    Returns (k_start, k_end) as ints, or (None, None) if it cannot be derived.
+    """
+    if snapshot_df is None or snapshot_df.empty:
+        return (None, None)
+    df = snapshot_df
+    if expiry is not None:
+        df = df[df['expiry'] == expiry]
+    if df.empty:
+        return (None, None)
+    cm = df['call_mid'].astype(float).fillna(0)
+    pm = df['put_mid'].astype(float).fillna(0)
+    live = df[(cm > min_premium) | (pm > min_premium)]
+    if live.empty:
+        return (int(df['strike'].min()), int(df['strike'].max()))
+    lo, hi = float(live['strike'].min()), float(live['strike'].max())
+    if spot:
+        # always include a window around spot even if premiums are thin there
+        lo = min(lo, spot * (1 - pad_pct))
+        hi = max(hi, spot * (1 + pad_pct))
+    return (int(lo), int(hi))

@@ -2312,28 +2312,39 @@ with tab10:
     import dex_gex_dashboard as dg
     st.markdown("### 💵 Premiums vs Vol")
     st.caption("Volatilità e premi (call/put) per strike, una scadenza alla volta. "
-               "Le modalità differenziali confrontano con una data storica: servono a "
-               "capire se stai per comprare caro o vendere sottoprezzato.")
+               "Confronta due date qualsiasi per capire dove e quanto sono cambiati "
+               "premi e volatilità.")
 
     _prem_dates = dg.list_premium_dates()
 
     if not _prem_dates:
         st.info("📭 Nessuno snapshot premi ancora salvato. Lo storico si costruisce "
-                "in avanti: il motore serale (o lo snapshot automatico) salva ogni "
-                "giorno i premi/volatilità di SPX (strike da −25% a +15% dallo spot, "
-                "scadenze entro ~6 mesi). Torna tra qualche giorno.")
+                "in avanti: il motore serale salva ogni giorno premi/volatilità di "
+                "SPX. Torna tra qualche giorno.")
     else:
-        _day_today = _prem_dates[-1]
-        _snap = dg.load_premium_snapshot(_day_today)
+        # ═══ SELETTORI DATE (due date liberamente confrontabili) ═══════════
+        st.markdown("**📅 Date da confrontare**")
+        _d1, _d2 = st.columns(2)
+        with _d1:
+            _day_A = st.selectbox("Data principale", options=_prem_dates[::-1],
+                                  index=0, key="pv_dayA",
+                                  help="La data di cui vedi i valori")
+        with _d2:
+            _ref_opts = ["(nessuna)"] + [d for d in _prem_dates[::-1] if d != _day_A]
+            _day_B_sel = st.selectbox("Confronta con", options=_ref_opts, index=0,
+                                      key="pv_dayB",
+                                      help="Seconda data per i differenziali")
+        _day_B = None if _day_B_sel == "(nessuna)" else _day_B_sel
+
+        _snap = dg.load_premium_snapshot(_day_A)
         if _snap.empty:
-            st.warning("Snapshot di oggi vuoto.")
+            st.warning(f"Snapshot del {_day_A} vuoto.")
         else:
             _spot_now = float(_snap['spot'].iloc[0]) if 'spot' in _snap.columns else None
-            st.markdown(f"**📅 Oggi:** `{_day_today}`"
-                        + (f"  ·  **Spot:** `{_spot_now:.0f}`" if _spot_now else "")
-                        + f"  ·  **Snapshot:** {len(_prem_dates)}")
+            _cmp_snap = dg.load_premium_snapshot(_day_B) if _day_B else None
 
-            # ── Row 1: expiry + mode + side (the essentials) ──────────────
+            # ═══ VISTA: scadenza + modalità + lato ════════════════════════
+            st.markdown("**📊 Vista**")
             _exps_all = sorted(_snap['expiry'].unique(),
                                key=lambda e: _snap[_snap['expiry']==e]['T_days'].iloc[0])
             _exp_lab = {e: f"{e}  ({int(_snap[_snap['expiry']==e]['T_days'].iloc[0])}g)"
@@ -2343,44 +2354,45 @@ with tab10:
                 _sel_exp = st.selectbox("Scadenza", options=_exps_all,
                                         format_func=lambda e: _exp_lab[e], key="pv_exp")
             with _c2:
-                _mode_view = st.selectbox("Modalità",
-                    ['Volatilità', 'Premi', 'Differenziale Vol', 'Differenza Premi'],
-                    key="pv_mode")
+                _modes = ['Volatilità', 'Premi']
+                if _day_B:
+                    _modes += ['Differenziale Vol', 'Differenza Premi']
+                _mode_view = st.selectbox("Modalità", _modes, key="pv_mode",
+                                          help="Le modalità differenziali richiedono "
+                                               "una seconda data")
             with _c3:
                 _side_view = st.selectbox("Lato", ['Call', 'Put'], key="pv_side")
 
-            # ── Reference date (only for differential modes) ──────────────
-            _is_diff = _mode_view in ('Differenziale Vol', 'Differenza Premi')
-            _cmp_snap = None
-            if _is_diff:
-                _ref_opts = [d for d in _prem_dates if d != _day_today][::-1]
-                if not _ref_opts:
-                    st.warning("Serve almeno un secondo giorno salvato per la modalità "
-                               "differenziale.")
-                else:
-                    _day_ref = st.selectbox("📅 Confronta con:", options=_ref_opts,
-                                            key="pv_refdate")
-                    _cmp_snap = dg.load_premium_snapshot(_day_ref)
-
-            # ── Row 2: strike filters (always visible, with titles) ───────
-            st.markdown("**⚙️ Filtri strike**")
+            # ═══ FILTRI STRIKE (default = range rilevante automatico) ═════
             _all_strikes = sorted(_snap['strike'].unique())
-            _k_min, _k_max = int(_all_strikes[0]), int(_all_strikes[-1])
             _step_guess = int(_all_strikes[1] - _all_strikes[0]) if len(_all_strikes) > 1 else 50
+            _auto_lo, _auto_hi = dg.relevant_strike_range(_snap, _sel_exp, _spot_now)
+            if _auto_lo is None:
+                _auto_lo, _auto_hi = int(_all_strikes[0]), int(_all_strikes[-1])
+
+            st.markdown("**⚙️ Filtri strike**")
+            _use_auto = st.checkbox("Range automatico (solo strike rilevanti)",
+                                    value=True, key="pv_auto",
+                                    help=f"Mostra da {_auto_lo} a {_auto_hi}, "
+                                         "escludendo gli strike con premio ~0")
             _f1, _f2, _f3 = st.columns(3)
             with _f1:
-                _k_start = st.number_input("Strike iniziale", value=_k_min,
+                _k_start = st.number_input("Strike iniziale", value=_auto_lo,
                                            step=_step_guess, key="pv_kstart",
+                                           disabled=_use_auto,
                                            help="Primo strike da mostrare")
             with _f2:
-                _k_end = st.number_input("Strike finale", value=_k_max,
+                _k_end = st.number_input("Strike finale", value=_auto_hi,
                                          step=_step_guess, key="pv_kend",
+                                         disabled=_use_auto,
                                          help="Ultimo strike da mostrare")
             with _f3:
                 _k_int = st.number_input("Intervallo strike", value=_step_guess,
                                          min_value=_step_guess, step=_step_guess,
                                          key="pv_kint",
                                          help="Passo tra uno strike e l'altro")
+            if _use_auto:
+                _k_start, _k_end = _auto_lo, _auto_hi
 
             _side_l = 'call' if _side_view == 'Call' else 'put'
             _chart_mode = {'Volatilità': f'vol_{_side_l}', 'Premi': f'prem_{_side_l}',
@@ -2398,26 +2410,27 @@ with tab10:
             _snap_f = _filter_strikes(_snap)
             _cmp_f = _filter_strikes(_cmp_snap) if _cmp_snap is not None else None
 
-            # ── One big chart for the selected expiry ─────────────────────
-            if _is_diff and (_cmp_f is None or _cmp_f.empty):
-                st.info("Seleziona una data di confronto valida per i differenziali.")
-            else:
-                _msub = _snap_f[_snap_f['expiry']==_sel_exp]
-                _tdays = int(_msub['T_days'].iloc[0]) if not _msub.empty else 0
-                st.markdown(f"#### {_sel_exp} · {_tdays}g · {_mode_view} {_side_view}"
-                            + (f"  ·  spot {_spot_now:.0f}" if _spot_now else ""))
-                try:
-                    _fig = dg.premium_bar_chart(_snap_f, _sel_exp, _chart_mode,
-                                                compare_df=_cmp_f, spot=_spot_now)
-                    _fig.update_layout(height=460)
-                    st.plotly_chart(_fig, use_container_width=True, key="pv_main")
-                except Exception as _e:
-                    st.caption(f"Errore grafico: {_e}")
+            # ═══ GRAFICO ═════════════════════════════════════════════════
+            _is_diff = _mode_view.startswith('Diff')
+            _msub = _snap_f[_snap_f['expiry']==_sel_exp]
+            _tdays = int(_msub['T_days'].iloc[0]) if not _msub.empty else 0
+            _title = (f"#### {_sel_exp} · {_tdays}g · {_mode_view} {_side_view}"
+                      + (f" · spot {_spot_now:.0f}" if _spot_now else ""))
+            if _is_diff and _day_B:
+                _title += f"  ·  {_day_A} vs {_day_B}"
+            st.markdown(_title)
+            try:
+                _fig = dg.premium_bar_chart(_snap_f, _sel_exp, _chart_mode,
+                                            compare_df=_cmp_f, spot=_spot_now)
+                _fig.update_layout(height=460)
+                st.plotly_chart(_fig, use_container_width=True, key="pv_main")
+            except Exception as _e:
+                st.caption(f"Errore grafico: {_e}")
 
-                if _is_diff:
-                    st.caption("💡 Le barre mostrano quanto vol/premi sono cambiati "
-                               f"rispetto al {_day_ref}. Se ciò che vorresti aprire è "
-                               "già molto mosso a sfavore, forse sei in ritardo.")
+            if _is_diff:
+                st.caption(f"💡 Barre = variazione rispetto al {_day_B}. Se ciò che "
+                           "vorresti aprire è già molto mosso a sfavore, forse sei "
+                           "in ritardo.")
 
 
 # ── Footer ────────────────────────────────────────────────────────────────────

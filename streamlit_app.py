@@ -1279,6 +1279,58 @@ with tab4:
     st.caption("La value area contiene l'80% del volume della sessione. POC = "
                "livello più scambiato. Il rapporto tra prezzo e VA definisce il "
                "bias direzionale (usato dal Ralendar).")
+
+    # ── Refresh controls (targeted: only re-fetch the intraday bars) ──────
+    _mp1, _mp2, _mp3 = st.columns([1, 1.4, 2])
+    with _mp1:
+        _mp_refresh = st.button("🔄 Aggiorna", key="mp_refresh",
+                                help="Ri-scarica solo le barre intraday e ricalcola "
+                                     "il VA-80 (non ri-scarica la chain opzioni)")
+    with _mp2:
+        _mp_auto = st.toggle("Auto 15 min", key="mp_auto", value=False,
+                             help="Aggiorna il Market Profile ogni 15 minuti mentre "
+                                  "sei su questa tab. 15 min è il minimo utile: "
+                                  "Yahoo ha comunque ~15 min di ritardo.")
+    with _mp3:
+        _mp_last = st.session_state.get("_mp_last_update")
+        if _mp_last:
+            st.caption(f"Ultimo aggiornamento: {_mp_last}")
+
+    # Manual refresh: re-fetch intraday only
+    if _mp_refresh:
+        try:
+            with st.spinner("Aggiorno le barre intraday…"):
+                _fresh = fetch_intraday_history(cur_tick, interval_min=5)
+            if _fresh is not None and not _fresh.empty:
+                intraday = _fresh
+                if "data" in st.session_state:
+                    st.session_state["data"]["intraday"] = _fresh
+                st.session_state["_mp_last_update"] = datetime.now().strftime("%H:%M:%S")
+            else:
+                st.warning("Nessuna barra intraday disponibile ora.")
+        except Exception as _mpe:
+            st.warning(f"Aggiornamento fallito: {_mpe}")
+
+    # Auto-refresh every 15 min, only while this tab is being viewed
+    if _mp_auto:
+        if st.session_state.get("_ar_enabled"):
+            st.caption("⚠️ Anche l'auto-refresh globale (sidebar) è attivo: due "
+                       "aggiornamenti in parallelo. Meglio tenerne acceso uno solo.")
+        if _HAS_AUTOREFRESH:
+            _st_autorefresh(interval=15 * 60 * 1000, limit=None, key="mp_autorefresh")
+            try:
+                _fresh_a = fetch_intraday_history(cur_tick, interval_min=5)
+                if _fresh_a is not None and not _fresh_a.empty:
+                    intraday = _fresh_a
+                    if "data" in st.session_state:
+                        st.session_state["data"]["intraday"] = _fresh_a
+                    st.session_state["_mp_last_update"] = datetime.now().strftime("%H:%M:%S")
+            except Exception:
+                pass
+        else:
+            st.caption("⚠️ streamlit-autorefresh non installato — usa il bottone "
+                       "Aggiorna, o aggiungi il pacchetto a requirements.txt")
+
     if intraday is None or (hasattr(intraday, 'empty') and intraday.empty):
         st.info("Dati intraday non disponibili — la value area richiede le barre "
                 "intraday (Yahoo). Riprova a mercato aperto o ricarica.")
@@ -1306,6 +1358,21 @@ with tab4:
                     {'label': 'Copertura', 'value': f"{_va['va_pct']*100:.0f}%"},
                     {'label': 'Metodo', 'value': _va['method'].upper()},
                 ], per_row=5)
+
+                # Data provenance — essential when comparing against your own
+                # VA-80: this proxy uses the cash index, not the E-mini future.
+                st.markdown(
+                    f'<div style="background:#F3F4F6;border-left:3px solid #9CA3AF;'
+                    f'border-radius:6px;padding:8px 12px;margin:6px 0 12px 0;">'
+                    f'<span style="color:#4B5563;font-size:11.5px;line-height:1.5;">'
+                    f'📐 <b>Dati usati:</b> indice cash (^GSPC via Yahoo), barre 5min, '
+                    f'sessione <b>{_va.get("session_date") or "n/d"}</b> '
+                    f'({_va.get("n_bars") or 0} barre'
+                    + (f", {_va['n_sessions']} sessioni disponibili"
+                       if _va.get("n_sessions") and _va["n_sessions"] > 1 else "")
+                    + f'). <b>Nota:</b> non è il volume del future E-mini — '
+                    f'confronta con il tuo VA-80 per valutarne la fedeltà.'
+                    f'</span></div>', unsafe_allow_html=True)
                 _cvl, _cvr = st.columns([2, 1])
                 with _cvl:
                     st.plotly_chart(value_area_chart(_va, spot, cur_tick),

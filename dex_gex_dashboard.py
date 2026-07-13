@@ -5407,6 +5407,13 @@ def premium_bar_chart(snapshot_df: pd.DataFrame, expiry: str, mode: str,
             fig.update_yaxes(range=[0, _ymax + _pad])          # premi/vol: parte da 0
         else:
             fig.update_yaxes(range=[_ymin - _pad, _ymax + _pad])  # differenziali: attorno a 0
+
+    # Fit the X axis to the strikes actually plotted (in diff mode the common
+    # strikes can be a subset, and a wider axis would leave dead space)
+    if strikes:
+        _k_lo, _k_hi = min(strikes), max(strikes)
+        _kpad = max((_k_hi - _k_lo) * 0.02, 10)
+        fig.update_xaxes(range=[_k_lo - _kpad, _k_hi + _kpad])
     return fig
 
 
@@ -5558,13 +5565,18 @@ def value_area_chart(va: dict, spot: float = None, ticker: str = 'SPX'):
 
 def relevant_strike_range(snapshot_df: pd.DataFrame, expiry: str = None,
                           spot: float = None, min_premium: float = 0.05,
-                          pad_pct: float = 0.03) -> tuple:
+                          pad_pct: float = 0.03,
+                          compare_df: pd.DataFrame = None) -> tuple:
     """Suggest a sensible default strike window for the premium charts.
 
     Far-OTM strikes carry near-zero premium and add nothing but empty space, so
     the default view should start where the data is actually meaningful. Keeps
     strikes where either side has a premium above `min_premium`, then pads the
     window slightly around spot.
+
+    When `compare_df` is given (differential modes), the window is additionally
+    restricted to strikes present in BOTH snapshots — otherwise the chart would
+    reserve axis space for strikes that can never render a bar.
 
     Returns (k_start, k_end) as ints, or (None, None) if it cannot be derived.
     """
@@ -5575,6 +5587,19 @@ def relevant_strike_range(snapshot_df: pd.DataFrame, expiry: str = None,
         df = df[df['expiry'] == expiry]
     if df.empty:
         return (None, None)
+
+    # In differential mode only strikes common to both dates can be plotted
+    if compare_df is not None and not compare_df.empty:
+        cmp_e = compare_df
+        if expiry is not None:
+            cmp_e = cmp_e[cmp_e['expiry'] == expiry]
+        if not cmp_e.empty:
+            common = set(df['strike']).intersection(set(cmp_e['strike']))
+            if common:
+                df = df[df['strike'].isin(common)]
+            if df.empty:
+                return (None, None)
+
     cm = df['call_mid'].astype(float).fillna(0)
     pm = df['put_mid'].astype(float).fillna(0)
     live = df[(cm > min_premium) | (pm > min_premium)]
@@ -5585,4 +5610,7 @@ def relevant_strike_range(snapshot_df: pd.DataFrame, expiry: str = None,
         # always include a window around spot even if premiums are thin there
         lo = min(lo, spot * (1 - pad_pct))
         hi = max(hi, spot * (1 + pad_pct))
+    # never widen beyond what actually exists in the (possibly intersected) data
+    lo = max(lo, float(df['strike'].min()))
+    hi = min(hi, float(df['strike'].max()))
     return (int(lo), int(hi))

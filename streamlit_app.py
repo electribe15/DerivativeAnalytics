@@ -137,6 +137,37 @@ div[data-testid="stPlotlyChart"] {
 /* ── Misc ────────────────────────────────────────────── */
 .stSpinner > div { border-top-color: #6C63FF !important; }
 div[data-testid="stSlider"] label { color: #6B7280 !important; font-size: 12px; font-weight: 500; }
+
+/* ── Widget labels in the MAIN area (selectbox, number_input, checkbox,
+      radio, text_input…). Without this they inherit a light colour from the
+      theme and become invisible on the white background. Sidebar labels keep
+      their own rule above. ─────────────────────────────────────────────── */
+section.main label,
+div[data-testid="stAppViewContainer"] div[data-testid="stSelectbox"] label,
+div[data-testid="stAppViewContainer"] div[data-testid="stNumberInput"] label,
+div[data-testid="stAppViewContainer"] div[data-testid="stCheckbox"] label,
+div[data-testid="stAppViewContainer"] div[data-testid="stRadio"] label,
+div[data-testid="stAppViewContainer"] div[data-testid="stTextInput"] label,
+div[data-testid="stAppViewContainer"] div[data-testid="stDateInput"] label,
+div[data-testid="stSelectbox"] label p,
+div[data-testid="stNumberInput"] label p,
+div[data-testid="stCheckbox"] label p,
+div[data-testid="stWidgetLabel"],
+div[data-testid="stWidgetLabel"] p,
+div[data-testid="stWidgetLabel"] * {
+    color: #374151 !important;
+    -webkit-text-fill-color: #374151 !important;
+    font-size: 13px !important;
+    font-weight: 600 !important;
+    font-family: 'Inter', sans-serif !important;
+}
+/* Sidebar labels must keep their light colour (dark background) */
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] div[data-testid="stWidgetLabel"],
+section[data-testid="stSidebar"] div[data-testid="stWidgetLabel"] * {
+    color: #A5B4FC !important;
+    -webkit-text-fill-color: #A5B4FC !important;
+}
 input[type="text"], input[type="number"] {
     background: #F9FAFB !important; border: 1.5px solid #E5E7EB !important;
     border-radius: 8px !important; color: #374151 !important;
@@ -2326,14 +2357,23 @@ with tab10:
         st.markdown("**📅 Date da confrontare**")
         _d1, _d2 = st.columns(2)
         with _d1:
-            _day_A = st.selectbox("Data principale", options=_prem_dates[::-1],
+            st.markdown("<span style='color:#374151;font-size:13px;font-weight:600;'>"
+                        "Data da analizzare (il «dopo»)</span>", unsafe_allow_html=True)
+            _day_A = st.selectbox("Data da analizzare",
+                                  options=_prem_dates[::-1],
                                   index=0, key="pv_dayA",
-                                  help="La data di cui vedi i valori")
+                                  label_visibility="collapsed",
+                                  help="I valori mostrati sono quelli di questa data")
         with _d2:
+            st.markdown("<span style='color:#374151;font-size:13px;font-weight:600;'>"
+                        "Data di riferimento (il «prima»)</span>", unsafe_allow_html=True)
             _ref_opts = ["(nessuna)"] + [d for d in _prem_dates[::-1] if d != _day_A]
-            _day_B_sel = st.selectbox("Confronta con", options=_ref_opts, index=0,
+            _day_B_sel = st.selectbox("Data di riferimento",
+                                      options=_ref_opts, index=0,
                                       key="pv_dayB",
-                                      help="Seconda data per i differenziali")
+                                      label_visibility="collapsed",
+                                      help="Le barre dei differenziali mostrano quanto "
+                                           "è cambiato DA questa data A quella a sinistra")
         _day_B = None if _day_B_sel == "(nessuna)" else _day_B_sel
 
         _snap = dg.load_premium_snapshot(_day_A)
@@ -2351,22 +2391,36 @@ with tab10:
                         for e in _exps_all}
             _c1, _c2, _c3 = st.columns([1.4, 1.4, 0.9])
             with _c1:
+                st.markdown("<span style='color:#374151;font-size:13px;"
+                            "font-weight:600;'>Scadenza</span>", unsafe_allow_html=True)
                 _sel_exp = st.selectbox("Scadenza", options=_exps_all,
-                                        format_func=lambda e: _exp_lab[e], key="pv_exp")
+                                        format_func=lambda e: _exp_lab[e], key="pv_exp",
+                                        label_visibility="collapsed")
             with _c2:
+                st.markdown("<span style='color:#374151;font-size:13px;"
+                            "font-weight:600;'>Modalità</span>", unsafe_allow_html=True)
                 _modes = ['Volatilità', 'Premi']
                 if _day_B:
                     _modes += ['Differenziale Vol', 'Differenza Premi']
                 _mode_view = st.selectbox("Modalità", _modes, key="pv_mode",
+                                          label_visibility="collapsed",
                                           help="Le modalità differenziali richiedono "
                                                "una seconda data")
             with _c3:
-                _side_view = st.selectbox("Lato", ['Call', 'Put'], key="pv_side")
+                st.markdown("<span style='color:#374151;font-size:13px;"
+                            "font-weight:600;'>Lato</span>", unsafe_allow_html=True)
+                _side_view = st.selectbox("Lato", ['Call', 'Put'], key="pv_side",
+                                          label_visibility="collapsed")
 
             # ═══ FILTRI STRIKE (default = range rilevante automatico) ═════
             _all_strikes = sorted(_snap['strike'].unique())
             _step_guess = int(_all_strikes[1] - _all_strikes[0]) if len(_all_strikes) > 1 else 50
-            _auto_lo, _auto_hi = dg.relevant_strike_range(_snap, _sel_exp, _spot_now)
+            # in modalità differenziale il range deve considerare solo gli strike
+            # presenti in ENTRAMBE le date, altrimenti resta spazio vuoto
+            _is_diff_mode = _mode_view.startswith('Diff')
+            _auto_lo, _auto_hi = dg.relevant_strike_range(
+                _snap, _sel_exp, _spot_now,
+                compare_df=(_cmp_snap if _is_diff_mode else None))
             if _auto_lo is None:
                 _auto_lo, _auto_hi = int(_all_strikes[0]), int(_all_strikes[-1])
 
@@ -2377,19 +2431,31 @@ with tab10:
                                          "escludendo gli strike con premio ~0")
             _f1, _f2, _f3 = st.columns(3)
             with _f1:
+                st.markdown("<span style='color:#374151;font-size:13px;"
+                            "font-weight:600;'>Strike iniziale</span>",
+                            unsafe_allow_html=True)
                 _k_start = st.number_input("Strike iniziale", value=_auto_lo,
                                            step=_step_guess, key="pv_kstart",
                                            disabled=_use_auto,
+                                           label_visibility="collapsed",
                                            help="Primo strike da mostrare")
             with _f2:
+                st.markdown("<span style='color:#374151;font-size:13px;"
+                            "font-weight:600;'>Strike finale</span>",
+                            unsafe_allow_html=True)
                 _k_end = st.number_input("Strike finale", value=_auto_hi,
                                          step=_step_guess, key="pv_kend",
                                          disabled=_use_auto,
+                                         label_visibility="collapsed",
                                          help="Ultimo strike da mostrare")
             with _f3:
+                st.markdown("<span style='color:#374151;font-size:13px;"
+                            "font-weight:600;'>Intervallo strike</span>",
+                            unsafe_allow_html=True)
                 _k_int = st.number_input("Intervallo strike", value=_step_guess,
                                          min_value=_step_guess, step=_step_guess,
                                          key="pv_kint",
+                                         label_visibility="collapsed",
                                          help="Passo tra uno strike e l'altro")
             if _use_auto:
                 _k_start, _k_end = _auto_lo, _auto_hi
@@ -2416,9 +2482,16 @@ with tab10:
             _tdays = int(_msub['T_days'].iloc[0]) if not _msub.empty else 0
             _title = (f"#### {_sel_exp} · {_tdays}g · {_mode_view} {_side_view}"
                       + (f" · spot {_spot_now:.0f}" if _spot_now else ""))
-            if _is_diff and _day_B:
-                _title += f"  ·  {_day_A} vs {_day_B}"
             st.markdown(_title)
+            if _is_diff and _day_B:
+                st.markdown(
+                    f'<div style="background:#EFF6FF;border-left:4px solid #3B82F6;'
+                    f'border-radius:8px;padding:9px 13px;margin-bottom:10px;">'
+                    f'<span style="color:#1E40AF;font-size:12.5px;">'
+                    f'📖 <b>Come leggerlo:</b> variazione da <b>{_day_B}</b> (prima) '
+                    f'a <b>{_day_A}</b> (dopo). Barra <b>sopra lo zero</b> = valore '
+                    f'<b>salito</b>; <b>sotto lo zero</b> = <b>sceso</b>.'
+                    f'</span></div>', unsafe_allow_html=True)
             try:
                 _fig = dg.premium_bar_chart(_snap_f, _sel_exp, _chart_mode,
                                             compare_df=_cmp_f, spot=_spot_now)
@@ -2428,9 +2501,9 @@ with tab10:
                 st.caption(f"Errore grafico: {_e}")
 
             if _is_diff:
-                st.caption(f"💡 Barre = variazione rispetto al {_day_B}. Se ciò che "
-                           "vorresti aprire è già molto mosso a sfavore, forse sei "
-                           "in ritardo.")
+                st.caption("💡 Se ciò che vorresti aprire è già molto mosso a sfavore "
+                           "(comprare dove la vol è già salita, vendere dove è già "
+                           "scesa), forse sei in ritardo.")
 
 
 # ── Footer ────────────────────────────────────────────────────────────────────

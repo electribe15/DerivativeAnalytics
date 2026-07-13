@@ -732,19 +732,40 @@ dte0_metrics = compute_0dte_metrics(raw_full, spot)
 has_0dte     = bool(dte0_metrics)
 
 # ── Tabs — 0DTE is always first and shown by default ─────────────────────────
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
-    "⚡ 0DTE",
-    "📊 GEX / DEX",
-    "📐 Range & Skew",
-    "💰 Put Monitor",
-    "📈 Volatilità",
-    "🔥 Open Interest",
-    "📉 Realized Vol",
-    "🤖 Long Vol Strat",
-    "🌊 VolDex",
-    "📉 Short Vol Strat",
-    "💵 Specchietto Premi",
-])
+# NOTE: on_change="rerun" makes Streamlit keep track of the active tab across
+# reruns. Without it, any widget interaction (e.g. the date selectors in the
+# Premiums vs Vol tab) snaps the app back to the first tab — a known Streamlit
+# behaviour, not a bug in this app.
+try:
+    _TABS = st.tabs([
+        "⚡ 0DTE",
+        "📊 GEX / DEX",
+        "📐 Range & Skew",
+        "💰 Put Monitor",
+        "📈 Volatilità",
+        "🔥 Open Interest",
+        "📉 Realized Vol",
+        "🤖 Long Vol Strat",
+        "🌊 VolDex",
+        "📉 Short Vol Strat",
+        "💵 Premiums vs Vol",
+    ], on_change="rerun")
+except TypeError:
+    # Older Streamlit without on_change support — falls back to default tabs
+    _TABS = st.tabs([
+        "⚡ 0DTE",
+        "📊 GEX / DEX",
+        "📐 Range & Skew",
+        "💰 Put Monitor",
+        "📈 Volatilità",
+        "🔥 Open Interest",
+        "📉 Realized Vol",
+        "🤖 Long Vol Strat",
+        "🌊 VolDex",
+        "📉 Short Vol Strat",
+        "💵 Premiums vs Vol",
+    ])
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = _TABS
 
 # ── Tab 0: 0DTE ───────────────────────────────────────────────────────────────
 with tab0:

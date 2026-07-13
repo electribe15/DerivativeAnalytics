@@ -2448,27 +2448,54 @@ with tab10:
             st.markdown("**⚙️ Filtri strike**")
             _use_auto = st.checkbox("Range automatico (solo strike rilevanti)",
                                     value=True, key="pv_auto",
-                                    help=f"Mostra da {_auto_lo} a {_auto_hi}, "
-                                         "escludendo gli strike con premio ~0")
+                                    help="Calcola da solo il primo e l'ultimo strike "
+                                         "con dati significativi (esclude i premi ~0 "
+                                         "e, nei differenziali, gli strike non comuni "
+                                         "alle due date)")
+
             _f1, _f2, _f3 = st.columns(3)
-            with _f1:
-                st.markdown("<span style='color:#374151;font-size:13px;"
-                            "font-weight:600;'>Strike iniziale</span>",
-                            unsafe_allow_html=True)
-                _k_start = st.number_input("Strike iniziale", value=_auto_lo,
-                                           step=_step_guess, key="pv_kstart",
-                                           disabled=_use_auto,
-                                           label_visibility="collapsed",
-                                           help="Primo strike da mostrare")
-            with _f2:
-                st.markdown("<span style='color:#374151;font-size:13px;"
-                            "font-weight:600;'>Strike finale</span>",
-                            unsafe_allow_html=True)
-                _k_end = st.number_input("Strike finale", value=_auto_hi,
-                                         step=_step_guess, key="pv_kend",
-                                         disabled=_use_auto,
-                                         label_visibility="collapsed",
-                                         help="Ultimo strike da mostrare")
+            if _use_auto:
+                # AUTO: show the computed window as read-only text. Using a
+                # disabled number_input with a key would fight session_state and
+                # render blank when the window changes (expiry/date switch).
+                with _f1:
+                    st.markdown("<span style='color:#374151;font-size:13px;"
+                                "font-weight:600;'>Strike iniziale</span>",
+                                unsafe_allow_html=True)
+                    st.markdown(f"<div style='background:#F3F4F6;border:1.5px solid "
+                                f"#E5E7EB;border-radius:8px;padding:9px 12px;"
+                                f"color:#111827;font-size:15px;font-weight:600;'>"
+                                f"{_auto_lo} <span style='color:#9CA3AF;font-size:11px;"
+                                f"font-weight:500;'>auto</span></div>",
+                                unsafe_allow_html=True)
+                with _f2:
+                    st.markdown("<span style='color:#374151;font-size:13px;"
+                                "font-weight:600;'>Strike finale</span>",
+                                unsafe_allow_html=True)
+                    st.markdown(f"<div style='background:#F3F4F6;border:1.5px solid "
+                                f"#E5E7EB;border-radius:8px;padding:9px 12px;"
+                                f"color:#111827;font-size:15px;font-weight:600;'>"
+                                f"{_auto_hi} <span style='color:#9CA3AF;font-size:11px;"
+                                f"font-weight:500;'>auto</span></div>",
+                                unsafe_allow_html=True)
+                _k_start, _k_end = _auto_lo, _auto_hi
+            else:
+                with _f1:
+                    st.markdown("<span style='color:#374151;font-size:13px;"
+                                "font-weight:600;'>Strike iniziale</span>",
+                                unsafe_allow_html=True)
+                    _k_start = st.number_input(
+                        "Strike iniziale", value=_auto_lo, step=_step_guess,
+                        key="pv_kstart_man", label_visibility="collapsed",
+                        help="Primo strike da mostrare")
+                with _f2:
+                    st.markdown("<span style='color:#374151;font-size:13px;"
+                                "font-weight:600;'>Strike finale</span>",
+                                unsafe_allow_html=True)
+                    _k_end = st.number_input(
+                        "Strike finale", value=_auto_hi, step=_step_guess,
+                        key="pv_kend_man", label_visibility="collapsed",
+                        help="Ultimo strike da mostrare")
             with _f3:
                 st.markdown("<span style='color:#374151;font-size:13px;"
                             "font-weight:600;'>Intervallo strike</span>",
@@ -2478,8 +2505,6 @@ with tab10:
                                          key="pv_kint",
                                          label_visibility="collapsed",
                                          help="Passo tra uno strike e l'altro")
-            if _use_auto:
-                _k_start, _k_end = _auto_lo, _auto_hi
 
             _side_l = 'call' if _side_view == 'Call' else 'put'
             _chart_mode = {'Volatilità': f'vol_{_side_l}', 'Premi': f'prem_{_side_l}',

@@ -5,3 +5,4 @@ date,action,strategy,confidence,skip_category,skip_reason,spot,voldex,credit,max
 2026-07-09,SKIP,,0.37,Conviction bassa,Conviction 0.37 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7543.64,12.54,,
 2026-07-10,SKIP,,0.37,Conviction bassa,Conviction 0.37 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7575.39,12.08,,
 2026-07-13,SKIP,,0.0,Evento macro imminente,CPI tra 1g (2026-07-14) — niente vendite vol a ridosso di eventi ad alto impatto,7515.34,13.89,,
+2026-07-14,SKIP,,0.0,Evento macro imminente,CPI oggi (2026-07-14) — niente vendite vol a ridosso di eventi ad alto impatto,7543.59,13.15,,

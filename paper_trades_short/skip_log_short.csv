@@ -8,3 +8,4 @@ date,action,strategy,confidence,skip_category,skip_reason,spot,voldex,credit,max
 2026-07-14,SKIP,,0.0,Evento macro imminente,CPI oggi (2026-07-14) — niente vendite vol a ridosso di eventi ad alto impatto,7543.59,13.15,,
 2026-07-15,SKIP,,0.32,Conviction bassa,Conviction 0.32 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7572.4,12.35,,
 2026-07-16,SKIP,,0.0,Stress in arrivo (skew),"Skew in forte espansione (+1.65pt) — stress in arrivo, vendere vol ora è pericoloso",7533.77,13.12,,
+2026-07-17,SKIP,,0.0,Stress in arrivo (skew),"Skew in forte espansione (+2.59pt) — stress in arrivo, vendere vol ora è pericoloso",7457.69,14.66,,

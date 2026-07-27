@@ -14,3 +14,4 @@ date,action,strategy,confidence,skip_category,skip_reason,spot,voldex,credit,max
 2026-07-22,SKIP,,0.27,Conviction bassa,Conviction 0.27 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7498.96,12.9,,
 2026-07-23,SKIP,,0.0,Term structure invertita,"Term structure in backwardation — vol breve > vol lunga, stress acuto in corso, non vendere",7408.3,14.83,,
 2026-07-24,SKIP,,0.17,Conviction bassa,Conviction 0.17 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7411.98,14.88,,
+2026-07-27,SKIP,,0.0,Term structure invertita,"Term structure in backwardation — vol breve > vol lunga, stress acuto in corso, non vendere",7413.18,14.66,,

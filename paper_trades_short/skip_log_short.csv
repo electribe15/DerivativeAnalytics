@@ -15,3 +15,4 @@ date,action,strategy,confidence,skip_category,skip_reason,spot,voldex,credit,max
 2026-07-23,SKIP,,0.0,Term structure invertita,"Term structure in backwardation — vol breve > vol lunga, stress acuto in corso, non vendere",7408.3,14.83,,
 2026-07-24,SKIP,,0.17,Conviction bassa,Conviction 0.17 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7411.98,14.88,,
 2026-07-27,SKIP,,0.0,Term structure invertita,"Term structure in backwardation — vol breve > vol lunga, stress acuto in corso, non vendere",7413.18,14.66,,
+2026-07-28,SKIP,,0.0,Evento macro imminente,FOMC tra 1g (2026-07-29) — niente vendite vol a ridosso di eventi ad alto impatto,7428.78,14.56,,

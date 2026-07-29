@@ -38,4 +38,4 @@ Strategia scelta perché singola put OTM — la struttura più economica e a ris
 Gambe dell'operazione (su XSP):
 BUY 1x PUT 700 @ 2.16 (~$216)
 
-Strategia scelta perché singola put OTM — la struttura più economica e a rischio definito; esposizione asimmetrica al ribasso, premio contenuto. Scadenza 45 giorni, premio totale 2.16 punti (~$216, 4% del capitale). Perdita massima limitata al premio pagato.","[{""side"": ""BUY"", ""type"": ""PUT"", ""strike"": 700, ""qty"": 1, ""premium_pts"": 2.16, ""premium_usd"": 216.0}]",14.88,13.25,20.74,23.21,0.81,1.0
+Strategia scelta perché singola put OTM — la struttura più economica e a rischio definito; esposizione asimmetrica al ribasso, premio contenuto. Scadenza 45 giorni, premio totale 2.16 punti (~$216, 4% del capitale). Perdita massima limitata al premio pagato.","[{""side"": ""BUY"", ""type"": ""PUT"", ""strike"": 700, ""qty"": 1, ""premium_pts"": 2.16, ""premium_usd"": 216.0}]",14.88,13.25,20.74,23.21,0.81,1.867

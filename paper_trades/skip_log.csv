@@ -22,3 +22,4 @@ date,action,strategy,confidence,skip_category,skip_reason,spot,voldex,expected_m
 2026-07-27,SKIP,,0.455,Premio oltre budget,Premio minimo $571 > cap $400 (8% di $5000),7413.18,14.66,218.26946455055617,7413.18
 2026-07-28,TRADE,long_put,0.457,,,7428.78,14.56,22.53271471535693,7428.78
 2026-07-29,TRADE,long_put,0.53,,,7316.15,16.55,6.290931872694692,7316.15
+2026-07-30,SKIP,,0.372,Conviction bassa,Conviction 0.37 < 0.4 — condizioni non abbastanza favorevoli per comprare vol,7437.63,13.78,24.269680499246437,7437.63

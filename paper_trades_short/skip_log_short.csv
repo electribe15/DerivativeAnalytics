@@ -19,3 +19,4 @@ date,action,strategy,confidence,skip_category,skip_reason,spot,voldex,credit,max
 2026-07-29,SKIP,,0.0,Evento macro imminente,FOMC oggi (2026-07-29) — niente vendite vol a ridosso di eventi ad alto impatto,7316.15,16.55,,
 2026-07-30,SKIP,,0.27,Conviction bassa,Conviction 0.27 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7437.63,13.78,,
 2026-07-31,SKIP,,0.27,Conviction bassa,Conviction 0.27 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7489.72,13.26,,
+2026-08-03,SKIP,,0.37,Conviction bassa,Conviction 0.37 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7600.5,12.57,,

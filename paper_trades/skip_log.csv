@@ -29,3 +29,4 @@ date,action,strategy,confidence,skip_category,skip_reason,spot,voldex,expected_m
 2026-08-05,TRADE,long_put,0.641,,,7723.55,12.76,146.83714352717396,7723.55
 2026-08-06,SKIP,,0.402,Premio oltre budget,Premio minimo $418 > cap $400 (8% di $5000),7709.96,12.18,230.9174251481334,7709.96
 2026-08-07,SKIP,,0.403,Premio oltre budget,Premio minimo $423 > cap $400 (8% di $5000),7757.64,12.1,206.10306143270307,7757.64
+2026-08-10,SKIP,,0.4,Premio oltre budget,Premio minimo $446 > cap $400 (8% di $5000),7753.11,12.26,201.8801493232863,7753.11

@@ -29,3 +29,4 @@ date,action,strategy,confidence,skip_category,skip_reason,spot,voldex,credit,max
 2026-08-12,SKIP,,0.0,Evento macro imminente,CPI oggi (2026-08-12) — niente vendite vol a ridosso di eventi ad alto impatto,7748.5,11.57,,
 2026-08-13,SKIP,,0.0,IV troppo bassa,IV 11.6% < 12.0% — premio troppo magro per giustificare il rischio di coda,7798.99,11.6,,
 2026-08-14,SKIP,,0.0,IV troppo bassa,IV 11.3% < 12.0% — premio troppo magro per giustificare il rischio di coda,7785.76,11.33,,
+2026-08-17,SKIP,,0.0,IV troppo bassa,IV 12.0% < 12.0% — premio troppo magro per giustificare il rischio di coda,7745.06,11.97,,

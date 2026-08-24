@@ -34,3 +34,4 @@ date,action,strategy,confidence,skip_category,skip_reason,spot,voldex,credit,max
 2026-08-19,SKIP,,0.0,IV troppo bassa,IV 11.5% < 12.0% — premio troppo magro per giustificare il rischio di coda,7707.98,11.49,,
 2026-08-20,SKIP,,0.37,Conviction bassa,Conviction 0.37 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7641.16,12.56,,
 2026-08-21,SKIP,,0.02,Conviction bassa,Conviction 0.02 < 0.4 — condizioni non abbastanza favorevoli per vendere vol,7674.37,12.23,,
+2026-08-24,SKIP,,0.0,Stress in arrivo (skew),"Skew in forte espansione (+2.75pt) — stress in arrivo, vendere vol ora è pericoloso",7652.86,12.44,,
